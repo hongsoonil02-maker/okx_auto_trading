@@ -175,9 +175,6 @@ class OKXStockStrategyBrain:
                 return
             df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
             
-            st_d, st_v = calc_supertrend(df, 10, 3.0)
-            df['st_d'] = st_d
-            df['st_v'] = st_v
             
             # Volume MA 20
             df['vol_ma'] = df['v'].rolling(20).mean()
@@ -229,8 +226,8 @@ class OKXStockStrategyBrain:
             is_long_breakout = prev['st_d'] == -1 and curr['st_d'] == 1 and vol_cond
             is_short_breakout = prev['st_d'] == 1 and curr['st_d'] == -1 and vol_cond
 
-            is_long_pullback = curr['st_d'] == 1 and prev['stoch_k'] < 20 and curr['stoch_k'] >= 20
-            is_short_pullback = curr['st_d'] == -1 and prev['stoch_k'] > 80 and curr['stoch_k'] <= 80
+            is_long_pullback = curr['st_d_loose'] == 1 and prev['stoch_k'] < 20 and curr['stoch_k'] >= 20 and vol_cond
+            is_short_pullback = curr['st_d_loose'] == -1 and prev['stoch_k'] > 80 and curr['stoch_k'] <= 80 and vol_cond
 
             if is_long_breakout or is_long_pullback:
                 if (symbol, 'long') not in self.auto_active_pos:

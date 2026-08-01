@@ -238,9 +238,19 @@ class OKXHybridStrategyBrain:
                 return
             df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
             
-            st_d, st_v = calc_supertrend(df, 10, 3.0)
-            df['st_d'] = st_d
-            df['st_v'] = st_v
+            
+            # 진입용 (Loose) Supertrend (Multiplier 4.0)
+            st_d_loose, st_v_loose = calc_supertrend(df, 10, 4.0)
+            # 청산/방어용 (Tight) Supertrend (Multiplier 2.5)
+            st_d_tight, st_v_tight = calc_supertrend(df, 10, 2.5)
+            
+            df['st_d_loose'] = st_d_loose
+            df['st_v_loose'] = st_v_loose
+            df['st_d_tight'] = st_d_tight
+            df['st_v_tight'] = st_v_tight
+            
+            # Volume MA 20
+            df['vol_ma'] = df['v'].rolling(20).mean()
             
             # Volume MA 20
             df['vol_ma'] = df['v'].rolling(20).mean()
@@ -294,9 +304,8 @@ class OKXHybridStrategyBrain:
             is_long_breakout = prev['st_d'] == -1 and curr['st_d'] == 1 and vol_cond
             is_short_breakout = prev['st_d'] == 1 and curr['st_d'] == -1 and vol_cond
 
-            # 2. 눌림목 진입 (추세 방향 내에서 StochRSI 반등)
-            is_long_pullback = curr['st_d'] == 1 and prev['stoch_k'] < 20 and curr['stoch_k'] >= 20
-            is_short_pullback = curr['st_d'] == -1 and prev['stoch_k'] > 80 and curr['stoch_k'] <= 80
+            is_long_pullback = curr['st_d_loose'] == 1 and prev['stoch_k'] < 20 and curr['stoch_k'] >= 20 and vol_cond
+            is_short_pullback = curr['st_d_loose'] == -1 and prev['stoch_k'] > 80 and curr['stoch_k'] <= 80 and vol_cond
 
             if is_long_breakout or is_long_pullback:
                 if (symbol, 'long') not in self.auto_active_pos:
