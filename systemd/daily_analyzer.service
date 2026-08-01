@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily Trading Analyzer and Auto-Tuner
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/hongsoonil02/quant_system
+ExecStart=/usr/bin/python3 /home/hongsoonil02/quant_system/daily_analyzer.py
+StandardOutput=append:/home/hongsoonil02/quant_system/daily_analyzer.log
+StandardError=append:/home/hongsoonil02/quant_system/daily_analyzer.log
+
+[Install]
+WantedBy=default.target

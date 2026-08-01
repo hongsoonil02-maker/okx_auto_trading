@@ -1,0 +1,15 @@
+[Unit]
+Description=OKX Swap Bot (Bot C)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hongsoonil02/quant_system
+ExecStart=/usr/bin/python3 /home/hongsoonil02/quant_system/bot_c_okx_swap.py 8003
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/hongsoonil02/quant_system/bot_c_okx_swap.log
+StandardError=append:/home/hongsoonil02/quant_system/bot_c_okx_swap.log
+
+[Install]
+WantedBy=default.target

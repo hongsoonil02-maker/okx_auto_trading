@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Daily Analyzer every day at 00:05 KST
+
+[Timer]
+# 서버가 UTC이므로 KST 00:05는 UTC 15:05
+OnCalendar=*-*-* 15:05:00 UTC
+Persistent=true
+Unit=daily_analyzer.service
+
+[Install]
+WantedBy=timers.target

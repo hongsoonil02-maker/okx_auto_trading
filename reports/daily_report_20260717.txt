@@ -1,0 +1,25 @@
+📊 [Bot Daily Auto-Tuning Report]
+=========================
+📦 Lookback: 30d | Trades: 424
+📈 Market Regime: Low Volatility (Tighter Stops)
+🔹 BTC 24h Avg Hourly Volatility: 0.44%
+
+📌 [Market Summary]
+OKX  | N=261 | WR=43.7% | Avg=+0.057% | Sum=+14.80%
+UPBIT| N=163 | WR=26.4% | Avg=-0.703% | Sum=-114.64%
+
+⛔ [Blocked KST Hours]
+[3, 4, 11, 12, 17]
+OKX=[3, 11, 17] | UPBIT=[3, 4, 12]
+
+🚫 [Blacklisted Symbols - OKX]
+None
+
+🚫 [Blacklisted Symbols - UPBIT]
+KRW-AQT, KRW-ARK, KRW-ARX, KRW-CARV, KRW-G, KRW-IP, KRW-MOC, KRW-TT
+
+⚙️ [Adjusted Params]
+Upbit: TS 1.5%, SL 3.0%, ORB 10 candles
+OKX: TS 1.5%, SL 3.0%, ORB 4 candles
+=========================
+✅ 파라미터 자동 반영 완료.

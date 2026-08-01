@@ -1,0 +1,17 @@
+{
+    "BotC_OKX": {
+        "initial_equity": 647.691523746123,
+        "peak_equity": 848.2736872577466,
+        "pause_until": 0.0,
+        "equity": 837.7552072577466
+    },
+    "__PORTFOLIO__": {
+        "emergency_stop": false
+    },
+    "BotD_Upbit": {
+        "initial_equity": 1030042.48149832,
+        "peak_equity": 512605.6596896,
+        "pause_until": 0.0,
+        "equity": 512605.6596896
+    }
+}

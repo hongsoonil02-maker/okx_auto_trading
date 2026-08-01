@@ -1,0 +1,73 @@
+{
+  "blocked_hours_kst": [
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    9,
+    10,
+    11,
+    12,
+    13,
+    17,
+    18,
+    23
+  ],
+  "blocked_hours_kst_okx": [
+    11,
+    17
+  ],
+  "blocked_hours_kst_upbit": [
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    9,
+    10,
+    11,
+    12,
+    13,
+    17,
+    18,
+    23
+  ],
+  "blacklisted_symbols": {
+    "OKX": [],
+    "UPBIT": [
+      "KRW-AQT",
+      "KRW-ARK",
+      "KRW-ARX",
+      "KRW-CARV",
+      "KRW-G",
+      "KRW-ID",
+      "KRW-IP",
+      "KRW-MOC",
+      "KRW-TT",
+      "KRW-UP2"
+    ]
+  },
+  "upbit_params": {
+    "TRAILING_PCT": 0.015,
+    "HARD_SL_PCT": 0.03,
+    "ORB_LOOKBACK": 10,
+    "POSITION_PCT": 0.05,
+    "MIN_HOLD_SEC": 900,
+    "COOLDOWN_SEC": 3600,
+    "UPBIT_MIN_RANGE_PCT": 0.35,
+    "UPBIT_ENTRY_BUFFER_PCT": 0.0012,
+    "UPBIT_MIN_MOMENTUM_PCT": 0.0008
+  },
+  "okx_params": {
+    "TRAILING_PCT": 0.015,
+    "HARD_SL_PCT": 0.03,
+    "ORB_LOOKBACK": 4,
+    "POSITION_PCT": 0.18,
+    "OKX_MIN_RANGE_PCT": 0.6,
+    "OKX_ENTRY_BUFFER_PCT": 0.0004,
+    "OKX_MIN_MOMENTUM_PCT": 0.0003
+  }
+}

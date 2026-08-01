@@ -1,0 +1,16 @@
+[Unit]
+Description=Master Bot Orchestrator
+After=network.target bot_c_okx_swap.service bot_d_upbit.service bot_a_kr_stock.service bot_b_nasdaq.service
+Wants=bot_c_okx_swap.service bot_d_upbit.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hongsoonil02/quant_system
+ExecStart=/usr/bin/python3 /home/hongsoonil02/quant_system/master_bot_orchestrator.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/hongsoonil02/quant_system/master_orchestrator.log
+StandardError=append:/home/hongsoonil02/quant_system/master_orchestrator.log
+
+[Install]
+WantedBy=default.target

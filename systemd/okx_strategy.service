@@ -1,0 +1,14 @@
+[Unit]
+Description=OKX Strategy Engine (Shadow Copy Trading Brain)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/hongsoonil02/quant_system/okx_strategy.py
+WorkingDirectory=/home/hongsoonil02/quant_system
+Restart=always
+RestartSec=10
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=default.target
