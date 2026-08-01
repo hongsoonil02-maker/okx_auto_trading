@@ -211,18 +211,17 @@ class OKXVentureStrategyBrain:
                         qty = self.auto_active_pos[(symbol, 'long')]['size']
                         sell_qty = qty / (8 - dca['exit_count'])
                         
-                        market_info = self.exchange.markets.get(symbol)
                         if market_info:
                             min_amount = market_info.get('limits', {}).get('amount', {}).get('min', 0)
                             if min_amount and sell_qty < min_amount:
                                 sell_qty = min_amount
-                        if sell_qty > qty:
-                            sell_qty = qty
-                            
-                        sell_qty = float(self.exchange.amount_to_precision(symbol, sell_qty))
+                        if sell_qty >= qty:
+                            sell_qty = 0
+                        else:
+                            sell_qty = float(self.exchange.amount_to_precision(symbol, sell_qty))
                         
-                        if sell_qty > 0:
-                            logger.info(f"💨 [DCA Trade] 롱 분할 청산 ({dca['exit_count']+1}/8): {symbol} (수량: {sell_qty})")
+                        if sell_qty >= 0:
+                            logger.info(f"💨 [DCA Trade] 롱 분할 청산 ({dca['exit_count']+1}/8): {symbol} (수량: {sell_qty if sell_qty > 0 else 'ALL'})")
                             await self.send_webhook(SideType.CLOSE_LONG, symbol, sell_qty)
                         dca['exit_count'] += 1
                         dca['last_exit_t'] = t_curr
@@ -242,18 +241,17 @@ class OKXVentureStrategyBrain:
                         qty = self.auto_active_pos[(symbol, 'short')]['size']
                         sell_qty = qty / (8 - dca['exit_count'])
                         
-                        market_info = self.exchange.markets.get(symbol)
                         if market_info:
                             min_amount = market_info.get('limits', {}).get('amount', {}).get('min', 0)
                             if min_amount and sell_qty < min_amount:
                                 sell_qty = min_amount
-                        if sell_qty > qty:
-                            sell_qty = qty
-                            
-                        sell_qty = float(self.exchange.amount_to_precision(symbol, sell_qty))
+                        if sell_qty >= qty:
+                            sell_qty = 0
+                        else:
+                            sell_qty = float(self.exchange.amount_to_precision(symbol, sell_qty))
                         
-                        if sell_qty > 0:
-                            logger.info(f"💨 [DCA Trade] 숏 분할 청산 ({dca['exit_count']+1}/8): {symbol} (수량: {sell_qty})")
+                        if sell_qty >= 0:
+                            logger.info(f"💨 [DCA Trade] 숏 분할 청산 ({dca['exit_count']+1}/8): {symbol} (수량: {sell_qty if sell_qty > 0 else 'ALL'})")
                             await self.send_webhook(SideType.CLOSE_SHORT, symbol, sell_qty)
                         dca['exit_count'] += 1
                         dca['last_exit_t'] = t_curr

@@ -188,19 +188,13 @@ class OKXStockStrategyBrain:
             # A. 추적 청산 (Trailing Stop 기반)
             if (symbol, 'long') in self.auto_active_pos:
                 if curr['st_d'] == -1 or curr['c'] < curr['st_v']:
-                    qty = self.auto_active_pos[(symbol, 'long')]['size']
-                    qty = float(self.exchange.amount_to_precision(symbol, qty))
-                    if qty > 0:
-                        logger.info(f"💨 [Stock Trade] 롱 청산 시그널: {symbol}")
-                        await self.send_webhook(SideType.CLOSE_LONG, symbol, qty)
+                    logger.info(f"💨 [Stock Trade] 롱 청산 시그널 (ALL): {symbol}")
+                    await self.send_webhook(SideType.CLOSE_LONG, symbol, 0)
             
             if (symbol, 'short') in self.auto_active_pos:
                 if curr['st_d'] == 1 or curr['c'] > curr['st_v']:
-                    qty = self.auto_active_pos[(symbol, 'short')]['size']
-                    qty = float(self.exchange.amount_to_precision(symbol, qty))
-                    if qty > 0:
-                        logger.info(f"💨 [Stock Trade] 숏 청산 시그널: {symbol}")
-                        await self.send_webhook(SideType.CLOSE_SHORT, symbol, qty)
+                    logger.info(f"💨 [Stock Trade] 숏 청산 시그널 (ALL): {symbol}")
+                    await self.send_webhook(SideType.CLOSE_SHORT, symbol, 0)
 
             # B. 신규 진입 (포션 5% 사용)
             is_long_breakout = prev['st_d'] == -1 and curr['st_d'] == 1

@@ -110,17 +110,31 @@ class BotCOKXSwap:
             for attempt in range(max_retries):
                 try:
                     start = time.time()
-                    order = await asyncio.wait_for(
-                        self.exchange.create_market_order(
-                            ccxt_symbol, side, amount, params=params
-                        ),
-                        timeout=10.0,
-                    )
+                    
+                    if amount == 0 and payload.side in [SideType.CLOSE_LONG, SideType.CLOSE_SHORT]:
+                        # 수량이 0인 경우, 해당 포지션 전체 청산(close_position) 수행
+                        pos_side = params.get("posSide", "long")
+                        try:
+                            await self.exchange.cancel_all_orders(ccxt_symbol)
+                        except:
+                            pass
+                        order = await asyncio.wait_for(
+                            self.exchange.close_position(ccxt_symbol, side=pos_side),
+                            timeout=10.0
+                        )
+                    else:
+                        order = await asyncio.wait_for(
+                            self.exchange.create_market_order(
+                                ccxt_symbol, side, amount, params=params
+                            ),
+                            timeout=10.0,
+                        )
+                        
                     latency = time.time() - start
                     order_id = order.get("id", "N/A")
                     avg_price = order.get("average") or order.get("price", 0)
                     logger.info(
-                        f"✅ [실주문 성공] {side.upper()} {amount} {ccxt_symbol} "
+                        f"✅ [실주문 성공] {side.upper()} {amount if amount > 0 else 'ALL'} {ccxt_symbol} "
                         f"@ {avg_price} | ID: {order_id} | Latency: {latency:.3f}s"
                     )
                     return order
