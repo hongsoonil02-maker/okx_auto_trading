@@ -254,8 +254,8 @@ class MasterBotOrchestrator:
                     logger.warning(f"⚠️  Unknown market: {market}")
                     continue
                 
-                # Bot으로 라우팅
-                result = await self.route_signal_to_bot(bot_name, signal)
+                # Bot으로 라우팅 (비동기 병렬 처리로 수정하여 병목 해결)
+                asyncio.create_task(self.route_signal_to_bot(bot_name, signal))
             
             except asyncio.TimeoutError:
                 # 신호 없음 (정상)

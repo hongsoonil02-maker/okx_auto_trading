@@ -175,33 +175,85 @@ class OKXStockStrategyBrain:
                 return
             df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
             
-            st_d, st_v = calc_supertrend(df, 10, 3.0)
-            df['st_d'] = st_d
-            df['st_v'] = st_v
             
+            # 진입용 (Loose) Supertrend (Multiplier 4.0)
+            st_d_loose, st_v_loose = calc_supertrend(df, 10, 4.0)
+            # 청산/방어용 (Tight) Supertrend (Multiplier 2.5)
+            st_d_tight, st_v_tight = calc_supertrend(df, 10, 2.5)
+            
+            df['st_d_loose'] = st_d_loose
+            df['st_v_loose'] = st_v_loose
+            df['st_d_tight'] = st_d_tight
+            df['st_v_tight'] = st_v_tight
+            
+            # Volume MA 20
+            df['vol_ma'] = df['v'].rolling(20).mean()
+            
+            # StochRSI 적용 (K, D선)
             k, d = calc_stoch_rsi(df['c'], 14, 3, 3)
             df['stoch_k'] = k
             df['stoch_d'] = d
             
             prev, curr = df.iloc[-2], df.iloc[-1]
+            
+            pos_long = self.auto_active_pos.get((symbol, 'long'))
+            has_long = pos_long is not None
+            avg_price_long = pos_long['avgPrice'] if has_long else 0
+            if has_long and avg_price_long > 0:
+                self.max_price_state[(symbol, 'long')] = max(self.max_price_state.get((symbol, 'long'), avg_price_long), curr['c'])
+                
+            pos_short = self.auto_active_pos.get((symbol, 'short'))
+            has_short = pos_short is not None
+            avg_price_short = pos_short['avgPrice'] if has_short else 0
+            if has_short and avg_price_short > 0:
+                self.max_price_state[(symbol, 'short')] = min(self.max_price_state.get((symbol, 'short'), avg_price_short), curr['c'])
+
+            vol_cond = curr['v'] > prev['vol_ma'] * 1.2
 
             # A. 추적 청산 (Trailing Stop 기반)
-            if (symbol, 'long') in self.auto_active_pos:
-                if curr['st_d'] == -1 or curr['c'] < curr['st_v']:
+            if has_long and avg_price_long > 0:
+                max_price = self.max_price_state.get((symbol, 'long'), avg_price_long)
+                
+                # 기본 청산 시그널 (Loose 기준 이탈)
+                close_long_sig = curr['st_d_loose'] == -1 or curr['c'] < curr['st_v_loose']
+                
+                # 수익 1.5% 이상 도달 시 Tight 방어 로직 가동
+                if max_price > avg_price_long * 1.015:
+                    if curr['st_d_tight'] == -1 or curr['c'] < curr['st_v_tight']:
+                        close_long_sig = True
+                # 본절가 이탈 방어 (Breakeven)
+                elif max_price > avg_price_long * 1.01:
+                    if curr['c'] < avg_price_long * 1.001:
+                        close_long_sig = True
+                        
+                if close_long_sig:
                     logger.info(f"💨 [Stock Trade] 롱 청산 시그널 (ALL): {symbol}")
                     await self.send_webhook(SideType.CLOSE_LONG, symbol, 0)
             
-            if (symbol, 'short') in self.auto_active_pos:
-                if curr['st_d'] == 1 or curr['c'] > curr['st_v']:
+            if has_short and avg_price_short > 0:
+                min_price = self.max_price_state.get((symbol, 'short'), avg_price_short)
+                
+                close_short_sig = curr['st_d_loose'] == 1 or curr['c'] > curr['st_v_loose']
+                
+                # 수익 1.5% 이상 도달 시 Tight 방어 로직 가동
+                if min_price < avg_price_short * (1 - 0.014999999999999902):
+                    if curr['st_d_tight'] == 1 or curr['c'] > curr['st_v_tight']:
+                        close_short_sig = True
+                # 본절가 이탈 방어 (Breakeven)
+                elif min_price < avg_price_short * 0.99:
+                    if curr['c'] > avg_price_short * 0.999:
+                        close_short_sig = True
+                        
+                if close_short_sig:
                     logger.info(f"💨 [Stock Trade] 숏 청산 시그널 (ALL): {symbol}")
                     await self.send_webhook(SideType.CLOSE_SHORT, symbol, 0)
 
-            # B. 신규 진입 (포션 5% 사용)
-            is_long_breakout = prev['st_d'] == -1 and curr['st_d'] == 1
-            is_short_breakout = prev['st_d'] == 1 and curr['st_d'] == -1
+            # B. 신규 진입
+            is_long_breakout = prev['st_d_loose'] == -1 and curr['st_d_loose'] == 1 and vol_cond
+            is_short_breakout = prev['st_d_loose'] == 1 and curr['st_d_loose'] == -1 and vol_cond
 
-            is_long_pullback = curr['st_d'] == 1 and prev['stoch_k'] < 20 and curr['stoch_k'] >= 20
-            is_short_pullback = curr['st_d'] == -1 and prev['stoch_k'] > 80 and curr['stoch_k'] <= 80
+            is_long_pullback = curr['st_d_loose'] == 1 and prev['stoch_k'] < 20 and curr['stoch_k'] >= 20 and vol_cond
+            is_short_pullback = curr['st_d_loose'] == -1 and prev['stoch_k'] > 80 and curr['stoch_k'] <= 80 and vol_cond
 
             if is_long_breakout or is_long_pullback:
                 if (symbol, 'long') not in self.auto_active_pos:
@@ -273,11 +325,20 @@ class OKXStockStrategyBrain:
                 
                 positions = await self.exchange.fetch_positions()
                 self.auto_active_pos = {}
+                active_keys = set()
                 for p in positions:
                     if float(p.get('contracts', 0)) > 0:
                         sym = p.get('symbol')
                         s = p.get('side')
-                        self.auto_active_pos[(sym, s)] = {'size': float(p['contracts'])}
+                        active_keys.add((sym, s))
+                        self.auto_active_pos[(sym, s)] = {
+                            'size': float(p['contracts']),
+                            'avgPrice': float(p.get('avgPrice', p.get('price', 0)))
+                        }
+                
+                for k in list(self.max_price_state.keys()):
+                    if k not in active_keys:
+                        del self.max_price_state[k]
 
                 for symbol in symbols:
                     await self.check_auto_logic(symbol)
