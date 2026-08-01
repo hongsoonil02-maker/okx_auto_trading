@@ -179,26 +179,55 @@ class OKXStockStrategyBrain:
             df['st_d'] = st_d
             df['st_v'] = st_v
             
+            # Volume MA 20
+            df['vol_ma'] = df['v'].rolling(20).mean()
+            
             k, d = calc_stoch_rsi(df['c'], 14, 3, 3)
             df['stoch_k'] = k
             df['stoch_d'] = d
             
             prev, curr = df.iloc[-2], df.iloc[-1]
+            
+            pos_long = self.auto_active_pos.get((symbol, 'long'))
+            has_long = pos_long is not None
+            avg_price_long = pos_long['avgPrice'] if has_long else 0
+            if has_long and avg_price_long > 0:
+                self.max_price_state[(symbol, 'long')] = max(self.max_price_state.get((symbol, 'long'), avg_price_long), curr['c'])
+                
+            pos_short = self.auto_active_pos.get((symbol, 'short'))
+            has_short = pos_short is not None
+            avg_price_short = pos_short['avgPrice'] if has_short else 0
+            if has_short and avg_price_short > 0:
+                self.max_price_state[(symbol, 'short')] = min(self.max_price_state.get((symbol, 'short'), avg_price_short), curr['c'])
+
+            vol_cond = curr['v'] > prev['vol_ma'] * 1.2
 
             # A. 추적 청산 (Trailing Stop 기반)
-            if (symbol, 'long') in self.auto_active_pos:
-                if curr['st_d'] == -1 or curr['c'] < curr['st_v']:
+            if has_long and avg_price_long > 0:
+                close_long_sig = curr['st_d'] == -1 or curr['c'] < curr['st_v']
+                # Breakeven Stop
+                if self.max_price_state.get((symbol, 'long'), avg_price_long) > avg_price_long * 1.02:
+                    if curr['c'] < avg_price_long:
+                        close_long_sig = True
+                        
+                if close_long_sig:
                     logger.info(f"💨 [Stock Trade] 롱 청산 시그널 (ALL): {symbol}")
                     await self.send_webhook(SideType.CLOSE_LONG, symbol, 0)
             
-            if (symbol, 'short') in self.auto_active_pos:
-                if curr['st_d'] == 1 or curr['c'] > curr['st_v']:
+            if has_short and avg_price_short > 0:
+                close_short_sig = curr['st_d'] == 1 or curr['c'] > curr['st_v']
+                # Breakeven Stop
+                if self.max_price_state.get((symbol, 'short'), avg_price_short) < avg_price_short * 0.98:
+                    if curr['c'] > avg_price_short:
+                        close_short_sig = True
+                        
+                if close_short_sig:
                     logger.info(f"💨 [Stock Trade] 숏 청산 시그널 (ALL): {symbol}")
                     await self.send_webhook(SideType.CLOSE_SHORT, symbol, 0)
 
             # B. 신규 진입 (포션 5% 사용)
-            is_long_breakout = prev['st_d'] == -1 and curr['st_d'] == 1
-            is_short_breakout = prev['st_d'] == 1 and curr['st_d'] == -1
+            is_long_breakout = prev['st_d'] == -1 and curr['st_d'] == 1 and vol_cond
+            is_short_breakout = prev['st_d'] == 1 and curr['st_d'] == -1 and vol_cond
 
             is_long_pullback = curr['st_d'] == 1 and prev['stoch_k'] < 20 and curr['stoch_k'] >= 20
             is_short_pullback = curr['st_d'] == -1 and prev['stoch_k'] > 80 and curr['stoch_k'] <= 80
@@ -273,11 +302,20 @@ class OKXStockStrategyBrain:
                 
                 positions = await self.exchange.fetch_positions()
                 self.auto_active_pos = {}
+                active_keys = set()
                 for p in positions:
                     if float(p.get('contracts', 0)) > 0:
                         sym = p.get('symbol')
                         s = p.get('side')
-                        self.auto_active_pos[(sym, s)] = {'size': float(p['contracts'])}
+                        active_keys.add((sym, s))
+                        self.auto_active_pos[(sym, s)] = {
+                            'size': float(p['contracts']),
+                            'avgPrice': float(p.get('avgPrice', p.get('price', 0)))
+                        }
+                
+                for k in list(self.max_price_state.keys()):
+                    if k not in active_keys:
+                        del self.max_price_state[k]
 
                 for symbol in symbols:
                     await self.check_auto_logic(symbol)

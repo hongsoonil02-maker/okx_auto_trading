@@ -177,9 +177,15 @@ class OKXVentureStrategyBrain:
                 return
             df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
             
-            st_d, st_v = calc_supertrend(df, 10, 3.0)
-            df['st_d'] = st_d
-            df['st_v'] = st_v
+            st_d_loose, st_v_loose = calc_supertrend(df, 10, 4.0)
+            st_d_tight, st_v_tight = calc_supertrend(df, 10, 2.5)
+            df['st_d_loose'] = st_d_loose
+            df['st_v_loose'] = st_v_loose
+            df['st_d_tight'] = st_d_tight
+            df['st_v_tight'] = st_v_tight
+            
+            # Volume MA 20
+            df['vol_ma'] = df['v'].rolling(20).mean()
             
             # StochRSI 적용 (K, D선)
             k, d = calc_stoch_rsi(df['c'], 14, 3, 3)
@@ -191,22 +197,58 @@ class OKXVentureStrategyBrain:
             
             dca = self.dca_state.setdefault(symbol, {'entry_count': 0, 'exit_count': 0, 'last_entry_t': 0, 'last_exit_t': 0})
             
-            has_long = (symbol, 'long') in self.auto_active_pos
-            has_short = (symbol, 'short') in self.auto_active_pos
+            pos_long = self.auto_active_pos.get((symbol, 'long'))
+            has_long = pos_long is not None
+            avg_price_long = pos_long['avgPrice'] if has_long else 0
             
-            is_long_breakout = prev['st_d'] == -1 and curr['st_d'] == 1
-            is_long_pullback = curr['st_d'] == 1 and prev['stoch_k'] < 20 and curr['stoch_k'] >= 20
+            pos_short = self.auto_active_pos.get((symbol, 'short'))
+            has_short = pos_short is not None
+            avg_price_short = pos_short['avgPrice'] if has_short else 0
+            
+            vol_cond = curr['v'] > prev['vol_ma'] * 1.2
+            
+            is_long_breakout = prev['st_d_loose'] == -1 and curr['st_d_loose'] == 1 and vol_cond
+            is_long_pullback = curr['st_d_loose'] == 1 and prev['stoch_k'] < 20 and curr['stoch_k'] >= 20
             is_long_sig = is_long_breakout or is_long_pullback
             
-            is_short_breakout = prev['st_d'] == 1 and curr['st_d'] == -1
-            is_short_pullback = curr['st_d'] == -1 and prev['stoch_k'] > 80 and curr['stoch_k'] <= 80
+            is_short_breakout = prev['st_d_loose'] == 1 and curr['st_d_loose'] == -1 and vol_cond
+            is_short_pullback = curr['st_d_loose'] == -1 and prev['stoch_k'] > 80 and curr['stoch_k'] <= 80
             is_short_sig = is_short_breakout or is_short_pullback
             
-            close_long_sig = curr['st_d'] == -1 or curr['c'] < curr['st_v']
-            close_short_sig = curr['st_d'] == 1 or curr['c'] > curr['st_v']
+            if has_long and avg_price_long > 0:
+                is_profit_2pct = curr['c'] > avg_price_long * 1.02
+                st_v_long = curr['st_v_tight'] if is_profit_2pct else curr['st_v_loose']
+                st_d_long = curr['st_d_tight'] if is_profit_2pct else curr['st_d_loose']
+                
+                close_long_sig = st_d_long == -1 or curr['c'] < st_v_long
+                force_close_long = False
+                if dca['exit_count'] > 0 and curr['c'] < avg_price_long:
+                    force_close_long = True
+            else:
+                close_long_sig = False
+                force_close_long = False
+
+            if has_short and avg_price_short > 0:
+                is_profit_2pct = curr['c'] < avg_price_short * 0.98
+                st_v_short = curr['st_v_tight'] if is_profit_2pct else curr['st_v_loose']
+                st_d_short = curr['st_d_tight'] if is_profit_2pct else curr['st_d_loose']
+                
+                close_short_sig = st_d_short == 1 or curr['c'] > st_v_short
+                force_close_short = False
+                if dca['exit_count'] > 0 and curr['c'] > avg_price_short:
+                    force_close_short = True
+            else:
+                close_short_sig = False
+                force_close_short = False
 
             if has_long:
-                if close_long_sig:
+                if force_close_long and dca.get('last_exit_t') != t_curr:
+                    logger.info(f"💨 [Breakeven Stop] 롱 전량 방어 청산: {symbol}")
+                    await self.send_webhook(SideType.CLOSE_LONG, symbol, 0)
+                    dca['exit_count'] = 8
+                    dca['entry_count'] = 0
+                    dca['last_exit_t'] = t_curr
+                elif close_long_sig:
                     if dca['exit_count'] < 8 and dca.get('last_exit_t') != t_curr:
                         qty = self.auto_active_pos[(symbol, 'long')]['size']
                         sell_qty = qty / (8 - dca['exit_count'])
@@ -235,8 +277,14 @@ class OKXVentureStrategyBrain:
                         dca['entry_count'] += 1
                         dca['last_entry_t'] = t_curr
                         
-            elif has_short:
-                if close_short_sig:
+            if has_short:
+                if force_close_short and dca.get('last_exit_t') != t_curr:
+                    logger.info(f"💨 [Breakeven Stop] 숏 전량 방어 청산: {symbol}")
+                    await self.send_webhook(SideType.CLOSE_SHORT, symbol, 0)
+                    dca['exit_count'] = 8
+                    dca['entry_count'] = 0
+                    dca['last_exit_t'] = t_curr
+                elif close_short_sig:
                     if dca['exit_count'] < 8 and dca.get('last_exit_t') != t_curr:
                         qty = self.auto_active_pos[(symbol, 'short')]['size']
                         sell_qty = qty / (8 - dca['exit_count'])
@@ -348,7 +396,10 @@ class OKXVentureStrategyBrain:
                     if float(p.get('contracts', 0)) > 0:
                         sym = p.get('symbol')
                         s = p.get('side')
-                        self.auto_active_pos[(sym, s)] = {'size': float(p['contracts'])}
+                        self.auto_active_pos[(sym, s)] = {
+                            'size': float(p['contracts']),
+                            'avgPrice': float(p.get('avgPrice', p.get('price', 0)))
+                        }
 
                 # 코인별 로직 검사
                 for symbol in symbols:
