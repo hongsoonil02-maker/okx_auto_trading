@@ -5,11 +5,14 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/home/hongsoonil02/quant_system
-ExecStart=/usr/bin/python3 /home/hongsoonil02/quant_system/bot_c_okx_swap.py 8003
+ExecStart=/usr/bin/python3 /home/hongsoonil02/quant_system/bot_c_okx_swap.py 8013
 Restart=on-failure
 RestartSec=5
+EnvironmentFile=-/home/hongsoonil02/quant_system/.env
+Environment="PYTHONUNBUFFERED=1"
 StandardOutput=append:/home/hongsoonil02/quant_system/bot_c_okx_swap.log
 StandardError=append:/home/hongsoonil02/quant_system/bot_c_okx_swap.log
+LimitNOFILE=65535
 
 [Install]
 WantedBy=default.target

@@ -6,6 +6,7 @@ After=network.target
 Type=oneshot
 WorkingDirectory=/home/hongsoonil02/quant_system
 ExecStart=/usr/bin/python3 /home/hongsoonil02/quant_system/daily_analyzer.py
+EnvironmentFile=-/home/hongsoonil02/quant_system/.env
 StandardOutput=append:/home/hongsoonil02/quant_system/daily_analyzer.log
 StandardError=append:/home/hongsoonil02/quant_system/daily_analyzer.log
 

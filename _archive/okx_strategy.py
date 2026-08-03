@@ -150,54 +150,9 @@ class OKXHybridStrategyBrain:
     # [Task 1: Shadow Copy Logic]
     # =====================================================================
     async def run_shadow_copy_loop(self):
-        logger.info(f"🚀 [Shadow Copy] 전략 엔진 시작 (리드트레이더: {self.copy_engine.unique_code})")
-        
-        logger.info("🔎 [Shadow Copy] 초기 포지션 스냅샷 로드 중...")
-        init_positions = self.copy_engine.get_active_subpositions()
-        for p in init_positions:
-            pid = p.get("subPosId")
-            if pid:
-                self.known_positions[pid] = p
-        logger.info(f"✅ [Shadow Copy] 초기 활성 포지션 {len(self.known_positions)}개 감지됨 (중복 방지)")
-
+        logger.info("🚫 [Shadow Copy] 엔진이 비활성화되었습니다. (OKX 공식 카피 트레이딩 기능에 전적으로 위임)")
         while True:
-            try:
-                current_positions = self.copy_engine.get_active_subpositions()
-                if not isinstance(current_positions, list):
-                    logger.warning("⚠️ [Shadow Copy] 카피 포지션 조회 실패. 다음 주기 대기.")
-                    await asyncio.sleep(POLL_INTERVAL)
-                    continue
-
-                current_ids = {p.get("subPosId") for p in current_positions if p.get("subPosId")}
-                known_ids = set(self.known_positions.keys())
-
-                # 신규 진입 감지
-                new_ids = current_ids - known_ids
-                for p in current_positions:
-                    pid = p.get("subPosId")
-                    if pid in new_ids:
-                        inst_id = p.get("instId", "UNKNOWN")
-                        pos_side = p.get("posSide", "long").lower()
-                        logger.info(f"🔥 [Shadow Copy] 신규 진입 감지! {inst_id} ({pos_side}) | 서브포지션 ID: {pid}")
-                        side_enum = SideType.BUY if pos_side == "long" else SideType.SELL
-                        await self.send_webhook(side_enum, inst_id, DEFAULT_QTY)
-                        self.known_positions[pid] = p
-
-                # 청산 감지
-                closed_ids = known_ids - current_ids
-                for pid in closed_ids:
-                    old_p = self.known_positions[pid]
-                    inst_id = old_p.get("instId", "UNKNOWN")
-                    pos_side = old_p.get("posSide", "long").lower()
-                    logger.info(f"💨 [Shadow Copy] 포지션 청산 감지! {inst_id} ({pos_side}) | 서브포지션 ID: {pid}")
-                    close_side = SideType.CLOSE_LONG if pos_side == "long" else SideType.CLOSE_SHORT
-                    await self.send_webhook(close_side, inst_id, DEFAULT_QTY)
-                    del self.known_positions[pid]
-
-            except Exception as e:
-                logger.error(f"❌ [Shadow Copy] 예외 발생: {e}")
-            
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(3600)
 
     # =====================================================================
     # [Task 2: Auto Trading Logic (Supertrend + RSI)]
@@ -278,7 +233,11 @@ class OKXHybridStrategyBrain:
 
             # A. 추적 청산 (Trailing Stop 기반)
             if has_long and avg_price_long > 0:
-                close_long_sig = curr['st_d'] == -1 or curr['c'] < curr['st_v']
+                is_profit = curr['c'] > avg_price_long * 1.015
+                st_v_long = curr['st_v_tight'] if is_profit else curr['st_v_loose']
+                st_d_long = curr['st_d_tight'] if is_profit else curr['st_d_loose']
+                
+                close_long_sig = st_d_long == -1 or curr['c'] < st_v_long
                 # Breakeven Stop
                 if self.max_price_state.get((symbol, 'long'), avg_price_long) > avg_price_long * 1.02:
                     if curr['c'] < avg_price_long:
@@ -289,7 +248,11 @@ class OKXHybridStrategyBrain:
                     await self.send_webhook(SideType.CLOSE_LONG, symbol, 0)
             
             if has_short and avg_price_short > 0:
-                close_short_sig = curr['st_d'] == 1 or curr['c'] > curr['st_v']
+                is_profit = curr['c'] < avg_price_short * 0.985
+                st_v_short = curr['st_v_tight'] if is_profit else curr['st_v_loose']
+                st_d_short = curr['st_d_tight'] if is_profit else curr['st_d_loose']
+                
+                close_short_sig = st_d_short == 1 or curr['c'] > st_v_short
                 # Breakeven Stop
                 if self.max_price_state.get((symbol, 'short'), avg_price_short) < avg_price_short * 0.98:
                     if curr['c'] > avg_price_short:
@@ -301,8 +264,8 @@ class OKXHybridStrategyBrain:
 
             # B. 신규 진입 (포션 3% 사용)
             # 1. 돌파 진입 (Supertrend 추세 전환)
-            is_long_breakout = prev['st_d'] == -1 and curr['st_d'] == 1 and vol_cond
-            is_short_breakout = prev['st_d'] == 1 and curr['st_d'] == -1 and vol_cond
+            is_long_breakout = prev['st_d_loose'] == -1 and curr['st_d_loose'] == 1 and vol_cond
+            is_short_breakout = prev['st_d_loose'] == 1 and curr['st_d_loose'] == -1 and vol_cond
 
             is_long_pullback = curr['st_d_loose'] == 1 and prev['stoch_k'] < 20 and curr['stoch_k'] >= 20 and vol_cond
             is_short_pullback = curr['st_d_loose'] == -1 and prev['stoch_k'] > 80 and curr['stoch_k'] <= 80 and vol_cond

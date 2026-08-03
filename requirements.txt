@@ -184,3 +184,4 @@ zipp==3.23.0
 zstandard==0.25.0
 prometheus_client==0.20.0
 pandas-ta==0.3.14b0
+pyupbit==0.2.34

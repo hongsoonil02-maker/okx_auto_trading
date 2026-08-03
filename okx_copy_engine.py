@@ -38,13 +38,15 @@ class OKXCopyEngine:
         api_secret: str = None,
         passphrase: str = None,
         flag: str = "0",  # '0' = Live 실거래, '1' = Demo 모의투자
-        max_subpos_loss_pct: float = 3.5  # 카피 서브포지션 최대 허용 손실률 (-3.5%)
+        max_subpos_loss_pct: float = None,  # .env OKX_COPY_MAX_LOSS_PCT에서 로드 (기본 15.0%)
     ):
         self.api_key = api_key or os.getenv("OKX_API_KEY", "")
         self.api_secret = api_secret or os.getenv("OKX_SECRET", "") or os.getenv("OKX_SECRET_KEY", "")
         self.passphrase = passphrase or os.getenv("OKX_PASSPHRASE", "") or os.getenv("OKX_PASSWORD", "")
         self.flag = flag
-        self.max_subpos_loss_pct = max_subpos_loss_pct
+        self.max_subpos_loss_pct = max_subpos_loss_pct if max_subpos_loss_pct is not None else float(os.getenv("OKX_COPY_MAX_LOSS_PCT", "15.0"))
+        self.max_active_subpositions = int(os.getenv("OKX_COPY_MAX_ACTIVE_SUBPOS", "1"))
+        self.single_position_only = os.getenv("OKX_SINGLE_POSITION_ONLY", "true").lower() == "true"
         self.unique_code = os.getenv("OKX_LEAD_TRADER_UNIQUE_CODE", "171F98A6EAE83C1D")
         self.lead_trader_code = self.unique_code
 
@@ -160,8 +162,17 @@ class OKXCopyEngine:
                     amend_payload["copyAmt"] = str(copy_total_amt)
                     res = self._copy_request("POST", "/api/v5/copytrading/amend-copy-settings", body=amend_payload)
             else:
+                mgn_mode = "copy" if copy_mode in ("SMART_COPY", "copy") else "ratio"
                 logger.info(f"🚀 리드 트레이더({unique_code}) 신규 카피 개시 (first-copy-settings) 실행...")
-                res = self._copy_request("POST", "/api/v5/copytrading/first-copy-settings", body=payload)
+                first_copy_payload = {
+                    "uniqueCode": unique_code,
+                    "copyMgnMode": mgn_mode,
+                    "copyTotalAmt": str(copy_total_amt),
+                    "copyRatio": str(copy_ratio),
+                    "copyInstIdType": copy_inst_id_type,
+                    "subPosCloseType": sub_pos_close_type,
+                }
+                res = self._copy_request("POST", "/api/v5/copytrading/first-copy-settings", body=first_copy_payload)
 
             if res and str(res.get("code")) == "0":
                 logger.info(f"✅ 리드 트레이더({unique_code}) 카피 설정 완료! (할당 자본: ${copy_total_amt} USDT)")
@@ -297,13 +308,16 @@ class OKXCopyEngine:
             logger.error(f"❌ stop_copy_trading 예외: {e}")
             return False
 
-    def close_risky_subpositions(self, max_subpos_loss_pct: float = None, max_active_subpositions: int = 4) -> List[Dict[str, Any]]:
+    def close_risky_subpositions(self, max_subpos_loss_pct: float = None, max_active_subpositions: int = None) -> List[Dict[str, Any]]:
         """
         [Orca/Kiro 승리 개선안]
-        1. 개별 서브포지션 손실률이 max_subpos_loss_pct(예: -3.5%) 초과 시 즉시 강제 청산
-        2. 리드 트레이더의 과도한 물타기(Pyramiding) 방지: 활성 서브포지션 수가 max_active_subpositions(4개) 초과 시 손실 폭이 큰 순서대로 청산
+        1. 개별 서브포지션 손실률이 max_subpos_loss_pct(예: -10.0%) 초과 시 즉시 강제 청산
+        2. 리드 트레이더의 과도한 물타기(Pyramiding) 방지: 활성 서브포지션 수가 max_active_subpositions(1개, OKX_COPY_MAX_ACTIVE_SUBPOS) 초과 시 손실 폭이 큰 순서대로 청산
+        3. single_position_only=true: 동일 심볼의 중복 포지션(ADL 풀링)도 방지
         """
         threshold = max_subpos_loss_pct if max_subpos_loss_pct is not None else self.max_subpos_loss_pct
+        if max_active_subpositions is None:
+            max_active_subpositions = self.max_active_subpositions
         subpositions = self.get_active_subpositions()
         if not subpositions:
             return []
@@ -401,6 +415,66 @@ class OKXCopyEngine:
             "closed_subpos": closed_ids
         }
 
+    def diagnose_copy_status(self, unique_code: str = None) -> Dict[str, Any]:
+        """
+        카피 트레이딩 전체 상태를 한눈에 진단하는 종합 리포트 생성.
+        - 리드 트레이더 카피 활성 여부
+        - 활성 서브포지션 목록 및 손익
+        - 리스크 가드 임계값 설정 확인
+        """
+        target = unique_code or self.unique_code
+        report: Dict[str, Any] = {
+            "unique_code": target,
+            "copy_active": False,
+            "active_subpositions": [],
+            "total_active_count": 0,
+            "total_upl": 0.0,
+            "risk_settings": {
+                "max_subpos_loss_pct": self.max_subpos_loss_pct,
+                "max_active_subpositions": self.max_active_subpositions,
+                "single_position_only": self.single_position_only,
+            },
+        }
+
+        # 1. 카피 상태 확인
+        try:
+            status = self.check_lead_trader_status(unique_code=target)
+            report["copy_active"] = status.get("ok", False)
+            report["copy_state_detail"] = status
+        except Exception as e:
+            report["copy_state_detail"] = {"error": str(e)}
+
+        # 2. 활성 서브포지션 조회
+        try:
+            subpositions = self.get_active_subpositions(unique_code=target)
+            report["total_active_count"] = len(subpositions)
+            total_upl = 0.0
+            sub_details = []
+            for sp in subpositions:
+                upl = float(sp.get("upl", 0.0))
+                upl_ratio = float(sp.get("uplRatio", 0.0))
+                total_upl += upl
+                sub_details.append({
+                    "subPosId": sp.get("subPosId", ""),
+                    "instId": sp.get("instId", ""),
+                    "posSide": sp.get("posSide", ""),
+                    "upl": upl,
+                    "uplRatio_pct": round(upl_ratio * 100, 2),
+                })
+            report["active_subpositions"] = sub_details
+            report["total_upl"] = round(total_upl, 4)
+        except Exception as e:
+            report["subposition_error"] = str(e)
+
+        # 3. 리드 트레이더 목록
+        try:
+            leaders = self.get_current_lead_traders()
+            report["current_lead_traders"] = len(leaders)
+        except Exception:
+            report["current_lead_traders"] = "error"
+
+        return report
+
     def detect_new_subpositions(self, known_ids: set, unique_code: str = None) -> List[Dict[str, Any]]:
         """
         기존에 알던 subPosId 집합과 비교하여 새로 열린 카피 서브포지션만 반환.
@@ -415,15 +489,71 @@ class OKXCopyEngine:
         return new_items
 
 
-    def diagnose_copy_status(self) -> Dict[str, Any]:
-        lead_traders = self.get_current_lead_traders()
-        active_subpositions = self.get_active_subpositions()
+    def select_top_trader(self, inst_id: str = "BTC-USDT") -> Optional[Dict[str, Any]]:
+        """
+        수익률 1등 리드 트레이더 후보를 선택한다.
+        OKX CopyTrading 추천 리드 트레이더 목록을 조회하여 pnlRatio 기준 1위를 반환한다.
+        API: GET /api/v5/copytrading/lead-trader-list (public)
+        """
+        try:
+            res = self._copy_request("GET", "/api/v5/copytrading/lead-trader-list", params={"instId": inst_id})
+            if res and str(res.get("code")) == "0":
+                traders = res.get("data", [])
+                if traders:
+                    sorted_traders = sorted(
+                        traders,
+                        key=lambda t: float(t.get("pnlRatio", 0) or 0),
+                        reverse=True,
+                    )
+                    return sorted_traders[0]
+                logger.warning("⚠️ 리드 트레이더 목록이 비어있습니다.")
+            else:
+                logger.warning(f"⚠️ 리드 트레이더 목록 조회 실패: {res.get('msg') if res else 'None'}")
+        except Exception as e:
+            logger.error(f"❌ select_top_trader 예외: {e}")
+
+        logger.warning("⚠️ 리드 트레이더 자동 선정 실패, 기본 unique_code 반환")
         return {
-            "lead_traders_count": len(lead_traders),
-            "lead_traders": lead_traders,
-            "active_subpositions_count": len(active_subpositions),
-            "active_subpositions": active_subpositions
+            "uniqueCode": self.unique_code,
+            "nickName": "Default",
+            "pnlRatio": 0,
         }
+
+    def auto_copy_top_trader(
+        self,
+        copy_total_amt: str = "800",
+        copy_ratio: str = "1",
+        copy_mode: str = "SMART_COPY",
+    ) -> Dict[str, Any]:
+        """
+        수익률 1등 리드 트레이더를 자동 선정한 후 카피 트레이딩을 개시한다.
+        single_position_only=true이면 활성 포지션 수 제한 및 심볼 중복 방지 검사 수행.
+        """
+        # ADL 풀링 방지: 이미 활성 서브포지션 한도 도달 시 새 진입 거부
+        if self.single_position_only:
+            active = self.get_active_subpositions()
+            if len(active) >= self.max_active_subpositions:
+                logger.warning(
+                    f"🚫 [Single Position Guard] 활성 서브포지션 {len(active)}개 ≥ "
+                    f"최대 {self.max_active_subpositions}개 제한. 진입 거부."
+                )
+                return {"success": False, "reason": "max_active_subpositions_reached"}
+
+        top = self.select_top_trader()
+        if not top:
+            return {"success": False, "reason": "no_top_trader_found"}
+
+        unique_code = top.get("uniqueCode", self.unique_code)
+        result = self.setup_or_update_copy_trading(
+            unique_code=unique_code,
+            copy_mode=copy_mode,
+            copy_ratio=copy_ratio,
+            copy_total_amt=copy_total_amt,
+            copy_inst_id_type="copy",
+            sub_pos_close_type="copy_close",
+        )
+        result["selected_trader"] = top
+        return result
 
 
 def get_copy_engine():

@@ -10,6 +10,40 @@ from typing import Optional
 from enum import Enum
 import json
 import uuid
+import os
+import hmac
+import hashlib
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_SIGNATURE_HEADER = "X-Signature"
+
+
+def get_webhook_secret() -> str:
+    """Dynamically read WEBHOOK_SECRET from environment at call time
+    (avoids import-order issues when load_dotenv runs after this module loads)."""
+    return os.getenv("WEBHOOK_SECRET", "")
+
+
+def sign_payload(payload_str: str) -> str:
+    """HMAC-SHA256 서명 생성 (발신자용)."""
+    secret = get_webhook_secret()
+    if not secret:
+        return ""
+    return hmac.new(
+        secret.encode(), payload_str.encode(), hashlib.sha256
+    ).hexdigest()
+
+
+def verify_webhook_signature(payload_str: str, signature: str) -> bool:
+    """HMAC-SHA256 서명 검증 (수신자용).
+    WEBHOOK_SECRET이 비어있으면 검증을 건너뜀 (개발/테스트용, 프로덕션에서는 반드시 설정)."""
+    secret = get_webhook_secret()
+    if not secret:
+        return True
+    if not signature:
+        return False
+    expected = sign_payload(payload_str)
+    return hmac.compare_digest(expected, signature)
 
 class ActionType(str, Enum):
     EXEC = "EXEC"
@@ -78,6 +112,10 @@ class WebhookPayload:
         data = json.loads(json_str)
         valid_fields = {f.name for f in fields(cls)}
         filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        if "action" not in filtered_data:
+            raise ValueError("WebhookPayload: 'action' 필드 누락")
+        if "side" not in filtered_data:
+            raise ValueError("WebhookPayload: 'side' 필드 누락")
         filtered_data['action'] = ActionType(filtered_data['action'])
         filtered_data['side']   = SideType(filtered_data['side'])
         return cls(**filtered_data)

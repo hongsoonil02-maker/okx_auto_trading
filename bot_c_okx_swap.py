@@ -11,9 +11,11 @@ import os
 import sys
 import time
 import logging
+import psutil
 from aiohttp import web
 from dotenv import load_dotenv
 from utils_telegram import send_telegram_alert
+from bot_config import BotConfig
 
 try:
     import ccxt.async_support as ccxt_async
@@ -22,7 +24,7 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "ccxt", "-q"])
     import ccxt.async_support as ccxt_async
 
-from webhook_spec import WebhookPayload, SideType
+from webhook_spec import WebhookPayload, SideType, verify_webhook_signature, WEBHOOK_SIGNATURE_HEADER
 
 load_dotenv(override=True)
 
@@ -77,6 +79,25 @@ class BotCOKXSwap:
 
         async with self._lock:
             symbol = payload.symbol  # e.g. "BTC-USDT-SWAP" → ccxt용 "BTC/USDT:USDT"
+
+            if BotConfig.is_symbol_blacklisted(symbol, market="OKX"):
+                logger.warning(f"🚫 [차단] 블랙리스트 종목 주문 거부: {symbol}")
+                send_telegram_alert(f"🚫 [Bot C] 블랙리스트 종목 주문 거부: {symbol}")
+                return
+
+            # ── Last-line defense: reject new entries if max active positions reached ──
+            if payload.side in (SideType.BUY, SideType.SELL):
+                single_only = os.getenv("OKX_SINGLE_POSITION_ONLY", "true").lower() == "true"
+                if single_only:
+                    positions = await self.exchange.fetch_positions()
+                    active = [p for p in positions if float(p.get("contracts", 0)) > 0]
+                    if len(active) >= int(os.getenv("OKX_GLOBAL_MAX_POSITIONS", "20")):
+                        logger.warning(
+                            f"🚫 [Bot C Guard] 활성 포지션 {len(active)}개 >= "
+                            f"최대 1개. 진입 거부: {payload.side.value} {symbol}"
+                        )
+                        return
+
             # OKX ccxt 심볼 변환: "BTC-USDT-SWAP" → "BTC/USDT:USDT"
             ccxt_symbol = symbol.replace("-SWAP", "").replace("-", "/", 1)
             if ":" not in ccxt_symbol:
@@ -203,9 +224,13 @@ bot = BotCOKXSwap()
 
 
 async def handle_webhook(request):
+    signature = request.headers.get(WEBHOOK_SIGNATURE_HEADER, "")
+    body = await request.text()
+    if not verify_webhook_signature(body, signature):
+        logger.warning(f"⚠️ Bot C 웹훅 서명 검증 실패 (IP: {request.remote})")
+        return web.json_response({"error": "Invalid signature"}, status=401)
     try:
-        data = await request.text()
-        payload = WebhookPayload.from_json(data)
+        payload = WebhookPayload.from_json(body)
         logger.info(f"📥 Webhook 수신: {payload.side.value} {payload.qty} {payload.symbol}")
         asyncio.create_task(bot.execute_order(payload))
         return web.json_response({"status": "ok"})
@@ -253,6 +278,57 @@ async def handle_status(request):
     })
 
 
+async def handle_close_all(request):
+    """EMERGENCY: Close all open positions"""
+    results = []
+    try:
+        if not bot.exchange:
+            return web.json_response({"error": "exchange not initialized"}, status=500)
+
+        positions = await bot.exchange.fetch_positions()
+        for pos in positions:
+            contracts = float(pos.get("contracts", 0))
+            if contracts == 0:
+                continue
+            symbol = pos.get("symbol", "")
+            pos_side = pos.get("side", "").lower()
+            if pos_side not in ("long", "short"):
+                continue
+
+            close_side = "short" if pos_side == "long" else "long"
+            ccxt_symbol = symbol.replace("-SWAP", "").replace("-", "/", 1)
+            if ":" not in ccxt_symbol:
+                ccxt_symbol = ccxt_symbol + ":USDT"
+
+            try:
+                await bot.exchange.cancel_all_orders(ccxt_symbol)
+                order = await asyncio.wait_for(
+                    bot.exchange.close_position(ccxt_symbol, side=pos_side),
+                    timeout=10.0
+                )
+                results.append({
+                    "symbol": symbol,
+                    "side_closed": pos_side,
+                    "contracts": contracts,
+                    "status": "closed",
+                })
+                logger.info(f"✅ [CLOSE_ALL] {symbol} ({pos_side}) {contracts}청산 완료")
+            except Exception as e:
+                results.append({"symbol": symbol, "status": f"error: {e}"})
+                logger.error(f"❌ [CLOSE_ALL] {symbol} 청산 실패: {e}")
+
+        try:
+            send_telegram_alert(f"🚨 [Bot C] 전량 청산 완료: {len(results)}개 포지션")
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(f"[CLOSE_ALL] 오류: {e}")
+        return web.json_response({"results": results, "error": str(e)}, status=500)
+
+    return web.json_response({"results": results, "total_closed": len(results)})
+
+
 async def main():
     await bot.init()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8013
@@ -260,6 +336,7 @@ async def main():
     app.router.add_post("/webhook", handle_webhook)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/status", handle_status)
+    app.router.add_post("/close_all", handle_close_all)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)

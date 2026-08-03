@@ -1,0 +1,17 @@
+[Unit]
+Description=OKX Venture Strategy Engine (Altcoin/Meme Auto-Trading Brain)
+After=network.target master_bot_orchestrator.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/hongsoonil02/quant_system/okx_venture_strategy.py
+WorkingDirectory=/home/hongsoonil02/quant_system
+Restart=always
+RestartSec=10
+EnvironmentFile=-/home/hongsoonil02/quant_system/.env
+Environment="PYTHONUNBUFFERED=1"
+StandardOutput=append:/home/hongsoonil02/quant_system/okx_venture_strategy.log
+StandardError=append:/home/hongsoonil02/quant_system/okx_venture_strategy.log
+
+[Install]
+WantedBy=default.target

@@ -25,16 +25,23 @@ import aiohttp.web
 from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════════════════════
-# [No Hardcoding 강제] 임포트 즉시 워크스페이스 .env 자동 스캔 & 병합
+# .env 먼저 로드 (webhook_spec 모듈 레벨 상수 의존성: WEBHOOK_SECRET)
 # ═══════════════════════════════════════════════════════════════════════════
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 try:
     from env_auto_scanner import auto_load_env
-    _ENV_SCANNER = auto_load_env()  # 런타임 시작 시 .env 재귀 스캔 → os.environ 병합
+    _ENV_SCANNER = auto_load_env()
     _ENV_AUTOLOAD_OK = True
 except ImportError:
     _ENV_SCANNER = None
     _ENV_AUTOLOAD_OK = False
-    print("⚠️  env_auto_scanner 미발견 - 시스템 환경변수만 사용")
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(_BASE_DIR, ".env"))
+
+from webhook_spec import (
+    WebhookPayload, ActionType, SideType,
+    verify_webhook_signature, sign_payload, WEBHOOK_SIGNATURE_HEADER,
+)
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -68,10 +75,10 @@ class MasterBotOrchestrator:
       4. 포트폴리오 리포팅
     """
     
-    # SSH 로컬 포트 포워딩 터널 경유 (localhost:800X → 원격 봇)
-    # 터널: ssh -L 8001:localhost:8001 ... (방화벽 우회)
+    # Bot endpoints (SSH local port forwarding tunnel path: localhost:800X → remote bot)
+    # Currently active bots on this server:
+    #   Bot C (OKX): port 8013 (실거래)
     BOT_ENDPOINTS = {
-        "Bot A (KR Stock)": "http://localhost:8001",
         "Bot C (OKX)": "http://localhost:8013",
     }
     
@@ -82,6 +89,11 @@ class MasterBotOrchestrator:
         self.signal_queue = asyncio.Queue()
         self.processed_signals = []
         self.start_time = None
+        # 포지션 상태 추적: symbol -> "LONG" / "SHORT" / "FLAT"
+        # single_position_only=true이면 동시에 1개 포지션만 허용
+        self.position_state: Dict[str, str] = {}
+        self.single_position_only = os.getenv("OKX_SINGLE_POSITION_ONLY", "true").lower() == "true"
+        self.max_active_subpositions = int(os.getenv("OKX_GLOBAL_MAX_POSITIONS", "20"))
     
     def load_active_ports(self):
         """active_ports.json에서 동적 포트 매핑 로드 및 환경변수(Remote IP) 병합"""
@@ -91,7 +103,6 @@ class MasterBotOrchestrator:
                     registry = json.load(f)
                 
                 mapping = {
-                    "bot_a_kr_stock.py": "Bot A (KR Stock)",
                     "bot_c_okx_swap.py": "Bot C (OKX)",
                 }
                 
@@ -189,9 +200,12 @@ class MasterBotOrchestrator:
         endpoint = self.BOT_ENDPOINTS[bot_name]
         
         try:
+            body = json.dumps(webhook_payload)
+            headers = {"Content-Type": "application/json", WEBHOOK_SIGNATURE_HEADER: sign_payload(body)}
             async with self.session.post(
                 f"{endpoint}/webhook",
-                json=webhook_payload,
+                data=body,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 if resp.status in [200, 201]:
@@ -243,19 +257,50 @@ class MasterBotOrchestrator:
                 
                 market = signal.get("market")
                 bot_mapping = {
-                    "kr_stock": "Bot A (KR Stock)",
-                    "nasdaq": "Bot B (Nasdaq)",
                     "okx_swap": "Bot C (OKX)",
-                    "upbit": "Bot D (Upbit)",
                 }
                 
                 bot_name = bot_mapping.get(market)
                 if not bot_name:
                     logger.warning(f"⚠️  Unknown market: {market}")
                     continue
-                
-                # Bot으로 라우팅 (비동기 병렬 처리로 수정하여 병목 해결)
-                asyncio.create_task(self.route_signal_to_bot(bot_name, signal))
+
+                # ── 포지션 상태 검사 (15개 동시 진입 방지) ──
+                side = signal.get("side", "")
+                symbol = signal.get("symbol", "")
+                active_count = sum(1 for p in self.position_state.values() if p != "FLAT")
+
+                if side in ("BUY", "SELL"):
+                    # 신규 진입 신호
+                    if self.single_position_only:
+                        if active_count >= self.max_active_subpositions:
+                            logger.warning(
+                                f"🚫 [Master Guard] 활성 포지션 {active_count}개 ≥ "
+                                f"최대 {self.max_active_subpositions}개 제한. "
+                                f"진입 거부: {side} {symbol}"
+                            )
+                            continue
+                        if symbol in self.position_state and self.position_state[symbol] != "FLAT":
+                            logger.warning(
+                                f"🚫 [Master Guard] {symbol} 이미 포지션 보유 "
+                                f"({self.position_state[symbol]}). 진입 거부."
+                            )
+                            continue
+
+                    # 순차 라우팅 (병렬 create_task 제거 → 레이스 컨디션 방지)
+                    result = await self.route_signal_to_bot(bot_name, signal)
+                    if result.get("status") == "ok" or result.get("order_id"):
+                        self.position_state[symbol] = "LONG" if side == "BUY" else "SHORT"
+                    else:
+                        self.position_state[symbol] = "FLAT"
+
+                elif side in ("CLOSE_LONG", "CLOSE_SHORT"):
+                    # 청산 신호
+                    result = await self.route_signal_to_bot(bot_name, signal)
+                    if symbol in self.position_state:
+                        self.position_state[symbol] = "FLAT"
+                    else:
+                        self.position_state[symbol] = "FLAT"
             
             except asyncio.TimeoutError:
                 # 신호 없음 (정상)
@@ -325,21 +370,24 @@ class MasterBotOrchestrator:
         """Webhook 수신 서버 실행 (Master)"""
         
         async def handle_webhook(request):
-            """POST /webhook - Master Webhook 수신"""
+            """POST /webhook - Master Webhook 수신 (HMAC 서명 검증)"""
+            signature = request.headers.get(WEBHOOK_SIGNATURE_HEADER, "")
+            body = await request.text()
+            if not verify_webhook_signature(body, signature):
+                logger.warning(f"⚠️ 웹훅 서명 검증 실패 (IP: {request.remote})")
+                return aiohttp.web.json_response(
+                    {"error": "Invalid signature", "status": "denied"},
+                    status=401,
+                )
             try:
-                data = await request.json()
-                
-                # 신호 큐에 추가
+                data = json.loads(body)
                 await self.signal_queue.put(data)
-                
                 logger.info(f"📥 신호 수신: {data.get('signal_id')} ({data.get('market')})")
-                
                 return aiohttp.web.json_response({
                     "status": "queued",
                     "signal_id": data.get("signal_id"),
                     "timestamp": datetime.now().isoformat(),
                 })
-            
             except Exception as e:
                 logger.error(f"❌ Webhook 처리 오류: {e}")
                 return aiohttp.web.json_response(

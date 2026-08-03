@@ -1,0 +1,167 @@
+{
+  "timestamp": "2026-08-02T04:52:46Z",
+  "structure_verification": {
+    "Bot C (OKX)": {
+      "HMAC_signature": true,
+      "PID_lock": true,
+      "blacklist": true,
+      "position_guard": true,
+      "retry_logic": true,
+      "close_all": true,
+      "telegram": true,
+      "leverage_auto": true
+    },
+    "Bot E (Mirror)": {
+      "import_json": true,
+      "copy_engine": true,
+      "webhook_sign": true,
+      "qty_calc": true,
+      "entry_detect": true,
+      "exit_detect": true,
+      "PID_lock": true,
+      "init_snapshot": true
+    },
+    "Master Orchestrator": {
+      "HMAC_verify": true,
+      "pos_state": true,
+      "max_active": true,
+      "dup_block": true,
+      "seq_routing": true,
+      "health_check": true,
+      "signal_queue": true
+    },
+    "Copy Engine": {
+      "diagnose": true,
+      "close_risky": true,
+      "stop_copy": true,
+      "guard_risk": true,
+      "ADL_protect": true
+    },
+    "Strategy Common": {
+      "no_dup_symbols": true,
+      "dyn_blacklist": true,
+      "hour_block": true,
+      "DCA": true,
+      "breakeven": true,
+      "pos_limit": true
+    }
+  },
+  "strategy_backtests": {
+    "Venture Brain (Meme/Alt)": {
+      "DOGE/USDT:USDT": {
+        "total_return_pct": -0.546,
+        "buy_hold_pct": -0.524,
+        "alpha_pct": -0.022,
+        "total_trades": 10,
+        "long": 6,
+        "short": 4,
+        "wins": 4,
+        "losses": 6,
+        "win_rate_pct": 40.0,
+        "max_win_pct": 0.233,
+        "max_loss_pct": -0.436,
+        "breakeven_stops": 3,
+        "sharpe": -1.04,
+        "data_days": 3.1
+      },
+      "PEPE/USDT:USDT": {
+        "total_return_pct": -3.603,
+        "buy_hold_pct": 4.493,
+        "alpha_pct": -8.096,
+        "total_trades": 13,
+        "long": 7,
+        "short": 6,
+        "wins": 1,
+        "losses": 12,
+        "win_rate_pct": 7.7,
+        "max_win_pct": 2.306,
+        "max_loss_pct": -1.065,
+        "breakeven_stops": 6,
+        "sharpe": -1.26,
+        "data_days": 3.1
+      },
+      "WIF/USDT:USDT": {
+        "total_return_pct": 0.623,
+        "buy_hold_pct": -5.27,
+        "alpha_pct": 5.893,
+        "total_trades": 11,
+        "long": 6,
+        "short": 5,
+        "wins": 7,
+        "losses": 4,
+        "win_rate_pct": 63.6,
+        "max_win_pct": 0.518,
+        "max_loss_pct": -0.861,
+        "breakeven_stops": 2,
+        "sharpe": 0.45,
+        "data_days": 3.1
+      },
+      "SHIB/USDT:USDT": {
+        "total_return_pct": 5.424,
+        "buy_hold_pct": 5.862,
+        "alpha_pct": -0.439,
+        "total_trades": 16,
+        "long": 12,
+        "short": 4,
+        "wins": 10,
+        "losses": 6,
+        "win_rate_pct": 62.5,
+        "max_win_pct": 1.231,
+        "max_loss_pct": -0.687,
+        "breakeven_stops": 3,
+        "sharpe": 2.09,
+        "data_days": 3.1
+      }
+    },
+    "Stock Venture Brain": {
+      "AAPL/USDT:USDT": {
+        "total_return_pct": 2.552,
+        "buy_hold_pct": -8.496,
+        "alpha_pct": 11.048,
+        "total_trades": 7,
+        "long": 2,
+        "short": 5,
+        "wins": 3,
+        "losses": 4,
+        "win_rate_pct": 42.9,
+        "max_win_pct": 1.056,
+        "max_loss_pct": -0.263,
+        "breakeven_stops": 2,
+        "sharpe": 1.68,
+        "data_days": 3.1
+      },
+      "TSLA/USDT:USDT": {
+        "total_return_pct": 0.969,
+        "buy_hold_pct": 3.739,
+        "alpha_pct": -2.77,
+        "total_trades": 8,
+        "long": 5,
+        "short": 3,
+        "wins": 6,
+        "losses": 2,
+        "win_rate_pct": 75.0,
+        "max_win_pct": 0.701,
+        "max_loss_pct": -0.979,
+        "breakeven_stops": 1,
+        "sharpe": 0.61,
+        "data_days": 3.1
+      },
+      "NVDA/USDT:USDT": {
+        "total_return_pct": 1.042,
+        "buy_hold_pct": 3.983,
+        "alpha_pct": -2.941,
+        "total_trades": 13,
+        "long": 8,
+        "short": 5,
+        "wins": 9,
+        "losses": 4,
+        "win_rate_pct": 69.2,
+        "max_win_pct": 0.784,
+        "max_loss_pct": -0.498,
+        "breakeven_stops": 2,
+        "sharpe": 0.71,
+        "data_days": 3.1
+      }
+    }
+  }
+}

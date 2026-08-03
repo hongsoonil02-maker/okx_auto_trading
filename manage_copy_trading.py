@@ -94,12 +94,13 @@ def main():
         print(json.dumps(ce.diagnose_copy_status(), indent=2, ensure_ascii=False))
 
     elif args.stop:
-        logger.info(f"🛑 리드 트레이더({target_code}) 카피 트레이딩 중단 요청...")
-        res = ce.stop_copy_trading(unique_code=target_code, sub_pos_close_type="market_close")
-        if res:
-            logger.info("✅ 중단 성공!")
-        else:
-            logger.error("❌ 중단 실패")
+        for t_code in target_codes:
+            logger.info(f"🛑 리드 트레이더({t_code}) 카피 트레이딩 중단 요청...")
+            res = ce.stop_copy_trading(unique_code=t_code, sub_pos_close_type="market_close")
+            if res:
+                logger.info(f"✅ {t_code} 중단 성공!")
+            else:
+                logger.error(f"❌ {t_code} 중단 실패")
 
     else:
         # 기본 동작 또는 --status: 상태 진단

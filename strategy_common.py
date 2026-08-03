@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+strategy_common.py — Shared base for OKX venture strategy brains.
+Both okx_venture_strategy.py and okx_stock_venture_strategy.py inherit
+from BaseStrategyBrain to eliminate duplicated TA + DCA logic.
+"""
+import os
+import sys
+import time
+import json
+import logging
+import asyncio
+import aiohttp
+from datetime import datetime
+from typing import List
+import pytz
+from dotenv import load_dotenv
+import pandas as pd
+import ccxt.async_support as ccxt_async
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+try:
+    from webhook_spec import WebhookPayload, ActionType, SideType, sign_payload, WEBHOOK_SIGNATURE_HEADER
+except ImportError as e:
+    print(f"❌ 모듈 임포트 실패: {e}")
+    sys.exit(1)
+
+try:
+    from bot_config import BotConfig
+except ImportError:
+    BotConfig = None
+
+
+def setup_logger(name: str, log_file: str) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        fh = logging.FileHandler(os.path.join(BASE_DIR, log_file), encoding="utf-8")
+        fh.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s - %(message)s'))
+        ch = logging.StreamHandler()
+        ch.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s - %(message)s'))
+        logger.addHandler(fh)
+        logger.addHandler(ch)
+    return logger
+
+
+def calc_supertrend(df, period=10, multiplier=3.0):
+    hl2 = (df['h'] + df['l']) / 2
+    atr = (df['h'].combine(df['c'].shift(), max) - df['l'].combine(df['c'].shift(), min)).rolling(period).mean()
+
+    final_upperband = hl2 + (multiplier * atr)
+    final_lowerband = hl2 - (multiplier * atr)
+
+    st_dir = pd.Series(1, index=df.index, dtype='int')
+    st_val = pd.Series(0.0, index=df.index, dtype='float64')
+
+    for i in range(period, len(df)):
+        if df['c'].iloc[i] > final_upperband.iloc[i-1]:
+            st_dir.iloc[i] = 1
+        elif df['c'].iloc[i] < final_lowerband.iloc[i-1]:
+            st_dir.iloc[i] = -1
+        else:
+            st_dir.iloc[i] = st_dir.iloc[i-1]
+            if st_dir.iloc[i] == 1 and final_lowerband.iloc[i] < final_lowerband.iloc[i-1]:
+                final_lowerband.iloc[i] = final_lowerband.iloc[i-1]
+            if st_dir.iloc[i] == -1 and final_upperband.iloc[i] > final_upperband.iloc[i-1]:
+                final_upperband.iloc[i] = final_upperband.iloc[i-1]
+
+        if st_dir.iloc[i] == 1:
+            st_val.iloc[i] = final_lowerband.iloc[i]
+        else:
+            st_val.iloc[i] = final_upperband.iloc[i]
+
+    return st_dir, st_val
+
+
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+
+def calc_stoch_rsi(series, period=14, smooth_k=3, smooth_d=3):
+    rsi = calc_rsi(series, period)
+    stoch_rsi = (rsi - rsi.rolling(period).min()) / (rsi.rolling(period).max() - rsi.rolling(period).min())
+    k = stoch_rsi.rolling(smooth_k).mean() * 100
+    d = k.rolling(smooth_d).mean()
+    return k, d
+
+
+class BaseStrategyBrain:
+    """
+    공통 전략 브레인 베이스 클래스.
+    서브클래스는 get_target_symbols()와 클래스 속성(CONFIG)만 오버라이드하면 됨.
+    """
+    STRATEGY_NAME = "BaseStrategy"
+    LOG_FILE = "base_strategy.log"
+    LOGGER_NAME = "BaseStrategy"
+    SUPERTREND_MULT_TIGHT = 2.0
+    PROFIT_THRESHOLD = 1.025
+    MASTER_WEBHOOK_URL = "http://localhost:8009/webhook"
+    AUTO_TRADE_INTERVAL = 60.0
+    STOCK_KEYWORDS = []
+    BLACKLIST = []
+    TIMEFRAME = "15m"
+    TIMEFRAME_MINUTES = 15
+    # [개선안 #1] Volume 확인 배수 — 서브클래스에서 오버라이드 가능
+    # 추가 전략 파라미터
+    PROFIT_THRESHOLD = 1.02  # 2% 수익 구간부터 청산 고려
+    VOL_CONFIRM_MULT = 1.2   # 거래량 급증 확인 배수
+    MIN_HOLD_CANDLES = 12     # 최소 보유 캔들 수
+    EMA_PERIOD = 200         # 추세 필터 기간 (기본 200)
+    # [안전망 추가] 긴급 하드 스탑로스: 현물 기준 -5% (레버리지 10x 적용 시 PnL -50%) 
+    HARD_STOP_LOSS_PCT = float(os.getenv("OKX_HARD_STOP_LOSS", "-0.50"))
+    # 신규 진입 차단: Master가 max_active_subpositions 초과 시 신호를 거부하므로
+    # 각 전략 뇌도 로컬에서 동일 제한을 사전 체크 (중복 신호 억제)
+    MAX_DCA_ENTRIES = int(os.getenv("OKX_MAX_DCA_ENTRIES", "3"))
+    POSITION_PORTION = float(os.getenv("OKX_POSITION_PORTION", "0.20"))
+    SCALE_OUT_EXITS = True
+    MAX_OPEN_POSITIONS = int(os.getenv("OKX_BOT_MAX_POSITIONS", "5"))
+    NEW_LISTING_SLOTS = int(os.getenv("OKX_NEW_LISTING_SLOTS", "2"))
+    NEW_LISTING_DAYS = 60
+
+    def __init__(self):
+        self.session = None
+        self.exchange = None
+        self.auto_active_pos = {}
+        self.dca_state = {}
+        self.config = BotConfig() if BotConfig else None
+        self.logger = setup_logger(self.LOGGER_NAME, self.LOG_FILE)
+
+    def _is_trading_hour_allowed(self) -> bool:
+        """DEPRECATED: Bots now run 24/7 relying purely on technical indicators."""
+        return True
+
+    def _get_dynamic_blacklist(self) -> List[str]:
+        """Merge hardcoded BLACKLIST with auto-tuned blacklisted_symbols from OKX."""
+        bl = list(self.BLACKLIST)
+        if self.config:
+            bl.extend(self.config.blacklisted_symbols_okx)
+        return bl
+
+    def _is_new_listing(self, symbol: str) -> bool:
+        """Check if the symbol was listed within the last NEW_LISTING_DAYS."""
+        if not self.exchange or not hasattr(self.exchange, 'markets') or not self.exchange.markets:
+            return False
+        m_info = self.exchange.markets.get(symbol, {})
+        info = m_info.get('info', {})
+        list_time_str = info.get('listTime', '0')
+        if not list_time_str:
+            return False
+        try:
+            list_time = int(list_time_str)
+            now_ms = time.time() * 1000
+            if (now_ms - list_time) < (self.NEW_LISTING_DAYS * 24 * 60 * 60 * 1000):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _get_dynamic_portion(self, symbol: str) -> float:
+        """
+        [승률 기반 탄력적 시드 분배 (Dynamic Sizing)]
+        - 신규 상장 종목(승률 높음)은 기본 할당량의 1.5배 (가중치 베팅)
+        - 오래된 종목(휩소 많음)은 기본 할당량의 0.7배 (비중 축소)
+        """
+        if self._is_new_listing(symbol):
+            return self.POSITION_PORTION * 1.5
+        else:
+            return self.POSITION_PORTION * 0.7
+
+    async def get_target_symbols(self):
+        try:
+            tickers = await self.exchange.fetch_tickers()
+            markets = await self.exchange.load_markets()
+            dynamic_blacklist = self._get_dynamic_blacklist()
+            data = []
+            for s, t in tickers.items():
+                if s in markets and markets[s].get('swap') and 'USDT' in s:
+                    if self._symbol_matches(s, t, markets) and not any(b in s for b in dynamic_blacklist):
+                        data.append({'symbol': s, 'vol': t.get('quoteVolume', 0)})
+            df = pd.DataFrame(data).sort_values(by='vol', ascending=False)
+            if df.empty:
+                return []
+            return df['symbol'].tolist()
+        except Exception as e:
+            self.logger.error(f"⚠️ [{self.STRATEGY_NAME}] 심볼 로드 실패: {e}")
+            return []
+
+    async def init_session(self):
+        self.session = aiohttp.ClientSession()
+        self.exchange = ccxt_async.okx({
+            "apiKey": os.getenv("OKX_API_KEY", ""),
+            "secret": os.getenv("OKX_SECRET", "") or os.getenv("OKX_API_SECRET", ""),
+            "password": os.getenv("OKX_PASSPHRASE", "") or os.getenv("OKX_PASSWORD", ""),
+            "enableRateLimit": True,
+            "options": {"defaultType": "swap"},
+        })
+
+    async def close_session(self):
+        if self.session:
+            await self.session.close()
+        if self.exchange:
+            await self.exchange.close()
+
+    async def send_webhook(self, side: SideType, symbol: str, qty: float):
+        payload = WebhookPayload(
+            action=ActionType.EXEC,
+            side=side,
+            symbol=symbol,
+            qty=qty,
+            signal_strength="STRONG",
+        )
+        json_data = json.loads(payload.to_json())
+        json_data["market"] = "okx_swap"
+        body = json.dumps(json_data)
+        headers = {"Content-Type": "application/json", WEBHOOK_SIGNATURE_HEADER: sign_payload(body)}
+        try:
+            async with self.session.post(
+                self.MASTER_WEBHOOK_URL,
+                data=body,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status in [200, 201]:
+                    self.logger.info(f"✅ Webhook 발송 완료: {side.value} {qty} {symbol}")
+                else:
+                    self.logger.error(f"❌ Webhook 발송 실패: {resp.status} - {await resp.text()}")
+        except Exception as e:
+            self.logger.error(f"❌ Webhook 전송 예외: {e}")
+
+    def is_us_market_active(self):
+        """DEPRECATED: OKX stock tokens trade 24/7. Use _is_trading_hour_allowed() instead.
+        This is kept for backward compat but always returns True since crypto never sleeps."""
+        return True
+
+    def _symbol_matches(self, symbol: str, ticker_data: dict, markets: dict) -> bool:
+        raise NotImplementedError
+
+    async def check_auto_logic(self, symbol):
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, self.TIMEFRAME, limit=300)
+            if not ohlcv or len(ohlcv) < 200:
+                return
+            df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+
+            st_d_loose, st_v_loose = calc_supertrend(df, 10, 4.0)
+            st_d_tight, st_v_tight = calc_supertrend(df, 10, self.SUPERTREND_MULT_TIGHT)
+            df['st_d_loose'] = st_d_loose
+            df['st_v_loose'] = st_v_loose
+            df['st_d_tight'] = st_d_tight
+            df['st_v_tight'] = st_v_tight
+
+            df['vol_ma'] = df['v'].rolling(20).mean()
+            k, d = calc_stoch_rsi(df['c'], 14, 3, 3)
+            df['stoch_k'] = k
+            df['stoch_d'] = d
+            df['vol_ma'] = df['v'].rolling(20).mean()
+            df['ema_target'] = df['c'].ewm(span=self.EMA_PERIOD, adjust=False).mean()
+
+            prev, curr = df.iloc[-2], df.iloc[-1]
+            t_curr = curr['t']
+            dca = self.dca_state.setdefault(symbol, {'entry_count': 0, 'exit_count': 0, 'last_entry_t': 0, 'last_exit_t': 0, 'first_entry_t': 0, 'max_pnl_pct': 0.0})
+
+            pos_long = self.auto_active_pos.get((symbol, 'long'))
+            has_long = pos_long is not None
+            avg_price_long = pos_long['avgPrice'] if has_long else 0
+
+            pos_short = self.auto_active_pos.get((symbol, 'short'))
+            has_short = pos_short is not None
+            avg_price_short = pos_short['avgPrice'] if has_short else 0
+
+            vol_cond = curr['v'] > prev['vol_ma'] * self.VOL_CONFIRM_MULT
+
+            # 기초 시그널 판단
+            is_long_breakout = prev['st_d_loose'] == -1 and curr['st_d_loose'] == 1
+            is_short_breakout = prev['st_d_loose'] == 1 and curr['st_d_loose'] == -1
+
+            is_long_pullback = curr['st_d_loose'] == 1 and prev['stoch_k'] < 20 and curr['stoch_k'] >= 20
+            is_short_pullback = curr['st_d_loose'] == -1 and prev['stoch_k'] > 80 and curr['stoch_k'] <= 80
+
+            is_ema_trend_up = curr['c'] > curr['ema_target']
+            is_ema_trend_down = curr['c'] < curr['ema_target']
+
+            # 롱 진입 점수 계산
+            long_score = 0
+            if is_ema_trend_up: long_score += 60
+            if is_long_breakout: long_score += 40
+            if is_long_pullback: long_score += 40
+            
+            # 숏 진입 점수 계산
+            short_score = 0
+            if is_ema_trend_down: short_score += 60
+            if is_short_breakout: short_score += 40
+            if is_short_pullback: short_score += 40
+
+            # 총점 100점 이상 + 거래량 조건 충족 시 최종 진입 시그널
+            is_long_sig = (long_score >= 100) and vol_cond
+            is_short_sig = (short_score >= 100) and vol_cond
+            
+            leverage = int(os.getenv("OKX_LEVERAGE", "10"))
+            
+            pnl_pct_long = 0
+            is_hard_stop_long = False
+            take_profit_long_sig = False
+            if has_long and avg_price_long > 0:
+                pnl_pct_long = ((curr['c'] - avg_price_long) / avg_price_long) * leverage
+                if pnl_pct_long > dca['max_pnl_pct']:
+                    dca['max_pnl_pct'] = pnl_pct_long
+                
+                is_profit = curr['c'] > avg_price_long * self.PROFIT_THRESHOLD
+                st_v_long = curr['st_v_tight'] if is_profit else curr['st_v_loose']
+                st_d_long = curr['st_d_tight'] if is_profit else curr['st_d_loose']
+                close_long_sig = st_d_long == -1 or curr['c'] < st_v_long
+                force_close_long = False
+                
+                if pnl_pct_long <= self.HARD_STOP_LOSS_PCT:
+                    force_close_long = True
+                    is_hard_stop_long = True
+                elif dca['max_pnl_pct'] >= 0.40 and pnl_pct_long <= 0.20:
+                    force_close_long = True
+                elif dca['max_pnl_pct'] >= 0.20 and pnl_pct_long <= 0.02:
+                    force_close_long = True
+                elif pnl_pct_long >= 0.15 and dca['exit_count'] == 0:
+                    take_profit_long_sig = True
+                elif pnl_pct_long >= 0.30 and dca['exit_count'] == 1:
+                    take_profit_long_sig = True
+                elif pnl_pct_long >= 0.50 and dca['exit_count'] == 2:
+                    take_profit_long_sig = True
+                elif dca['exit_count'] > 0 and curr['c'] < avg_price_long:
+                    # [개선안 #3] 최소 보유 캔들 수 체크 — 진입 직후 whipsaw 방지
+                    candles_held = (t_curr - dca.get('first_entry_t', t_curr)) / (self.TIMEFRAME_MINUTES * 60 * 1000)
+                    if candles_held >= self.MIN_HOLD_CANDLES:
+                        force_close_long = True
+            else:
+                close_long_sig = False
+                force_close_long = False
+
+            take_profit_short_sig = False
+            if has_short and avg_price_short > 0:
+                pnl_pct_short = ((avg_price_short - curr['c']) / avg_price_short) * leverage
+                if pnl_pct_short > dca['max_pnl_pct']:
+                    dca['max_pnl_pct'] = pnl_pct_short
+                
+                is_profit = curr['c'] < avg_price_short * (2.0 - self.PROFIT_THRESHOLD)
+                st_v_short = curr['st_v_tight'] if is_profit else curr['st_v_loose']
+                st_d_short = curr['st_d_tight'] if is_profit else curr['st_d_loose']
+                close_short_sig = st_d_short == 1 or curr['c'] > st_v_short
+                force_close_short = False
+                
+                if pnl_pct_short <= self.HARD_STOP_LOSS_PCT:
+                    force_close_short = True
+                    is_hard_stop_short = True
+                elif dca['max_pnl_pct'] >= 0.40 and pnl_pct_short <= 0.20:
+                    force_close_short = True
+                elif dca['max_pnl_pct'] >= 0.20 and pnl_pct_short <= 0.02:
+                    force_close_short = True
+                elif pnl_pct_short >= 0.15 and dca['exit_count'] == 0:
+                    take_profit_short_sig = True
+                elif pnl_pct_short >= 0.30 and dca['exit_count'] == 1:
+                    take_profit_short_sig = True
+                elif pnl_pct_short >= 0.50 and dca['exit_count'] == 2:
+                    take_profit_short_sig = True
+                elif dca['exit_count'] > 0 and curr['c'] > avg_price_short:
+                    # [개선안 #3] 최소 보유 캔들 수 체크
+                    candles_held = (t_curr - dca.get('first_entry_t', t_curr)) / (self.TIMEFRAME_MINUTES * 60 * 1000)
+                    if candles_held >= self.MIN_HOLD_CANDLES:
+                        force_close_short = True
+            else:
+                close_short_sig = False
+                force_close_short = False
+
+            if has_long:
+                if force_close_long and dca.get('last_exit_t') != t_curr:
+                    if is_hard_stop_long:
+                        self.logger.warning(f"🚨 [HARD STOP] 롱 전량 긴급 손절 (손실률: {pnl_pct_long*100:.2f}%): {symbol}")
+                    else:
+                        self.logger.info(f"💨 [Breakeven Stop] 롱 전량 방어 청산: {symbol}")
+                    await self.send_webhook(SideType.CLOSE_LONG, symbol, 0)
+                    dca['exit_count'] = 8
+                    dca['entry_count'] = 0
+                    dca['last_exit_t'] = t_curr
+                    dca['max_pnl_pct'] = 0.0
+                elif close_long_sig or take_profit_long_sig:
+                    if dca['exit_count'] < self.MAX_DCA_ENTRIES and dca.get('last_exit_t') != t_curr:
+                        qty = self.auto_active_pos[(symbol, 'long')]['size']
+                        if not self.SCALE_OUT_EXITS:
+                            sell_qty = qty
+                            dca['exit_count'] = self.MAX_DCA_ENTRIES - 1
+                        else:
+                            sell_qty = qty / (self.MAX_DCA_ENTRIES - dca['exit_count'])
+                        m_info = self.exchange.markets.get(symbol)
+                        if m_info:
+                            min_amount = m_info.get('limits', {}).get('amount', {}).get('min', 0)
+                            if min_amount and sell_qty < min_amount:
+                                sell_qty = min_amount
+                        if sell_qty >= qty:
+                            sell_qty = 0
+                        else:
+                            sell_qty = float(self.exchange.amount_to_precision(symbol, sell_qty))
+                        if sell_qty >= 0:
+                            if take_profit_long_sig:
+                                self.logger.info(f"💎 [Take Profit] 롱 목표가 달성 분할 익절 ({dca['exit_count']+1}/{self.MAX_DCA_ENTRIES}): {symbol} (수량: {sell_qty})")
+                            else:
+                                self.logger.info(f"💨 [{self.STRATEGY_NAME} DCA] 롱 분할 청산 ({dca['exit_count']+1}/{self.MAX_DCA_ENTRIES}): {symbol} (수량: {sell_qty if sell_qty > 0 else 'ALL'})")
+                            await self.send_webhook(SideType.CLOSE_LONG, symbol, sell_qty)
+                        dca['exit_count'] += 1
+                        dca['last_exit_t'] = t_curr
+                        if dca['exit_count'] >= self.MAX_DCA_ENTRIES:
+                            dca['entry_count'] = 0
+                            dca['exit_count'] = 0
+                            dca['max_pnl_pct'] = 0.0
+                else:
+                    if dca['entry_count'] < self.MAX_DCA_ENTRIES and dca.get('last_entry_t') != t_curr:
+                        self.logger.info(f"🔥 [{self.STRATEGY_NAME} DCA] 롱 분할 진입 ({dca['entry_count']+1}/{self.MAX_DCA_ENTRIES}): {symbol}")
+                        await self.execute_auto_entry(symbol, SideType.BUY, portion=(self.POSITION_PORTION / self.MAX_DCA_ENTRIES))
+                        dca['entry_count'] += 1
+                        dca['last_entry_t'] = t_curr
+
+            if has_short:
+                if force_close_short and dca.get('last_exit_t') != t_curr:
+                    if is_hard_stop_short:
+                        self.logger.warning(f"🚨 [HARD STOP] 숏 전량 긴급 손절 (손실률: {pnl_pct_short*100:.2f}%): {symbol}")
+                    else:
+                        self.logger.info(f"💨 [Breakeven Stop] 숏 전량 방어 청산: {symbol}")
+                    await self.send_webhook(SideType.CLOSE_SHORT, symbol, 0)
+                    dca['exit_count'] = 8
+                    dca['entry_count'] = 0
+                    dca['last_exit_t'] = t_curr
+                    dca['max_pnl_pct'] = 0.0
+                elif close_short_sig or take_profit_short_sig:
+                    if dca['exit_count'] < self.MAX_DCA_ENTRIES and dca.get('last_exit_t') != t_curr:
+                        qty = self.auto_active_pos[(symbol, 'short')]['size']
+                        if not self.SCALE_OUT_EXITS:
+                            sell_qty = qty
+                            dca['exit_count'] = self.MAX_DCA_ENTRIES - 1
+                        else:
+                            sell_qty = qty / (self.MAX_DCA_ENTRIES - dca['exit_count'])
+                        m_info = self.exchange.markets.get(symbol)
+                        if m_info:
+                            min_amount = m_info.get('limits', {}).get('amount', {}).get('min', 0)
+                            if min_amount and sell_qty < min_amount:
+                                sell_qty = min_amount
+                        if sell_qty >= qty:
+                            sell_qty = 0
+                        else:
+                            sell_qty = float(self.exchange.amount_to_precision(symbol, sell_qty))
+                        if sell_qty >= 0:
+                            if take_profit_short_sig:
+                                self.logger.info(f"💎 [Take Profit] 숏 목표가 달성 분할 익절 ({dca['exit_count']+1}/{self.MAX_DCA_ENTRIES}): {symbol} (수량: {sell_qty})")
+                            else:
+                                self.logger.info(f"💨 [{self.STRATEGY_NAME} DCA] 숏 분할 청산 ({dca['exit_count']+1}/{self.MAX_DCA_ENTRIES}): {symbol} (수량: {sell_qty if sell_qty > 0 else 'ALL'})")
+                            await self.send_webhook(SideType.CLOSE_SHORT, symbol, sell_qty)
+                        dca['exit_count'] += 1
+                        dca['last_exit_t'] = t_curr
+                        if dca['exit_count'] >= self.MAX_DCA_ENTRIES:
+                            dca['entry_count'] = 0
+                            dca['exit_count'] = 0
+                            dca['max_pnl_pct'] = 0.0
+                elif is_short_pullback and dca['entry_count'] < self.MAX_DCA_ENTRIES and dca.get('last_entry_t') != t_curr:
+                    self.logger.info(f"📉 [Short Pullback 진입] {symbol} (DCA {dca['entry_count']+1}/{self.MAX_DCA_ENTRIES})")
+                    dyn_portion = self._get_dynamic_portion(symbol)
+                    await self.execute_auto_entry(symbol, SideType.SELL, portion=(dyn_portion / self.MAX_DCA_ENTRIES))
+                    dca['entry_count'] += 1
+                    dca['last_entry_t'] = t_curr
+
+            else:
+                active_symbols = set(sym for sym, _side in self.auto_active_pos.keys())
+                total_count = len(active_symbols)
+                new_listing_count = sum(1 for s in active_symbols if self._is_new_listing(s))
+                regular_count = total_count - new_listing_count
+                max_regular = self.MAX_OPEN_POSITIONS - self.NEW_LISTING_SLOTS
+                
+                is_new_listing = self._is_new_listing(symbol)
+                
+                if not is_new_listing:
+                    if regular_count >= max_regular:
+                        # 일반 종목 슬롯 포화 -> 예약된 신규 슬롯 보호를 위해 진입 차단
+                        return
+                
+                if total_count >= self.MAX_OPEN_POSITIONS:
+                    # 전체 슬롯 포화
+                    return
+
+                dyn_portion = self._get_dynamic_portion(symbol)
+                
+                if is_long_sig and dca.get('last_entry_t') != t_curr:
+                    self.logger.info(f"🟢 [Scoring System 신규 진입] {symbol} (Score: {long_score})")
+                    await self.execute_auto_entry(symbol, SideType.BUY, portion=(dyn_portion / self.MAX_DCA_ENTRIES))
+                    dca['entry_count'] = 1
+                    dca['exit_count'] = 0
+                    dca['last_entry_t'] = t_curr
+                    dca['first_entry_t'] = t_curr
+                elif is_short_sig and dca.get('last_entry_t') != t_curr:
+                    self.logger.info(f"🔴 [Scoring System 신규 진입] {symbol} (Score: {short_score})")
+                    await self.execute_auto_entry(symbol, SideType.SELL, portion=(dyn_portion / self.MAX_DCA_ENTRIES))
+                    dca['entry_count'] = 1
+                    dca['exit_count'] = 0
+                    dca['last_entry_t'] = t_curr
+                    dca['first_entry_t'] = t_curr
+
+        except Exception as e:
+            self.logger.error(f"⚠️ [{self.STRATEGY_NAME}] 로직 체크 실패 ({symbol}): {e}")
+
+    async def execute_auto_entry(self, symbol: str, side: SideType, portion: float = 0.20):
+        try:
+            balance = await self.exchange.fetch_balance()
+            free_usdt = balance.get('USDT', {}).get('free', 0)
+            if not free_usdt:
+                free_usdt = balance.get('free', {}).get('USDT', 0)
+            ticker = await self.exchange.fetch_ticker(symbol)
+            price = ticker.get('last')
+
+            if not free_usdt or not price:
+                return
+
+            leverage = int(os.getenv("OKX_LEVERAGE", "10"))
+            raw_amount = (free_usdt * portion * leverage) / price
+
+            market_info = self.exchange.markets.get(symbol)
+            contract_size = market_info.get('contractSize', 1) if market_info else 1
+            raw_contracts = raw_amount / float(contract_size)
+
+            amount = self.exchange.amount_to_precision(symbol, raw_contracts)
+            amount = float(amount)
+
+            if amount > 0:
+                min_amount = market_info.get('limits', {}).get('amount', {}).get('min', 0) if market_info else 0
+                max_amount = market_info.get('limits', {}).get('market', {}).get('max', 0) if market_info else 0
+
+                if min_amount and amount < min_amount:
+                    self.logger.warning(f"⚠️ 진입 수량({amount})이 최소 수량({min_amount}) 미만 (보유 USDT: {free_usdt:.2f})")
+                    return
+                if max_amount and amount > max_amount:
+                    amount = float(self.exchange.amount_to_precision(symbol, max_amount))
+
+                required_margin = (amount * float(contract_size) * price) / leverage
+                if required_margin > free_usdt * 0.95:
+                    self.logger.warning(f"⚠️ USDT 증거금 부족 - 필요: {required_margin:.2f}, 보유: {free_usdt:.2f} (수량: {amount})")
+                    return
+
+                self.logger.info(f"🔥 [{self.STRATEGY_NAME}] 신규 진입 시그널: {side.value} {symbol} (수량: {amount})")
+                await self.send_webhook(side, symbol, amount)
+        except Exception as e:
+            self.logger.error(f"⚠️ [{self.STRATEGY_NAME}] 진입 수량 계산 실패 ({symbol}): {e}")
+
+    async def run_auto_trade_loop(self):
+        self.logger.info(f"🚀 [{self.STRATEGY_NAME}] 자동매매 엔진 시작 (Supertrend + StochRSI)")
+        _config_check_counter = 0
+        while True:
+            try:
+                symbols = await self.get_target_symbols()
+                if not symbols:
+                    await asyncio.sleep(60)
+                    continue
+
+                positions = await self.exchange.fetch_positions()
+                self.auto_active_pos = {}
+                for p in positions:
+                    if float(p.get('contracts', 0)) > 0:
+                        sym = p.get('symbol')
+                        s = p.get('side')
+                        self.auto_active_pos[(sym, s)] = {
+                            'size': float(p['contracts']),
+                            'avgPrice': float(p.get('avgPrice', p.get('price', 0))),
+                        }
+
+                for symbol in symbols:
+                    await self.check_auto_logic(symbol)
+                    await asyncio.sleep(0.1)
+
+                _config_check_counter += 1
+                if _config_check_counter % 10 == 0 and self.config:
+                    self.config.refresh()
+
+            except Exception as e:
+                self.logger.error(f"❌ [{self.STRATEGY_NAME}] 예외 발생: {e}")
+
+            await asyncio.sleep(self.AUTO_TRADE_INTERVAL)
+
+    async def run_all(self):
+        await self.init_session()
+        try:
+            await self.run_auto_trade_loop()
+        finally:
+            await self.close_session()

@@ -1,0 +1,18 @@
+[Unit]
+Description=Bot E - Shadow Copy Mirror Bot
+After=network.target bot_c_okx_swap.service
+Requires=bot_c_okx_swap.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hongsoonil02/quant_system
+ExecStart=/usr/bin/python3 /home/hongsoonil02/quant_system/bot_e_shadow_mirror.py
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-/home/hongsoonil02/quant_system/.env
+Environment="PYTHONUNBUFFERED=1"
+StandardOutput=append:/home/hongsoonil02/quant_system/bot_e_shadow_mirror.log
+StandardError=append:/home/hongsoonil02/quant_system/bot_e_shadow_mirror.log
+
+[Install]
+WantedBy=default.target
