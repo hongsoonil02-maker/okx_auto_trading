@@ -15,6 +15,7 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
     STRATEGY_NAME = "OKX_Venture"
     LOG_FILE = "okx_venture_strategy.log"
     LOGGER_NAME = "OKX_Venture_Strategy"
+    STRATEGY_LEVERAGE = 50        # 50x 레버리지 강제 오버라이드
     SUPERTREND_MULT_TIGHT = 2.0   # 롤백: 2.5→2.0 (백테스트 결과 WIF 수익 악화 확인)
     PROFIT_THRESHOLD = 1.025
     VOL_CONFIRM_MULT = 1.0        # [개선안 #1] 1.2→1.0 (급등장 진입 지연 방지)

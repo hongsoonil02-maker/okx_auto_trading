@@ -118,9 +118,9 @@ class BotCOKXSwap:
             else:  # SELL
                 params = {"posSide": "short"}
 
-            # [수정] 주문 전 레버리지 자동 세팅 (환경변수 OKX_LEVERAGE 적용)
+            # [수정] 주문 전 레버리지 자동 세팅 (개별 payload 우선, 없으면 환경변수)
             try:
-                leverage = int(os.getenv("OKX_LEVERAGE", "10"))
+                leverage = payload.leverage if payload.leverage is not None else int(os.getenv("OKX_LEVERAGE", "10"))
                 await self.exchange.set_leverage(leverage, ccxt_symbol, {"mgnMode": "cross"})
                 logger.info(f"⚙️ [레버리지 설정] {ccxt_symbol} -> {leverage}x (Cross)")
             except Exception as e:

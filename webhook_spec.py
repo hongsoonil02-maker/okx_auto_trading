@@ -77,6 +77,7 @@ class WebhookPayload:
     price:           Optional[float] = None   # 시장가의 경우 None
     flag:            Optional[str]   = None   # 보조 플래그
     signal_strength: Optional[str]  = None   # "STRONG" / "WEAK"
+    leverage:        Optional[int]   = None   # 개별 전략용 레버리지 오버라이드
     signal_id:       str = ""  # 하위 호환성을 위해 유지
 
     def __post_init__(self):
