@@ -110,16 +110,16 @@ class BaseStrategyBrain:
     TIMEFRAME = "15m"
     TIMEFRAME_MINUTES = 15
     # [개선안 #1] Volume 확인 배수 — 서브클래스에서 오버라이드 가능
-    # 추가 전략 파라미터
-    PROFIT_THRESHOLD = 1.02  # 2% 수익 구간부터 청산 고려
+    # 추가 전략 파라미터 (AI 토너먼트 1등 Alpha_Trend 파라미터 적용)
+    PROFIT_THRESHOLD = 1.03  # 3% 수익 구간부터 청산 고려
     VOL_CONFIRM_MULT = 1.2   # 거래량 급증 확인 배수
-    MIN_HOLD_CANDLES = 12     # 최소 보유 캔들 수
-    EMA_PERIOD = 200         # 추세 필터 기간 (기본 200)
+    MIN_HOLD_CANDLES = 3     # 최소 보유 캔들 수
+    EMA_PERIOD = 50          # 추세 필터 기간
     # [안전망 추가] 긴급 하드 스탑로스: 현물 기준 -5% (레버리지 10x 적용 시 PnL -50%) 
     HARD_STOP_LOSS_PCT = float(os.getenv("OKX_HARD_STOP_LOSS", "-0.50"))
     # 신규 진입 차단: Master가 max_active_subpositions 초과 시 신호를 거부하므로
     # 각 전략 뇌도 로컬에서 동일 제한을 사전 체크 (중복 신호 억제)
-    MAX_DCA_ENTRIES = int(os.getenv("OKX_MAX_DCA_ENTRIES", "3"))
+    MAX_DCA_ENTRIES = int(os.getenv("OKX_MAX_DCA_ENTRIES", "8"))
     POSITION_PORTION = float(os.getenv("OKX_POSITION_PORTION", "0.20"))
     SCALE_OUT_EXITS = True
     MAX_OPEN_POSITIONS = int(os.getenv("OKX_BOT_MAX_POSITIONS", "5"))
@@ -182,8 +182,11 @@ class BaseStrategyBrain:
             data = []
             for s, t in tickers.items():
                 if s in markets and markets[s].get('swap') and 'USDT' in s:
-                    if self._symbol_matches(s, t, markets) and not any(b in s for b in dynamic_blacklist):
-                        data.append({'symbol': s, 'vol': t.get('quoteVolume', 0)})
+                    vol = float(t.get('quoteVolume', 0))
+                    # [긴급 패치] 24시간 거래대금 1천만 불(10M USDT) 미만인 잡코인 원천 차단
+                    if vol >= 10000000:
+                        if self._symbol_matches(s, t, markets) and not any(b in s for b in dynamic_blacklist):
+                            data.append({'symbol': s, 'vol': vol})
             df = pd.DataFrame(data).sort_values(by='vol', ascending=False)
             if df.empty:
                 return []
@@ -249,7 +252,7 @@ class BaseStrategyBrain:
                 return
             df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
 
-            st_d_loose, st_v_loose = calc_supertrend(df, 10, 4.0)
+            st_d_loose, st_v_loose = calc_supertrend(df, 10, 3.0)
             st_d_tight, st_v_tight = calc_supertrend(df, 10, self.SUPERTREND_MULT_TIGHT)
             df['st_d_loose'] = st_d_loose
             df['st_v_loose'] = st_v_loose

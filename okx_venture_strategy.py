@@ -20,7 +20,7 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
     VOL_CONFIRM_MULT = 1.0        # [개선안 #1] 1.2→1.0 (급등장 진입 지연 방지)
     MIN_HOLD_CANDLES = 3          # [개선안 #3] Breakeven 최소 3캔들 보유
     STOCK_KEYWORDS = []
-    BLACKLIST = ['KR200', 'SKHYNIX']
+    BLACKLIST = ['KR200', 'SKHYNIX', 'MU', 'SHAZ', 'ISRG', 'ROBO', 'RAM', 'DRAM', 'GME']
     MAJORS_AND_STOCKS = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'LINK', 'DOT', 'BNB', 'TRX', 'TSLA', 'NVDA', 'AAPL', 'AMZN', 'MSFT', 'META', 'GOOG', 'COIN']
 
     def _symbol_matches(self, symbol: str, ticker_data: dict, markets: dict) -> bool:

@@ -1,0 +1,134 @@
+{
+    "ranking": [
+        [
+            "Alpha_Trend",
+            9.43
+        ],
+        [
+            "Current_Base",
+            -9.16
+        ],
+        [
+            "Beta_Safe",
+            -10.66
+        ],
+        [
+            "Delta_DCA",
+            -12.84
+        ],
+        [
+            "Gamma_Sniper",
+            -16.23
+        ],
+        [
+            "Epsilon_High",
+            -22.259999999999998
+        ]
+    ],
+    "details": {
+        "Current_Base": {
+            "BTC/USDT:USDT": -0.59,
+            "ETH/USDT:USDT": -1.08,
+            "SOL/USDT:USDT": -3.5,
+            "DOGE/USDT:USDT": -3.43,
+            "PEPE/USDT:USDT": -0.56
+        },
+        "Alpha_Trend": {
+            "BTC/USDT:USDT": 1.43,
+            "ETH/USDT:USDT": 0,
+            "SOL/USDT:USDT": 0,
+            "DOGE/USDT:USDT": 2.33,
+            "PEPE/USDT:USDT": 5.67
+        },
+        "Beta_Safe": {
+            "BTC/USDT:USDT": -3.1,
+            "ETH/USDT:USDT": 0,
+            "SOL/USDT:USDT": 0,
+            "DOGE/USDT:USDT": 2.25,
+            "PEPE/USDT:USDT": -9.81
+        },
+        "Gamma_Sniper": {
+            "BTC/USDT:USDT": -0.59,
+            "ETH/USDT:USDT": -1.08,
+            "SOL/USDT:USDT": -3.5,
+            "DOGE/USDT:USDT": -3.43,
+            "PEPE/USDT:USDT": -7.63
+        },
+        "Delta_DCA": {
+            "BTC/USDT:USDT": -1.02,
+            "ETH/USDT:USDT": -1.96,
+            "SOL/USDT:USDT": -3.81,
+            "DOGE/USDT:USDT": -3.21,
+            "PEPE/USDT:USDT": -2.84
+        },
+        "Epsilon_High": {
+            "BTC/USDT:USDT": -0.59,
+            "ETH/USDT:USDT": -1.08,
+            "SOL/USDT:USDT": -13.09,
+            "DOGE/USDT:USDT": 0,
+            "PEPE/USDT:USDT": -7.5
+        }
+    },
+    "params": {
+        "Current_Base": {
+            "ema_period": 200,
+            "tight_mult": 2.0,
+            "loose_mult": 4.0,
+            "vol_mult": 1.0,
+            "min_hold": 3,
+            "max_dca": 8,
+            "tp_thr": 1.025,
+            "scale_out": true
+        },
+        "Alpha_Trend": {
+            "ema_period": 50,
+            "tight_mult": 2.0,
+            "loose_mult": 3.0,
+            "vol_mult": 1.2,
+            "min_hold": 3,
+            "max_dca": 8,
+            "tp_thr": 1.03,
+            "scale_out": true
+        },
+        "Beta_Safe": {
+            "ema_period": 200,
+            "tight_mult": 1.5,
+            "loose_mult": 2.5,
+            "vol_mult": 1.5,
+            "min_hold": 5,
+            "max_dca": 5,
+            "tp_thr": 1.01,
+            "scale_out": false
+        },
+        "Gamma_Sniper": {
+            "ema_period": 100,
+            "tight_mult": 2.5,
+            "loose_mult": 4.0,
+            "vol_mult": 1.5,
+            "min_hold": 1,
+            "max_dca": 8,
+            "tp_thr": 1.015,
+            "scale_out": true
+        },
+        "Delta_DCA": {
+            "ema_period": 200,
+            "tight_mult": 2.5,
+            "loose_mult": 4.0,
+            "vol_mult": 1.0,
+            "min_hold": 3,
+            "max_dca": 12,
+            "tp_thr": 1.02,
+            "scale_out": true
+        },
+        "Epsilon_High": {
+            "ema_period": 200,
+            "tight_mult": 3.0,
+            "loose_mult": 5.0,
+            "vol_mult": 1.2,
+            "min_hold": 3,
+            "max_dca": 8,
+            "tp_thr": 1.05,
+            "scale_out": false
+        }
+    }
+}
