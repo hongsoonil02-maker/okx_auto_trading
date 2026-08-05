@@ -8,6 +8,7 @@ echo "[$(date)] coinbot cleanup/start 시작 (systemd 기반)"
 pkill -9 -f 'master_bot_orchestrator.py' >/dev/null 2>&1 || true
 pkill -9 -f 'bot_c_okx_swap.py' >/dev/null 2>&1 || true
 pkill -9 -f 'okx_major_strategy.py' >/dev/null 2>&1 || true
+pkill -9 -f 'okx_stock_strategy.py' >/dev/null 2>&1 || true
 pkill -9 -f 'okx_venture_strategy.py' >/dev/null 2>&1 || true
 pkill -9 -f 'okx_stock_venture_strategy.py' >/dev/null 2>&1 || true
 pkill -9 -f 'daily_analyzer.py' >/dev/null 2>&1 || true

@@ -182,14 +182,18 @@ class BaseStrategyBrain:
             data = []
             for s, t in tickers.items():
                 if s in markets and markets[s].get('swap') and 'USDT' in s:
-                    vol = float(t.get('quoteVolume', 0))
+                    raw_vol = t.get('quoteVolume')
+                    try:
+                        vol = float(raw_vol) if raw_vol is not None else 0.0
+                    except (ValueError, TypeError):
+                        vol = 0.0
                     # [긴급 패치] 24시간 거래대금 1천만 불(10M USDT) 미만인 잡코인 원천 차단
                     if vol >= 10000000:
                         if self._symbol_matches(s, t, markets) and not any(b in s for b in dynamic_blacklist):
                             data.append({'symbol': s, 'vol': vol})
-            df = pd.DataFrame(data).sort_values(by='vol', ascending=False)
-            if df.empty:
+            if not data:
                 return []
+            df = pd.DataFrame(data).sort_values(by='vol', ascending=False)
             return df['symbol'].tolist()
         except Exception as e:
             self.logger.error(f"⚠️ [{self.STRATEGY_NAME}] 심볼 로드 실패: {e}")
@@ -565,13 +569,17 @@ class BaseStrategyBrain:
                 positions = await self.exchange.fetch_positions()
                 self.auto_active_pos = {}
                 for p in positions:
-                    if float(p.get('contracts', 0)) > 0:
-                        sym = p.get('symbol')
-                        s = p.get('side')
-                        self.auto_active_pos[(sym, s)] = {
-                            'size': float(p['contracts']),
-                            'avgPrice': float(p.get('avgPrice', p.get('price', 0))),
-                        }
+                    try:
+                        contracts_str = p.get('contracts')
+                        if contracts_str is not None and float(contracts_str) > 0:
+                            sym = p.get('symbol')
+                            s = p.get('side')
+                            self.auto_active_pos[(sym, s)] = {
+                                'size': float(contracts_str),
+                                'avgPrice': float(p.get('avgPrice', p.get('price', 0))),
+                            }
+                    except (ValueError, TypeError):
+                        pass
 
                 for symbol in symbols:
                     await self.check_auto_logic(symbol)
