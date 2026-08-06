@@ -23,8 +23,8 @@ class OKXMajorStrategyBrain(BaseStrategyBrain):
     SCALE_OUT_EXITS = False
     STRATEGY_LEVERAGE = 50  # 50x 레버리지 강제 오버라이드
     
-    # 5회 DCA 물타기 허용
-    MAX_DCA_ENTRIES = 5
+    # 8회 DCA 물타기 허용 (Vibe-Trading AI)
+    MAX_DCA_ENTRIES = 8
     
     MAJOR_COINS = ['BTC', 'ETH', 'XRP'] # 금강대제의 주력 종목으로 압축
 
