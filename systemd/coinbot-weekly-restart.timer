@@ -1,0 +1,9 @@
+[Unit]
+Description=Restart coinbot weekly (Sunday 04:00 KST = Sat 19:00 UTC)
+
+[Timer]
+OnCalendar=Sat *-*-* 19:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-strategy_common.py — Shared base for OKX venture strategy brains.
-Both okx_venture_strategy.py and okx_stock_venture_strategy.py inherit
-from BaseStrategyBrain to eliminate duplicated TA + DCA logic.
+strategy_common.py — Shared base for OKX strategy brains.
+okx_venture_strategy.py, okx_major_strategy.py 등이
+BaseStrategyBrain을 상속해 TA + DCA 로직을 공유한다.
 """
 import os
 import sys
