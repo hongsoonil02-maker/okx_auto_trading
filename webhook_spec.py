@@ -29,9 +29,19 @@ def sign_payload(payload_str: str) -> str:
     secret = get_webhook_secret()
     if not secret:
         return ""
-    return hmac.new(
-        secret.encode(), payload_str.encode(), hashlib.sha256
-    ).hexdigest()
+    # Ensure consistent ordering, sort keys and use canonical JSON format
+    import json
+    try:
+        parsed = json.loads(payload_str)
+        # Canonical representation: sort keys and use compact separators
+        canonical = json.dumps(parsed, separators=(',', ':'), sort_keys=True)
+        return hmac.new(
+            secret.encode(), canonical.encode(), hashlib.sha256
+        ).hexdigest()
+    except Exception:
+        return hmac.new(
+            secret.encode(), payload_str.encode(), hashlib.sha256
+        ).hexdigest()
 
 
 def verify_webhook_signature(payload_str: str, signature: str) -> bool:

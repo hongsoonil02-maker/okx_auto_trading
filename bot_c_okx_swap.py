@@ -7,10 +7,12 @@ bot_c_okx_swap.py — Bot C: OKX Futures 실제 주문 엔진 v2.0
 - 포트: 8003
 """
 import asyncio
+import json
 import os
 import sys
 import time
 import logging
+import logging.handlers
 import psutil
 from aiohttp import web
 from dotenv import load_dotenv
@@ -32,8 +34,11 @@ logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s - [BOT_C_OKX] %(message)s',
     handlers=[
-        logging.FileHandler("bot_c_okx_swap.log", encoding="utf-8"),
-        logging.StreamHandler(),
+        # systemd가 stdout/stderr를 같은 파일로 append하므로 StreamHandler 제거 (중복 방지)
+        logging.handlers.RotatingFileHandler(
+            "bot_c_okx_swap.log", encoding="utf-8",
+            maxBytes=10*1024*1024, backupCount=3,
+        ),
     ]
 )
 logger = logging.getLogger("BotC_OKX")
@@ -154,10 +159,18 @@ class BotCOKXSwap:
                     latency = time.time() - start
                     order_id = order.get("id", "N/A")
                     avg_price = order.get("average") or order.get("price", 0)
+                    if not avg_price:
+                        # OKX 시장가 주문 응답은 average/price가 None인 경우가 많음 → 현재가 폭백
+                        try:
+                            _t = await self.exchange.fetch_ticker(ccxt_symbol)
+                            avg_price = _t.get("last") or 0
+                        except Exception:
+                            pass
                     logger.info(
                         f"✅ [실주문 성공] {side.upper()} {amount if amount > 0 else 'ALL'} {ccxt_symbol} "
                         f"@ {avg_price} | ID: {order_id} | Latency: {latency:.3f}s"
                     )
+                    _record_trade(ccxt_symbol, payload.side.value, amount, avg_price, order_id)
                     return order
                 except asyncio.TimeoutError:
                     last_err = f"타임아웃 (시도 {attempt+1}/{max_retries})"
@@ -185,8 +198,28 @@ class BotCOKXSwap:
                 pass
 
 
-# ── PID LOCK ──
+# ── TRADE RECORDER (P3: 실현손익 추적용 체결 기록) ──
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_TRADES_FILE = os.path.join(_BASE_DIR, "state", "trades.jsonl")
+
+def _record_trade(symbol: str, side: str, amount: float, price: float, order_id: str):
+    try:
+        os.makedirs(os.path.dirname(_TRADES_FILE), exist_ok=True)
+        rec = {
+            "ts": int(time.time()),
+            "symbol": symbol,
+            "side": side,          # BUY / SELL / CLOSE_LONG / CLOSE_SHORT
+            "amount": amount,      # 0이면 전량청산
+            "price": price,
+            "order_id": order_id,
+        }
+        with open(_TRADES_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"⚠️ 거래 기록 실패: {e}")
+
+
+# ── PID LOCK ──
 _PID_FILE = os.path.join(_BASE_DIR, "bot_c_okx_swap.pid")
 
 
@@ -262,11 +295,15 @@ async def handle_health(request):
 
 async def handle_status(request):
     balance_info = "N/A"
+    positions = []
     try:
         if bot.exchange:
             bal = await bot.exchange.fetch_balance()
             usdt = bal.get("USDT", {}).get("free", 0)
             balance_info = f"{usdt:.2f} USDT"
+            for p in await bot.exchange.fetch_positions():
+                if float(p.get("contracts") or 0) > 0 and p.get("side") in ("long", "short"):
+                    positions.append({"symbol": p["symbol"], "side": p["side"]})
     except Exception as e:
         balance_info = f"Error: {e}"
     return web.json_response({
@@ -274,6 +311,7 @@ async def handle_status(request):
         "status": "active",
         "is_running": True,
         "balance": balance_info,
+        "positions": positions,
         "timestamp": time.time()
     })
 

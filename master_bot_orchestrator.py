@@ -56,7 +56,7 @@ logging.basicConfig(
             maxBytes=10*1024*1024,
             backupCount=5
         ),
-        logging.StreamHandler(),
+        # StreamHandler 제거: systemd가 stdout을 같은 로그파일로 append하므로 중복 기록됨
     ],
 )
 logger = logging.getLogger("MasterOrchestrator")
@@ -94,6 +94,10 @@ class MasterBotOrchestrator:
         self.position_state: Dict[str, str] = {}
         self.single_position_only = os.getenv("OKX_SINGLE_POSITION_ONLY", "true").lower() == "true"
         self.max_active_subpositions = int(os.getenv("OKX_GLOBAL_MAX_POSITIONS", "20"))
+        # [Fix] DCA 물타기 허용: 심볼별 분할진입 횟수 추적 (기존엔 보유 심볼 진입을 전부 거부해서
+        # 전략의 DCA 설계가 작동하지 않았음)
+        self.dca_entry_counts: Dict[str, int] = {}
+        self.max_dca_per_symbol = int(os.getenv("OKX_MASTER_MAX_DCA", "8"))
     
     def load_active_ports(self):
         """active_ports.json에서 동적 포트 매핑 로드 및 환경변수(Remote IP) 병합"""
@@ -271,8 +275,22 @@ class MasterBotOrchestrator:
                 active_count = sum(1 for p in self.position_state.values() if p != "FLAT")
 
                 if side in ("BUY", "SELL"):
-                    # 신규 진입 신호
-                    if self.single_position_only:
+                    sig_dir = "LONG" if side == "BUY" else "SHORT"
+                    cur_state = self.position_state.get(symbol, "FLAT")
+                    is_dca = cur_state == sig_dir  # 같은 방향 보유 중 = 물타기
+
+                    if cur_state != "FLAT" and not is_dca:
+                        logger.warning(
+                            f"🚫 [Master Guard] {symbol} 반대 방향 보유 "
+                            f"({cur_state}). 진입 거부."
+                        )
+                        continue
+                    if is_dca and self.dca_entry_counts.get(symbol, 0) >= self.max_dca_per_symbol:
+                        logger.warning(
+                            f"🚫 [Master Guard] {symbol} DCA {self.max_dca_per_symbol}회 초과. 진입 거부."
+                        )
+                        continue
+                    if cur_state == "FLAT" and self.single_position_only:
                         if active_count >= self.max_active_subpositions:
                             logger.warning(
                                 f"🚫 [Master Guard] 활성 포지션 {active_count}개 ≥ "
@@ -280,27 +298,30 @@ class MasterBotOrchestrator:
                                 f"진입 거부: {side} {symbol}"
                             )
                             continue
-                        if symbol in self.position_state and self.position_state[symbol] != "FLAT":
-                            logger.warning(
-                                f"🚫 [Master Guard] {symbol} 이미 포지션 보유 "
-                                f"({self.position_state[symbol]}). 진입 거부."
-                            )
-                            continue
 
                     # 순차 라우팅 (병렬 create_task 제거 → 레이스 컨디션 방지)
                     result = await self.route_signal_to_bot(bot_name, signal)
                     if result.get("status") == "ok" or result.get("order_id"):
-                        self.position_state[symbol] = "LONG" if side == "BUY" else "SHORT"
-                    else:
+                        self.position_state[symbol] = sig_dir
+                        self.dca_entry_counts[symbol] = self.dca_entry_counts.get(symbol, 0) + 1
+                        if is_dca:
+                            logger.info(
+                                f"✅ [DCA 허용] {symbol} {sig_dir} 물타기 "
+                                f"({self.dca_entry_counts[symbol]}/{self.max_dca_per_symbol})"
+                            )
+                    elif not is_dca:
                         self.position_state[symbol] = "FLAT"
 
                 elif side in ("CLOSE_LONG", "CLOSE_SHORT"):
-                    # 청산 신호
+                    # 청산 신호 (qty=0이면 전량청산, qty>0이면 부분청산 → 포지션 유지)
                     result = await self.route_signal_to_bot(bot_name, signal)
-                    if symbol in self.position_state:
+                    try:
+                        close_qty = float(signal.get("qty", 0) or 0)
+                    except (TypeError, ValueError):
+                        close_qty = 0
+                    if close_qty == 0:
                         self.position_state[symbol] = "FLAT"
-                    else:
-                        self.position_state[symbol] = "FLAT"
+                        self.dca_entry_counts[symbol] = 0
             
             except asyncio.TimeoutError:
                 # 신호 없음 (정상)
@@ -442,6 +463,8 @@ class MasterBotOrchestrator:
         
         # 헬스 체크 (초기)
         await self.check_bot_health()
+        # [Fix] 재시작 시 실제 보유 포지션 동기화 (state 초기화로 인한 중복 진입 방지)
+        await self._sync_positions_from_bots()
         
         # 백그라운드 태스크
         tasks = [
@@ -456,6 +479,28 @@ class MasterBotOrchestrator:
             self.is_running = False
             await self.close()
     
+    async def _sync_positions_from_bots(self):
+        """부팅 시 Bot C /status에서 실제 보유 포지션을 읽어 position_state 시딩"""
+        url = f"{self.BOT_ENDPOINTS.get('Bot C (OKX)', 'http://localhost:8013')}/status"
+        last_err = None
+        for attempt in range(5):
+            try:
+                async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    data = await resp.json()
+                n = 0
+                for p in data.get("positions", []):
+                    sym, side = p.get("symbol"), p.get("side")
+                    if sym and side in ("long", "short"):
+                        self.position_state[sym] = side.upper()
+                        self.dca_entry_counts.setdefault(sym, 1)
+                        n += 1
+                logger.info(f"🔄 [Master] 실제 보유 포지션 {n}개 동기화 완료")
+                return
+            except Exception as e:
+                last_err = e
+                await asyncio.sleep(3)
+        logger.warning(f"⚠️ [Master] 포지션 동기화 실패(빈 상태로 시작): {last_err}")
+
     async def _periodic_health_check(self):
         """주기적 헬스 체크 (30초)"""
         while self.is_running:

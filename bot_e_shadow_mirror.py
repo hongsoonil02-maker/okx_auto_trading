@@ -11,6 +11,7 @@ import json
 import os
 import time
 import logging
+import logging.handlers
 import uuid
 import sys
 import psutil
@@ -37,8 +38,11 @@ logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s - [BOT_E_MIRROR] %(message)s',
     handlers=[
-        logging.FileHandler("bot_e_shadow_mirror.log", encoding="utf-8"),
-        logging.StreamHandler(),
+        # systemd가 stdout/stderr를 같은 파일로 append하므로 StreamHandler 제거 (중복 방지)
+        logging.handlers.RotatingFileHandler(
+            "bot_e_shadow_mirror.log", encoding="utf-8",
+            maxBytes=10*1024*1024, backupCount=3,
+        ),
     ]
 )
 logger = logging.getLogger("BotE_Mirror")
