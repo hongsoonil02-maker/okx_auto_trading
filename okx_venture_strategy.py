@@ -28,7 +28,9 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
             return False
         if 'USDT' not in symbol:
             return False
-        base_coin = symbol.split('-')[0]
+        # [Fix] ccxt 심볼은 'BTC/USDT:USDT' 형태라 '-' split만으론 base 추출 불가
+        # → '/' split 추가 (기존엔 제외 목록이 작동하지 않아 ETH/주식토큰도 거래했음)
+        base_coin = symbol.split('-')[0].split('/')[0]
         if base_coin in self.MAJORS_AND_STOCKS:
             return False
         if any(b in symbol for b in self.BLACKLIST):
