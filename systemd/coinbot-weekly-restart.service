@@ -3,4 +3,4 @@ Description=Weekly restart of coinbot strategies (memory hygiene)
 
 [Service]
 Type=oneshot
-ExecStart=/bin/systemctl --user restart bot_c_okx_swap bot_e_shadow_mirror master_bot_orchestrator okx_major_strategy okx_venture_strategy
+ExecStart=/bin/systemctl --user restart bot_c_okx_swap master_bot_orchestrator okx_major_strategy okx_venture_strategy
