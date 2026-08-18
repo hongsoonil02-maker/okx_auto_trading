@@ -71,10 +71,7 @@ class BotConfig:
         cfg = get_config()
         return cfg.get("okx_params", {})
 
-    @staticmethod
-    def _upbit_params() -> Dict[str, Any]:
-        cfg = get_config()
-        return cfg.get("upbit_params", {})
+
 
     # -- OKX / Swap trading bot --
     @property
@@ -105,6 +102,14 @@ class BotConfig:
     def okx_min_momentum_pct(self) -> float:
         return float(self._okx_params().get("OKX_MIN_MOMENTUM_PCT", 0.0003))
 
+    @property
+    def okx_max_dca(self) -> int:
+        return int(self._okx_params().get("MAX_DCA", 8))
+
+    @property
+    def okx_dca_gap_pct(self) -> float:
+        return float(self._okx_params().get("OKX_DCA_GAP_PCT", 0.005))
+
     # -- Blocked hours / symbols --
     @property
     def blocked_hours_kst(self) -> List[int]:
@@ -121,18 +126,13 @@ class BotConfig:
         cfg = get_config()
         return cfg.get("blacklisted_symbols", {}).get("OKX", [])
 
-    @property
-    def blacklisted_symbols_upbit(self) -> List[str]:
-        cfg = get_config()
-        return cfg.get("blacklisted_symbols", {}).get("UPBIT", [])
+
 
     # -- Convenience --
     @classmethod
     def is_symbol_blacklisted(cls, symbol: str, market: str = "OKX") -> bool:
         if market.upper() == "OKX":
             return symbol in cls().blacklisted_symbols_okx
-        if market.upper() == "UPBIT":
-            return symbol in cls().blacklisted_symbols_upbit
         return False
 
     @classmethod

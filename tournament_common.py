@@ -48,6 +48,7 @@ def simulate(df, ema_period=200, tight_mult=2.5, loose_mult=4.0, vol_mult=1.2, m
     df['st_d_t'], df['st_v_t'] = calc_supertrend(df, 10, tight_mult)
     df['st_d_l'], df['st_v_l'] = calc_supertrend(df, 10, loose_mult)
     df['ema_target'] = df['c'].ewm(span=ema_period, adjust=False).mean()
+    df['ema_slope'] = df['ema_target'].diff(5)
 
     for i in range(250, len(df)):
         prev = df.iloc[i - 1]
@@ -72,15 +73,26 @@ def simulate(df, ema_period=200, tight_mult=2.5, loose_mult=4.0, vol_mult=1.2, m
         if is_short_pb:
             ss += 40
 
-        is_long_sig = (ls >= 100) and vol_cond
-        is_short_sig = (ss >= 100) and vol_cond
+        is_long_sig = (ls >= 100) and vol_cond and curr['ema_slope'] > 0
+        is_short_sig = (ss >= 100) and vol_cond and curr['ema_slope'] < 0
 
         if long_pos:
             ep = long_pos['entry']
             is_pft = curr['c'] > ep * tp_thr
             stv = curr['st_v_t'] if is_pft else curr['st_v_l']
             std = curr['st_d_t'] if is_pft else curr['st_d_l']
-            close_l = std == -1 or curr['c'] < stv
+            
+            # 24시간(96캔들) 보유 & 0.5% 미만 변동 시 강제 청산
+            held_candles = i - long_pos.get('first_i', i)
+            if held_candles >= 96 and abs(curr['c'] - ep) / ep < 0.005:
+                trades.append({'pnl': (curr['c'] - ep) / ep * long_pos['size'] * 10.0})
+                long_pos = None
+                continue
+
+            # Supertrend가 꺾여도 EMA 기울기가 급격히 꺾이지 않았으면 유지 (우상향 중이면 홀딩)
+            st_close_l = std == -1 or curr['c'] < stv
+            close_l = st_close_l and curr['ema_slope'] < 0
+            
             force_l = False
             if long_pos['exit_count'] > 0 and curr['c'] < ep:
                 if (i - long_pos.get('first_i', i)) >= min_hold:
@@ -98,17 +110,29 @@ def simulate(df, ema_period=200, tight_mult=2.5, loose_mult=4.0, vol_mult=1.2, m
                 if long_pos['exit_count'] >= max_dca or long_pos['size'] < 0.001:
                     long_pos = None
             elif not close_l and long_pos['entry_count'] < max_dca:
-                long_pos['entry_count'] += 1
-                add = 1.0 / max_dca
-                long_pos['entry'] = (ep * long_pos['size'] + curr['c'] * add) / (long_pos['size'] + add)
-                long_pos['size'] += add
+                # 불타기/물타기 스텝 세분화 (가격이 평단에서 0.5% 이상 벗어날 때만 추가 진입)
+                if abs(curr['c'] - ep) / ep >= 0.005:
+                    long_pos['entry_count'] += 1
+                    add = 1.0 / max_dca
+                    long_pos['entry'] = (ep * long_pos['size'] + curr['c'] * add) / (long_pos['size'] + add)
+                    long_pos['size'] += add
 
         if short_pos:
             ep = short_pos['entry']
             is_pft = curr['c'] < ep * (2.0 - tp_thr)
             stv = curr['st_v_t'] if is_pft else curr['st_v_l']
             std = curr['st_d_t'] if is_pft else curr['st_d_l']
-            close_s = std == 1 or curr['c'] > stv
+            
+            # 24시간(96캔들) 보유 & 0.5% 미만 변동 시 강제 청산
+            held_candles = i - short_pos.get('first_i', i)
+            if held_candles >= 96 and abs(curr['c'] - ep) / ep < 0.005:
+                trades.append({'pnl': (ep - curr['c']) / ep * short_pos['size'] * 10.0})
+                short_pos = None
+                continue
+
+            # Supertrend가 꺾여도 EMA 기울기가 꺾이지 않았으면 유지 (우하향 중이면 홀딩)
+            st_close_s = std == 1 or curr['c'] > stv
+            close_s = st_close_s and curr['ema_slope'] > 0
             force_s = False
             if short_pos['exit_count'] > 0 and curr['c'] > ep:
                 if (i - short_pos.get('first_i', i)) >= min_hold:
@@ -126,10 +150,12 @@ def simulate(df, ema_period=200, tight_mult=2.5, loose_mult=4.0, vol_mult=1.2, m
                 if short_pos['exit_count'] >= max_dca or short_pos['size'] < 0.001:
                     short_pos = None
             elif not close_s and short_pos['entry_count'] < max_dca:
-                short_pos['entry_count'] += 1
-                add = 1.0 / max_dca
-                short_pos['entry'] = (ep * short_pos['size'] + curr['c'] * add) / (short_pos['size'] + add)
-                short_pos['size'] += add
+                # 불타기/물타기 스텝 세분화 (가격이 평단에서 0.5% 이상 벗어날 때만 추가 진입)
+                if abs(curr['c'] - ep) / ep >= 0.005:
+                    short_pos['entry_count'] += 1
+                    add = 1.0 / max_dca
+                    short_pos['entry'] = (ep * short_pos['size'] + curr['c'] * add) / (short_pos['size'] + add)
+                    short_pos['size'] += add
 
         active = (1 if long_pos else 0) + (1 if short_pos else 0)
         if active >= 3:

@@ -14,12 +14,23 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
     LOG_FILE = "okx_venture_strategy.log"
     LOGGER_NAME = "OKX_Venture_Strategy"
     
+    # [포트폴리오 & 리스크 튜닝]
+    PORTFOLIO_WEIGHT = 1.5       # 자본 집중 배분
+    HARD_STOP_LOSS_PCT = -0.15   # 꼬리 위험 방어 (15% 컷)
+    PYRAMID_RATIO = 0.50         # 추세 승자 적극 불타기
+    
     STOCK_KEYWORDS = []
     BLACKLIST = ['KR200', 'SKHYNIX', 'MU', 'SHAZ', 'ISRG', 'ROBO', 'RAM', 'DRAM', 'GME']
     # 주식/상품 토큰 전부 제외 (주식 전용 봇과 중복 거래 방지)
     MAJORS_AND_STOCKS = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'LINK', 'DOT', 'BNB', 'TRX',
                          'TSLA', 'NVDA', 'AAPL', 'AMZN', 'MSFT', 'META', 'GOOG', 'GOOGL', 'COIN',
-                         'SPCX', 'OPENAI', 'ANTHROPIC', 'RDDT', 'MU', 'SNDK', 'SOXL', 'XAU', 'CL']
+                         'SPCX', 'OPENAI', 'ANTHROPIC', 'RDDT', 'MU', 'SNDK', 'SOXL', 'XAU', 'CL',
+                         # [Fix] 주식/ETF 토큰 추가 — 크립토와 다른 가격 패턴, 숏 구조적 불리
+                         'SKHY', 'KORU', 'CBRS', 'AEON',
+                         'PLTR', 'AMD', 'INTC', 'QCOM', 'BABA', 'UBER', 'ABNB', 'SNAP',
+                         'MSTR', 'HOOD', 'RIVN', 'NIO', 'PYPL', 'SQ', 'SHOP',
+                         'SPY', 'QQQ', 'IWM', 'DIA', 'GLD', 'SLV', 'XAG',
+                         ]
     # [백테스트 검증] Venture 15m에서 재진입 PF 1.15→1.20 (180일, N=231)
     REENTRY_ENABLED = True
 

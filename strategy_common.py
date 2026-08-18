@@ -113,6 +113,10 @@ class BaseStrategyBrain:
     BLACKLIST = []
     TIMEFRAME = "15m"
     TIMEFRAME_MINUTES = 15
+    # [Fix] HTF(상위 타임프레임) 추세 필터 설정
+    HTF_TIMEFRAME = "1h"     # 상위 타임프레임
+    HTF_EMA_PERIOD = 50      # HTF EMA 기간
+    HTF_SLOPE_THRESHOLD = 0.005  # HTF EMA 기울기 임계값 (0.5%)
     # [개선안 #1] Volume 확인 배수 — 서브클래스에서 오버라이드 가능
     # 추가 전략 파라미터 (AI 토너먼트 1등 Alpha_Trend 파라미터 적용)
     PROFIT_THRESHOLD = 1.03  # 3% 수익 구간부터 청산 고려
@@ -126,13 +130,18 @@ class BaseStrategyBrain:
     MAX_DCA_ENTRIES = int(os.getenv("OKX_MAX_DCA_ENTRIES", "8"))
     POSITION_PORTION = float(os.getenv("OKX_POSITION_PORTION", "0.20"))
     SCALE_OUT_EXITS = True
-    MAX_OPEN_POSITIONS = int(os.getenv("OKX_BOT_MAX_POSITIONS", "5"))
-    NEW_LISTING_SLOTS = int(os.getenv("OKX_NEW_LISTING_SLOTS", "2"))
+    MAX_OPEN_POSITIONS = int(os.getenv("OKX_BOT_MAX_POSITIONS", "15"))
+    NEW_LISTING_SLOTS = int(os.getenv("OKX_NEW_LISTING_SLOTS", "3"))
     NEW_LISTING_DAYS = 60
     # [백테스트 검증] 재진입: 전량 청산 후 같은 방향 추세 유지 시 쿨다운 후 재진입
-    # (Venture 15m에서 PF 1.15→1.20 개선 확인. 서브클스에서만 활성화 권장)
+    # (Venture 15m에서 PF 1.15→1.20 개선 확인. 서브클래스에서만 활성화 권장)
     REENTRY_ENABLED = False
     REENTRY_COOLDOWN_CANDLES = 4
+    
+    # [포트폴리오 리밸런싱] 자본 배분 가중치 및 불타기(Pyramid) 비율
+    PORTFOLIO_WEIGHT = 1.0
+    PYRAMID_RATIO = 0.35
+
     # [백테스트 검증] 트레일링 전량청산 시 즉시 반대방향 진입
     # Major 30m: PF 0.76→1.22 (흑자 전환) / Venture 15m: PF 1.23→1.13 (악화)
     # → 메이저처럼 박스권 성격 심볼에만 활성화
@@ -142,17 +151,21 @@ class BaseStrategyBrain:
     # [Fix] DCA 추가 진입 최소 간격 (캔들 수) — 매 캔들 물타기는 수수료 출혈
     DCA_MIN_CANDLES = 4
     # ── 켈리 공식 포지션 사이징 ──
-    # portion = 쿼터켈리 × f* / 평균손실률, f* = p - (1-p)/b
-    KELLY_FRACTION = 0.25          # 쿼터 켈리 (변동성 완충)
+    # portion = Half-Kelly × f* / 평균손실률, f* = p - (1-p)/b
+    KELLY_FRACTION = 0.50          # Half-Kelly (적극적 자본배치)
     KELLY_MIN_TRADES = 20          # 이 건수 미만이면 백테스트 사전값 사용
     KELLY_PRIOR_WR = 0.36          # 180일 Venture 15m 백테스트 승률
     KELLY_PRIOR_PL = 2.0           # 백테스트 평균손익비 (PF 1.15 기반)
     KELLY_PRIOR_LOSS = 0.20        # 평균 손실률 (마진 기준, 하드스탑 -30% 이내)
-    PORTION_MIN = 0.05
-    PORTION_MAX = 0.30
+    PORTION_MIN = 0.15
+    PORTION_MAX = 0.45
     # [긴급 패치] 24시간 거래대금 최소 기준 (잡코인 원천 차단) — 주식 토큰처럼
     # 거래량이 구조적으로 낮은 전략은 서브클스에서 오버라이드
     MIN_QUOTE_VOLUME = float(os.getenv("OKX_MIN_QUOTE_VOLUME", "10000000"))
+    # ── [Fix] 포지션 사이징 개선: 최소 마진 하한선 ──
+    # free_usdt 기반 사이징은 포지션 수 증가 시 사이즈가 0에 수렴하는 문제 해결
+    # total_equity / MAX_OPEN_POSITIONS 기반 균등 분할 + 최소 마진 하한선
+    MIN_POSITION_MARGIN = float(os.getenv("OKX_MIN_POSITION_MARGIN", "100"))
 
     def __init__(self):
         self.session = None
@@ -162,6 +175,8 @@ class BaseStrategyBrain:
         self.config = BotConfig() if BotConfig else None
         self.logger = setup_logger(self.LOGGER_NAME, self.LOG_FILE)
         self._long_regime_ok = True
+        self._short_regime_ok = True  # [Fix] 숏 레짐 필터 (BTC 상승 시 알트숏 억제)
+        self._htf_cache = {}  # [Fix] HTF EMA 캐시 {symbol: (timestamp, slope)}
         self._kelly_cache = None  # (timestamp, portion)
 
     def _is_trading_hour_allowed(self) -> bool:
@@ -294,6 +309,45 @@ class BaseStrategyBrain:
         if self._is_new_listing(symbol):
             return min(base * 1.5, self.PORTION_MAX)
         return base * 0.7
+
+    def _calc_target_margin(self, free_usdt: float, total_equity: float, entry_type: str = "new") -> float:
+        """
+        [Fix] 균등 분할 기반 심볼당 목표 마진 계산.
+        기존 free_usdt × portion 방식 → total_equity / MAX_OPEN_POSITIONS 기반.
+
+        entry_type:
+          - "new": 신규 진입 (목표 마진의 50%)
+          - "dca": DCA 물타기 (목표 마진의 25%)
+          - "pyramid": 승자 불타기 (목표 마진의 35%)
+          - "flip": 반대방향 전환 (목표 마진의 30%)
+          - "reentry": 재진입 (목표 마진의 30%)
+        """
+        # 심볼당 목표 마진 = (총 자산 / 최대 포지션 수) * 포트폴리오 가중치
+        base_margin = (total_equity / max(1, self.MAX_OPEN_POSITIONS)) * self.PORTFOLIO_WEIGHT
+
+        # 진입 유형별 비율
+        type_ratios = {
+            "new": 0.50,       # 신규 진입: 목표의 50%
+            "dca": 0.25,       # DCA 물타기: 목표의 25%
+            "pyramid": self.PYRAMID_RATIO,   # 승자 불타기: 동적 비율 적용
+            "flip": 0.30,      # 반대방향 전환: 목표의 30%
+            "reentry": 0.30,   # 재진입: 목표의 30%
+        }
+        ratio = type_ratios.get(entry_type, 0.50)
+        target_margin = base_margin * ratio
+
+        # Free 잔고 안전 가드: free의 95% 이내
+        target_margin = min(target_margin, free_usdt * 0.95)
+
+        # 최소 마진 하한선 적용
+        if target_margin < self.MIN_POSITION_MARGIN:
+            # free가 충분하면 최소 마진으로 상향, 아니면 진입 거부(0 반환)
+            if free_usdt >= self.MIN_POSITION_MARGIN * 1.1:
+                target_margin = self.MIN_POSITION_MARGIN
+            else:
+                return 0.0  # 자금 부족으로 진입 불가
+
+        return target_margin
 
     async def get_target_symbols(self):
         import traceback
@@ -456,10 +510,11 @@ class BaseStrategyBrain:
             if is_short_trend_cont: short_score += 20
             if is_short_momentum: short_score += 20
 
-            # [Fix] 총점 70점 이상 + 거래량 조건 충족 시 최종 진입 시그널 (80→70 완화)
-            ENTRY_THRESHOLD = 70
-            is_long_sig = (long_score >= ENTRY_THRESHOLD) and vol_cond and getattr(self, '_long_regime_ok', True)
-            is_short_sig = (short_score >= ENTRY_THRESHOLD) and vol_cond
+            # [Fix] 비대칭 임계값: 롱 70, 숏 90 (숏은 구조적으로 위험하므로 엄격)
+            ENTRY_THRESHOLD_LONG = 70
+            ENTRY_THRESHOLD_SHORT = 90
+            is_long_sig = (long_score >= ENTRY_THRESHOLD_LONG) and vol_cond and getattr(self, '_long_regime_ok', True)
+            is_short_sig = (short_score >= ENTRY_THRESHOLD_SHORT) and vol_cond and getattr(self, '_short_regime_ok', True)
             
             default_leverage = int(os.getenv("OKX_LEVERAGE", "10"))
             leverage = getattr(self, 'STRATEGY_LEVERAGE', default_leverage)
@@ -497,7 +552,24 @@ class BaseStrategyBrain:
                     take_profit_long_sig = True
                 elif pnl_pct_long >= 0.50 and dca['exit_count'] == 2:
                     take_profit_long_sig = True
-                elif dca['exit_count'] > 0 and curr['c'] < avg_price_long:
+                # ── [Winner Pyramiding] 추세 승자 롱 불타기 ──
+                if pnl_pct_long >= 0.40 and dca.get('pyramid_count', 0) == 0 and self._dca_ready(dca, t_curr):
+                    if is_ema_trend_up and st_d_loose == 1:
+                        self.logger.info(f"🔥 [Winner Pyramiding 1차 불타기] 롱 {symbol} (PnL: +{pnl_pct_long*100:.1f}%)")
+                        await self.execute_auto_entry(symbol, SideType.BUY, entry_type="pyramid")
+                        dca['pyramid_count'] = 1
+                        dca['last_entry_t'] = t_curr
+                elif pnl_pct_long >= 1.00 and dca.get('pyramid_count', 0) == 1 and self._dca_ready(dca, t_curr):
+                    if is_ema_trend_up and is_long_momentum:
+                        self.logger.info(f"🚀 [Winner Pyramiding 2차 불타기] 롱 {symbol} (PnL: +{pnl_pct_long*100:.1f}%)")
+                        await self.execute_auto_entry(symbol, SideType.BUY, entry_type="pyramid")
+                        dca['pyramid_count'] = 2
+                        dca['last_entry_t'] = t_curr
+
+                if dca.get('pyramid_count', 0) >= 1 and pnl_pct_long < 0.20:
+                    force_close_long = True
+
+                if dca['exit_count'] > 0 and curr['c'] < avg_price_long:
                     # [개선안 #3] 최소 보유 캔들 수 체크 — 진입 직후 whipsaw 방지
                     candles_held = (t_curr - dca.get('first_entry_t', t_curr)) / (self.TIMEFRAME_MINUTES * 60 * 1000)
                     if candles_held >= self.MIN_HOLD_CANDLES:
@@ -535,7 +607,24 @@ class BaseStrategyBrain:
                     take_profit_short_sig = True
                 elif pnl_pct_short >= 0.50 and dca['exit_count'] == 2:
                     take_profit_short_sig = True
-                elif dca['exit_count'] > 0 and curr['c'] > avg_price_short:
+                # ── [Winner Pyramiding] 추세 승자 숏 불타기 ──
+                if pnl_pct_short >= 0.40 and dca.get('pyramid_count', 0) == 0 and self._dca_ready(dca, t_curr):
+                    if is_ema_trend_down and st_d_loose == -1:
+                        self.logger.info(f"📉 [Winner Pyramiding 숏 1차 불타기] {symbol} (PnL: +{pnl_pct_short*100:.1f}%)")
+                        await self.execute_auto_entry(symbol, SideType.SELL, entry_type="pyramid")
+                        dca['pyramid_count'] = 1
+                        dca['last_entry_t'] = t_curr
+                elif pnl_pct_short >= 1.00 and dca.get('pyramid_count', 0) == 1 and self._dca_ready(dca, t_curr):
+                    if is_ema_trend_down and is_short_momentum:
+                        self.logger.info(f"🚀 [Winner Pyramiding 숏 2차 불타기] {symbol} (PnL: +{pnl_pct_short*100:.1f}%)")
+                        await self.execute_auto_entry(symbol, SideType.SELL, entry_type="pyramid")
+                        dca['pyramid_count'] = 2
+                        dca['last_entry_t'] = t_curr
+
+                if dca.get('pyramid_count', 0) >= 1 and pnl_pct_short < 0.20:
+                    force_close_short = True
+
+                if dca['exit_count'] > 0 and curr['c'] > avg_price_short:
                     # [개선안 #3] 최소 보유 캔들 수 체크
                     candles_held = (t_curr - dca.get('first_entry_t', t_curr)) / (self.TIMEFRAME_MINUTES * 60 * 1000)
                     if candles_held >= self.MIN_HOLD_CANDLES:
@@ -554,10 +643,10 @@ class BaseStrategyBrain:
                     # [Flip] 트레일링/방어 청산 시 즉시 숏 진입 (하드스탑 제외)
                     if self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_long:
                         self.logger.info(f"🔄 [FLIP] 롱 청산 → 숏 반대진입: {symbol} (최고수익: {dca['max_pnl_pct']*100:.0f}%)")
-                        dyn_portion = self._get_dynamic_portion(symbol)
-                        await self.execute_auto_entry(symbol, SideType.SELL, portion=(dyn_portion / self.MAX_DCA_ENTRIES))
+                        await self.execute_auto_entry(symbol, SideType.SELL, entry_type="flip")
                     dca['exit_count'] = 8
                     dca['entry_count'] = 0
+                    dca['pyramid_count'] = 0
                     dca['last_exit_t'] = t_curr
                     dca['max_pnl_pct'] = 0.0
                     dca['last_close_t'] = t_curr
@@ -595,8 +684,7 @@ class BaseStrategyBrain:
                 else:
                     if dca['entry_count'] < self.MAX_DCA_ENTRIES and self._dca_ready(dca, t_curr):
                         self.logger.info(f"🔥 [{self.STRATEGY_NAME} DCA] 롱 분할 진입 ({dca['entry_count']+1}/{self.MAX_DCA_ENTRIES}): {symbol}")
-                        dyn_portion = self._get_dynamic_portion(symbol)
-                        await self.execute_auto_entry(symbol, SideType.BUY, portion=(dyn_portion / self.MAX_DCA_ENTRIES))
+                        await self.execute_auto_entry(symbol, SideType.BUY, entry_type="dca")
                         dca['entry_count'] += 1
                         dca['last_entry_t'] = t_curr
 
@@ -610,10 +698,10 @@ class BaseStrategyBrain:
                     # [Flip] 트레일링/방어 청산 시 즉시 롱 진입 (하드스탑 제외, 레짐 필터 적용)
                     if self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_short and self._long_regime_ok:
                         self.logger.info(f"🔄 [FLIP] 숏 청산 → 롱 반대진입: {symbol} (최고수익: {dca['max_pnl_pct']*100:.0f}%)")
-                        dyn_portion = self._get_dynamic_portion(symbol)
-                        await self.execute_auto_entry(symbol, SideType.BUY, portion=(dyn_portion / self.MAX_DCA_ENTRIES))
+                        await self.execute_auto_entry(symbol, SideType.BUY, entry_type="flip")
                     dca['exit_count'] = 8
                     dca['entry_count'] = 0
+                    dca['pyramid_count'] = 0
                     dca['last_exit_t'] = t_curr
                     dca['max_pnl_pct'] = 0.0
                     dca['last_close_t'] = t_curr
@@ -650,8 +738,7 @@ class BaseStrategyBrain:
                             dca['max_pnl_pct'] = 0.0
                 elif is_short_pullback and dca['entry_count'] < self.MAX_DCA_ENTRIES and self._dca_ready(dca, t_curr):
                     self.logger.info(f"📉 [Short Pullback 진입] {symbol} (DCA {dca['entry_count']+1}/{self.MAX_DCA_ENTRIES})")
-                    dyn_portion = self._get_dynamic_portion(symbol)
-                    await self.execute_auto_entry(symbol, SideType.SELL, portion=(dyn_portion / self.MAX_DCA_ENTRIES))
+                    await self.execute_auto_entry(symbol, SideType.SELL, entry_type="dca")
                     dca['entry_count'] += 1
                     dca['last_entry_t'] = t_curr
 
@@ -673,7 +760,6 @@ class BaseStrategyBrain:
                     # 전체 슬롯 포화
                     return
 
-                dyn_portion = self._get_dynamic_portion(symbol)
 
                 # [재진입] 전량 청산 후 같은 방향 추세 유지 시 쿨다운 후 재진입
                 if self.REENTRY_ENABLED and dca.get('last_close_t') and dca.get('last_entry_t') != t_curr:
@@ -685,7 +771,7 @@ class BaseStrategyBrain:
                         if re_long or re_short:
                             side = SideType.BUY if re_long else SideType.SELL
                             self.logger.info(f"♻️ [Re-entry] 추세 지속 재진입 ({side_closed}): {symbol}")
-                            await self.execute_auto_entry(symbol, side, portion=(dyn_portion / self.MAX_DCA_ENTRIES))
+                            await self.execute_auto_entry(symbol, side, entry_type="reentry")
                             dca['entry_count'] = 1
                             dca['exit_count'] = 0
                             dca['last_entry_t'] = t_curr
@@ -695,28 +781,58 @@ class BaseStrategyBrain:
 
                 if is_long_sig and dca.get('last_entry_t') != t_curr:
                     self.logger.info(f"🟢 [Scoring System 신규 진입] {symbol} (Score: {long_score})")
-                    await self.execute_auto_entry(symbol, SideType.BUY, portion=(dyn_portion / self.MAX_DCA_ENTRIES))
+                    await self.execute_auto_entry(symbol, SideType.BUY, entry_type="new")
                     dca['entry_count'] = 1
+                    dca['pyramid_count'] = 0
                     dca['exit_count'] = 0
                     dca['last_entry_t'] = t_curr
                     dca['first_entry_t'] = t_curr
                 elif is_short_sig and dca.get('last_entry_t') != t_curr:
-                    self.logger.info(f"🔴 [Scoring System 신규 진입] {symbol} (Score: {short_score})")
-                    await self.execute_auto_entry(symbol, SideType.SELL, portion=(dyn_portion / self.MAX_DCA_ENTRIES))
-                    dca['entry_count'] = 1
-                    dca['exit_count'] = 0
-                    dca['last_entry_t'] = t_curr
-                    dca['first_entry_t'] = t_curr
+                    # [Fix] HTF 추세 필터: 1h EMA50 상승 중이면 숏 진입 차단
+                    htf = await self._check_htf_trend(symbol)
+                    if htf['is_uptrend']:
+                        self.logger.info(
+                            f"🚫 [HTF Filter] 숏 진입 차단 — 1h EMA50 상승 중: {symbol} "
+                            f"(기울기: {htf['ema_slope']*100:+.2f}%, Score: {short_score})"
+                        )
+                    else:
+                        self.logger.info(f"🔴 [Scoring System 신규 진입] {symbol} (Score: {short_score}, HTF: {htf['ema_slope']*100:+.2f}%)")
+                        await self.execute_auto_entry(symbol, SideType.SELL, entry_type="new")
+                        dca['entry_count'] = 1
+                        dca['pyramid_count'] = 0
+                        dca['exit_count'] = 0
+                        dca['last_entry_t'] = t_curr
+                        dca['first_entry_t'] = t_curr
 
         except Exception as e:
             self.logger.error(f"⚠️ [{self.STRATEGY_NAME}] 로직 체크 실패 ({symbol}): {e}")
 
-    async def execute_auto_entry(self, symbol: str, side: SideType, portion: float = 0.20):
+    async def execute_auto_entry(self, symbol: str, side: SideType, portion: float = 0.20, entry_type: str = "new"):
+        """
+        [개선] equity 기반 균등 분할 포지션 사이징.
+
+        기존: free_usdt × portion → 포지션 수 증가 시 사이즈가 0에 수렴
+        개선: total_equity / MAX_OPEN_POSITIONS 기반 목표 마진 산출
+              + MIN_POSITION_MARGIN 하한선으로 극소 포지션 원천 방지
+
+        Args:
+            symbol: 거래 심볼
+            side: 매수/매도 방향
+            portion: (하위 호환) 기존 portion 파라미터 (entry_type 우선)
+            entry_type: "new", "dca", "pyramid", "flip", "reentry"
+        """
         try:
             balance = await self.exchange.fetch_balance()
             free_usdt = balance.get('USDT', {}).get('free', 0)
             if not free_usdt:
                 free_usdt = balance.get('free', {}).get('USDT', 0)
+            total_usdt = balance.get('USDT', {}).get('total', 0)
+            if not total_usdt:
+                total_usdt = balance.get('total', {}).get('USDT', 0)
+            # total이 0이면 free로 폴백 (API 응답 누락 대비)
+            if not total_usdt:
+                total_usdt = free_usdt
+
             ticker = await self.exchange.fetch_ticker(symbol)
             price = ticker.get('last')
 
@@ -726,8 +842,19 @@ class BaseStrategyBrain:
             # [Bug Fix] 서브클래스에서 STRATEGY_LEVERAGE를 강제 오버라이드한 경우 이를 우선 적용
             default_leverage = int(os.getenv("OKX_LEVERAGE", "10"))
             leverage = getattr(self, 'STRATEGY_LEVERAGE', default_leverage)
-            
-            raw_amount = (free_usdt * portion * leverage) / price
+
+            # ── [Fix] Equity 기반 균등 분할 사이징 ──
+            target_margin = self._calc_target_margin(free_usdt, total_usdt, entry_type)
+            if target_margin <= 0:
+                self.logger.warning(
+                    f"⚠️ [{self.STRATEGY_NAME}] 목표 마진 0 → 진입 거부 "
+                    f"(free: {free_usdt:.2f}, equity: {total_usdt:.2f}, type: {entry_type})"
+                )
+                return
+
+            # 목표 마진 → 레버리지 반영 노셔널 → 수량 계산
+            notional = target_margin * leverage
+            raw_amount = notional / price
 
             market_info = self.exchange.markets.get(symbol)
             contract_size = market_info.get('contractSize', 1) if market_info else 1
@@ -741,7 +868,7 @@ class BaseStrategyBrain:
                 max_amount = market_info.get('limits', {}).get('market', {}).get('max', 0) if market_info else 0
 
                 if min_amount and amount < min_amount:
-                    self.logger.warning(f"⚠️ 진입 수량({amount})이 최소 수량({min_amount}) 미만 (보유 USDT: {free_usdt:.2f})")
+                    self.logger.warning(f"⚠️ 진입 수량({amount})이 최소 수량({min_amount}) 미만 (목표마진: {target_margin:.2f})")
                     return
                 if max_amount and amount > max_amount:
                     amount = float(self.exchange.amount_to_precision(symbol, max_amount))
@@ -751,7 +878,10 @@ class BaseStrategyBrain:
                     self.logger.warning(f"⚠️ USDT 증거금 부족 - 필요: {required_margin:.2f}, 보유: {free_usdt:.2f} (수량: {amount})")
                     return
 
-                self.logger.info(f"🔥 [{self.STRATEGY_NAME}] 신규 진입 시그널: {side.value} {symbol} (수량: {amount})")
+                self.logger.info(
+                    f"🔥 [{self.STRATEGY_NAME}] 진입 시그널: {side.value} {symbol} "
+                    f"(수량: {amount}, 목표마진: {target_margin:.1f} USDT, 유형: {entry_type})"
+                )
                 await self.send_webhook(side, symbol, amount)
         except Exception as e:
             self.logger.error(f"⚠️ [{self.STRATEGY_NAME}] 진입 수량 계산 실패 ({symbol}): {e}")
@@ -774,6 +904,55 @@ class BaseStrategyBrain:
         except Exception as e:
             self.logger.warning(f"⚠️ [{self.STRATEGY_NAME}] BTC 레짐 체크 실패(통과 처리): {e}")
             return True
+
+    async def _check_short_regime(self) -> bool:
+        """BTC 1h 종가가 EMA200 위면 신규 알트숏 진입 억제 (역추세 레짐 필터)."""
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv('BTC/USDT:USDT', '1h', limit=220)
+            if not ohlcv or len(ohlcv) < 200:
+                return True
+            closes = pd.Series([c[4] for c in ohlcv], dtype='float64')
+            ema200 = closes.ewm(span=200, adjust=False).mean().iloc[-1]
+            ema50 = closes.ewm(span=50, adjust=False).mean().iloc[-1]
+            # BTC가 EMA200 위이고 EMA50도 상승 중이면 숏 억제
+            btc_bullish = bool(closes.iloc[-1] >= ema200 and ema50 > closes.ewm(span=50, adjust=False).mean().iloc[-5])
+            if btc_bullish:
+                self.logger.info(
+                    f"🧭 [Regime] BTC 1h EMA200 상회 + EMA50 상승 — 신규 알트숏 억제 "
+                    f"(BTC: {closes.iloc[-1]:.0f} > EMA200: {ema200:.0f}, EMA50: {ema50:.0f})"
+                )
+            return not btc_bullish  # True = 숏 허용, False = 숏 억제
+        except Exception as e:
+            self.logger.warning(f"⚠️ [{self.STRATEGY_NAME}] BTC 숏 레짐 체크 실패(통과 처리): {e}")
+            return True
+
+    async def _check_htf_trend(self, symbol: str) -> dict:
+        """
+        [Fix] 상위 타임프레임(1h) EMA 추세 확인.
+        Returns: {'ema_slope': float, 'is_uptrend': bool, 'is_downtrend': bool}
+        5분 캐시 적용.
+        """
+        now = time.time()
+        cached = self._htf_cache.get(symbol)
+        if cached and (now - cached[0]) < 300:  # 5분 캐시
+            return cached[1]
+
+        result = {'ema_slope': 0.0, 'is_uptrend': False, 'is_downtrend': False}
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, self.HTF_TIMEFRAME, limit=60)
+            if ohlcv and len(ohlcv) >= 50:
+                closes = pd.Series([c[4] for c in ohlcv], dtype='float64')
+                ema = closes.ewm(span=self.HTF_EMA_PERIOD, adjust=False).mean()
+                # 최근 5캔들 기울기 (1h 기준 5시간)
+                slope = (ema.iloc[-1] - ema.iloc[-5]) / ema.iloc[-5]
+                result['ema_slope'] = slope
+                result['is_uptrend'] = slope > self.HTF_SLOPE_THRESHOLD
+                result['is_downtrend'] = slope < -self.HTF_SLOPE_THRESHOLD
+        except Exception as e:
+            self.logger.warning(f"⚠️ HTF 추세 체크 실패 ({symbol}): {e}")
+
+        self._htf_cache[symbol] = (now, result)
+        return result
 
     async def run_auto_trade_loop(self):
         self.logger.info(f"🚀 [{self.STRATEGY_NAME}] 자동매매 엔진 시작 (Supertrend + StochRSI)")
@@ -801,15 +980,32 @@ class BaseStrategyBrain:
                         if contracts_str is not None and float(contracts_str) > 0:
                             sym = p.get('symbol')
                             s = p.get('side')
+                            # [Fix] avgPrice=0 버그 수정: entryPrice → info.avgPx → avgPrice → price 폴백 체인
+                            raw_avg = (
+                                p.get('entryPrice')
+                                or p.get('info', {}).get('avgPx')
+                                or p.get('avgPrice')
+                                or p.get('price')
+                                or 0
+                            )
+                            avg_price = float(raw_avg) if raw_avg else 0.0
+                            if avg_price <= 0:
+                                self.logger.warning(
+                                    f"⚠️ [{self.STRATEGY_NAME}] avgPrice=0 감지: {sym} ({s}) "
+                                    f"— entryPrice={p.get('entryPrice')}, "
+                                    f"avgPx={p.get('info', {}).get('avgPx')}, "
+                                    f"avgPrice={p.get('avgPrice')}, price={p.get('price')}"
+                                )
                             self.auto_active_pos[(sym, s)] = {
                                 'size': float(contracts_str),
-                                'avgPrice': float(p.get('avgPrice', p.get('price', 0))),
+                                'avgPrice': avg_price,
                             }
                     except (ValueError, TypeError):
                         pass
 
                 # 시장 레짐 필터 갱신 (사이클당 1회)
                 self._long_regime_ok = await self._check_btc_regime()
+                self._short_regime_ok = await self._check_short_regime()
 
                 for symbol in symbols:
                     await self.check_auto_logic(symbol)

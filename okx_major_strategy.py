@@ -15,6 +15,10 @@ class OKXMajorStrategyBrain(BaseStrategyBrain):
     STRATEGY_NAME = "OKX_Major_Strategy"
     LOG_FILE = "okx_major_strategy.log"
     LOGGER_NAME = "OKX_Major_Strategy"
+    
+    # [포트폴리오 & 리스크 튜닝]
+    PORTFOLIO_WEIGHT = 0.5       # 자본 분산 배분 (보수적)
+
 
     TIMEFRAME = "30m"       # 신호 빈도 확대: 1h → 30m
     TIMEFRAME_MINUTES = 30

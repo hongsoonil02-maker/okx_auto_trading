@@ -16,9 +16,7 @@ from tournament_common import (
 
 SYMBOL_SETS = {
     "Major_Crypto": ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT'],
-    "Stock_Majors": ['TSLA/USDT:USDT', 'NVDA/USDT:USDT', 'AAPL/USDT:USDT', 'AMZN/USDT:USDT', 'MSFT/USDT:USDT'],
     "Venture_Alts": ['DOGE/USDT:USDT', 'PEPE/USDT:USDT', 'WIF/USDT:USDT'],
-    "Stock_Ventures": ['CRM/USDT:USDT', 'OKTA/USDT:USDT', 'TMF/USDT:USDT'],
 }
 
 STRATEGIES = {

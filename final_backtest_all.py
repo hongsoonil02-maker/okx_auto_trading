@@ -17,12 +17,13 @@ def calc_supertrend(df, period=10, multiplier=3.0):
         sv.iloc[i] = fl.iloc[i] if sd.iloc[i] == 1 else fu.iloc[i]
     return sd, sv
 
-def simulate(df, ema_period=200, tight_mult=2.5, loose_mult=4.0, vol_mult=1.2, min_hold=3, max_dca=8, tp_thr=1.02, scale_out=True):
+def simulate(df, ema_period=200, tight_mult=2.5, loose_mult=4.0, vol_mult=1.2, min_hold=3, max_dca=12, tp_thr=1.02, scale_out=True):
     trades = []
     long_pos = None; short_pos = None
     df['st_d_t'], df['st_v_t'] = calc_supertrend(df, 10, tight_mult)
     df['st_d_l'], df['st_v_l'] = calc_supertrend(df, 10, loose_mult)
     df['ema_target'] = df['c'].ewm(span=ema_period, adjust=False).mean()
+    df['ema_slope'] = df['ema_target'].diff(5)
 
     for i in range(250, len(df)):
         prev = df.iloc[i-1]; curr = df.iloc[i]
@@ -42,8 +43,8 @@ def simulate(df, ema_period=200, tight_mult=2.5, loose_mult=4.0, vol_mult=1.2, m
         if is_short_bo: ss += 40
         if is_short_pb: ss += 40
         
-        is_long_sig = (ls >= 100) and vol_cond
-        is_short_sig = (ss >= 100) and vol_cond
+        is_long_sig = (ls >= 100) and vol_cond and curr['ema_slope'] > 0
+        is_short_sig = (ss >= 100) and vol_cond and curr['ema_slope'] < 0
 
         # ── Long ──
         if long_pos:
@@ -51,7 +52,17 @@ def simulate(df, ema_period=200, tight_mult=2.5, loose_mult=4.0, vol_mult=1.2, m
             is_pft = curr['c'] > ep * tp_thr
             stv = curr['st_v_t'] if is_pft else curr['st_v_l']
             std = curr['st_d_t'] if is_pft else curr['st_d_l']
-            close_l = std == -1 or curr['c'] < stv
+            
+            # 24시간(96캔들) 보유 & 0.5% 미만 변동 시 강제 청산
+            held_candles = i - long_pos.get('first_i', i)
+            if held_candles >= 96 and abs(curr['c'] - ep) / ep < 0.005:
+                trades.append({'pnl': (curr['c'] - ep) / ep * long_pos['size'] * 10.0})
+                long_pos = None
+                continue
+
+            # Supertrend가 꺾여도 EMA 기울기가 급격히 꺾이지 않았으면 유지 (우상향 중이면 홀딩)
+            st_close_l = std == -1 or curr['c'] < stv
+            close_l = st_close_l and curr['ema_slope'] < 0
             force_l = False
             if long_pos['exit_count'] > 0 and curr['c'] < ep:
                 if (i - long_pos.get('first_i', i)) >= min_hold: force_l = True
@@ -70,10 +81,12 @@ def simulate(df, ema_period=200, tight_mult=2.5, loose_mult=4.0, vol_mult=1.2, m
                     trades.append({'pnl': (curr['c'] - ep) / ep * long_pos['size'] * 10.0})
                     long_pos = None
             elif not close_l and long_pos['entry_count'] < max_dca:
-                long_pos['entry_count'] += 1
-                add = 1.0 / max_dca
-                long_pos['entry'] = (ep * long_pos['size'] + curr['c'] * add) / (long_pos['size'] + add)
-                long_pos['size'] += add
+                # 불타기/물타기 스텝 세분화 (가격이 평단에서 0.5% 이상 벗어날 때만 추가 진입)
+                if abs(curr['c'] - ep) / ep >= 0.005:
+                    long_pos['entry_count'] += 1
+                    add = 1.0 / max_dca
+                    long_pos['entry'] = (ep * long_pos['size'] + curr['c'] * add) / (long_pos['size'] + add)
+                    long_pos['size'] += add
 
         # ── Short ──
         if short_pos:
@@ -81,7 +94,17 @@ def simulate(df, ema_period=200, tight_mult=2.5, loose_mult=4.0, vol_mult=1.2, m
             is_pft = curr['c'] < ep * (2.0 - tp_thr)
             stv = curr['st_v_t'] if is_pft else curr['st_v_l']
             std = curr['st_d_t'] if is_pft else curr['st_d_l']
-            close_s = std == 1 or curr['c'] > stv
+            
+            # 24시간(96캔들) 보유 & 0.5% 미만 변동 시 강제 청산
+            held_candles = i - short_pos.get('first_i', i)
+            if held_candles >= 96 and abs(curr['c'] - ep) / ep < 0.005:
+                trades.append({'pnl': (ep - curr['c']) / ep * short_pos['size'] * 10.0})
+                short_pos = None
+                continue
+
+            # Supertrend가 꺾여도 EMA 기울기가 꺾이지 않았으면 유지 (우하향 중이면 홀딩)
+            st_close_s = std == 1 or curr['c'] > stv
+            close_s = st_close_s and curr['ema_slope'] > 0
             force_s = False
             if short_pos['exit_count'] > 0 and curr['c'] > ep:
                 if (i - short_pos.get('first_i', i)) >= min_hold: force_s = True
@@ -100,10 +123,12 @@ def simulate(df, ema_period=200, tight_mult=2.5, loose_mult=4.0, vol_mult=1.2, m
                     trades.append({'pnl': (ep - curr['c']) / ep * short_pos['size'] * 10.0})
                     short_pos = None
             elif not close_s and short_pos['entry_count'] < max_dca:
-                short_pos['entry_count'] += 1
-                add = 1.0 / max_dca
-                short_pos['entry'] = (ep * short_pos['size'] + curr['c'] * add) / (short_pos['size'] + add)
-                short_pos['size'] += add
+                # 불타기/물타기 스텝 세분화 (가격이 평단에서 0.5% 이상 벗어날 때만 추가 진입)
+                if abs(curr['c'] - ep) / ep >= 0.005:
+                    short_pos['entry_count'] += 1
+                    add = 1.0 / max_dca
+                    short_pos['entry'] = (ep * short_pos['size'] + curr['c'] * add) / (short_pos['size'] + add)
+                    short_pos['size'] += add
 
         active = (1 if long_pos else 0) + (1 if short_pos else 0)
         if active >= 3: continue
@@ -118,17 +143,19 @@ def simulate(df, ema_period=200, tight_mult=2.5, loose_mult=4.0, vol_mult=1.2, m
     if short_pos: trades.append({'pnl': (short_pos['entry'] - lc)/short_pos['entry']*short_pos['size'] * 10.0})
     return trades
 
-def stats(trades):
-    if not trades: return {'ret': 0, 'n': 0}
+def detailed_stats(trades):
+    if not trades: return {'ret': 0, 'win_rate': 0, 'n': 0}
     pnls = [t['pnl'] for t in trades]
     ret = sum(pnls) * 100
-    return {'ret': round(ret, 2), 'n': len(trades)}
+    wins = [p for p in pnls if p > 0]
+    wr = (len(wins) / len(pnls)) * 100
+    return {'ret': round(ret, 2), 'win_rate': round(wr, 1), 'n': len(trades)}
 
 async def main():
     ex = ccxt_async.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
     
     print("="*60)
-    print(" 🚀 Final System Backtest (4 Bots, 10x Leverage, Exact Settings)")
+    print(" 🚀 Final System Backtest (2 Bots, 10x Leverage, Exact Settings)")
     print("="*60)
     
     async def process_bot(name, syms, tf, ema, tp, scale_out):
@@ -146,16 +173,14 @@ async def main():
                 df['stoch_k'] = ((rsi - rsi.rolling(14).min()) / (rsi.rolling(14).max() - rsi.rolling(14).min())).rolling(3).mean() * 100
 
                 tr = simulate(df.copy(), ema_period=ema, tp_thr=tp, max_dca=8, scale_out=scale_out)
-                s = stats(tr)
-                print(f"{sym:<15} | {s['ret']:>6.2f}% ({s['n']:>2d})")
+                s = detailed_stats(tr)
+                print(f"{sym:<15} | Ret: {s['ret']:>6.2f}% | WR: {s['win_rate']:>5.1f}% | Trades: {s['n']:>2d}")
             except Exception as e:
                 print(f"{sym:<15} | ❌ Error: {str(e)}")
             await asyncio.sleep(0.5)
 
     await process_bot("1. Major Crypto", ["BTC/USDT:USDT", "ETH/USDT:USDT"], "1h", 50, 1.01, False)
-    await process_bot("2. Stock Majors", ["TSLA/USDT:USDT", "AAPL/USDT:USDT", "NVDA/USDT:USDT"], "15m", 200, 1.01, False)
-    await process_bot("3. Venture Alts", ["DOGE/USDT:USDT", "PEPE/USDT:USDT", "WIF/USDT:USDT"], "15m", 200, 1.02, True)
-    await process_bot("4. Stock Ventures", ["CRM/USDT:USDT", "OKTA/USDT:USDT", "TMF/USDT:USDT"], "15m", 200, 1.02, True)
+    await process_bot("2. Venture Alts", ["DOGE/USDT:USDT", "PEPE/USDT:USDT", "WIF/USDT:USDT"], "15m", 200, 1.02, True)
 
     await ex.close()
 

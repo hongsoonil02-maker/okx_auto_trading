@@ -144,17 +144,55 @@ class BotCOKXSwap:
                             await self.exchange.cancel_all_orders(ccxt_symbol)
                         except:
                             pass
-                        order = await asyncio.wait_for(
-                            self.exchange.close_position(ccxt_symbol, side=pos_side),
-                            timeout=10.0
-                        )
+                        
+                        # [FIX] 51108 (시장가 청산 한도 초과) 방지를 위해 포지션 수량과 maxMktSz 확인 후 분할 청산
+                        await self.exchange.load_markets()
+                        market_info = self.exchange.markets.get(ccxt_symbol, {}).get('info', {})
+                        max_mkt_sz = float(market_info.get('maxMktSz', 0)) if market_info.get('maxMktSz') else 0
+                        
+                        positions = await self.exchange.fetch_positions([ccxt_symbol])
+                        target_pos = next((p for p in positions if p['side'] == pos_side and float(p.get('contracts', 0)) > 0), None)
+                        
+                        if target_pos and max_mkt_sz > 0 and float(target_pos['contracts']) > max_mkt_sz:
+                            logger.info(f"⚠️ 청산 수량({target_pos['contracts']})이 시장가 최대 한도({max_mkt_sz})를 초과하여 분할 청산합니다.")
+                            remain = float(target_pos['contracts'])
+                            close_side = "sell" if pos_side == "long" else "buy"
+                            close_params = {"reduceOnly": True, "posSide": pos_side}
+                            while remain > 0:
+                                chunk = min(remain, max_mkt_sz)
+                                await self.exchange.create_market_order(ccxt_symbol, close_side, chunk, params=close_params)
+                                remain -= chunk
+                                await asyncio.sleep(0.2)
+                            order = {"id": "chunked_close"}
+                        else:
+                            order = await asyncio.wait_for(
+                                self.exchange.close_position(ccxt_symbol, side=pos_side),
+                                timeout=10.0
+                            )
                     else:
-                        order = await asyncio.wait_for(
-                            self.exchange.create_market_order(
-                                ccxt_symbol, side, amount, params=params
-                            ),
-                            timeout=10.0,
-                        )
+                        # [FIX] 51202 방지를 위해 시장가 진입 분할 처리
+                        await self.exchange.load_markets()
+                        market_info = self.exchange.markets.get(ccxt_symbol, {}).get('info', {})
+                        max_mkt_sz = float(market_info.get('maxMktSz', 0)) if market_info.get('maxMktSz') else 0
+                        
+                        if max_mkt_sz > 0 and amount > max_mkt_sz:
+                            logger.info(f"⚠️ 진입 수량({amount})이 시장가 최대 한도({max_mkt_sz})를 초과하여 분할 진입합니다.")
+                            remain = amount
+                            orders = []
+                            while remain > 0:
+                                chunk = min(remain, max_mkt_sz)
+                                o = await self.exchange.create_market_order(ccxt_symbol, side, chunk, params=params)
+                                orders.append(o)
+                                remain -= chunk
+                                await asyncio.sleep(0.2)
+                            order = orders[-1]
+                        else:
+                            order = await asyncio.wait_for(
+                                self.exchange.create_market_order(
+                                    ccxt_symbol, side, amount, params=params
+                                ),
+                                timeout=10.0,
+                            )
                         
                     latency = time.time() - start
                     order_id = order.get("id", "N/A")
@@ -178,6 +216,12 @@ class BotCOKXSwap:
                 except Exception as e:
                     last_err = str(e)
                     logger.error(f"⚠️ OKX API 에러 (시도 {attempt+1}/{max_retries}): {e}")
+                    
+                    # [FIX] 이미 청산되었거나 포지션이 없는 경우 (51023, 51169) 에러 무시하고 성공 처리
+                    if "51023" in last_err or "51169" in last_err:
+                        logger.info("✅ 포지션이 이미 존재하지 않거나 청산 완료됨 (성공으로 간주)")
+                        return {"status": "already_closed"}
+
                     if "price limit" in last_err.lower() or "limit mechanism" in last_err.lower():
                         logger.critical(
                             f"🚨 [PRICE_LIMIT] {side.upper()} {amount} {ccxt_symbol} 주문이 가격제한으로 차단됨: {last_err}"
@@ -303,7 +347,13 @@ async def handle_status(request):
             balance_info = f"{usdt:.2f} USDT"
             for p in await bot.exchange.fetch_positions():
                 if float(p.get("contracts") or 0) > 0 and p.get("side") in ("long", "short"):
-                    positions.append({"symbol": p["symbol"], "side": p["side"]})
+                    positions.append({
+                        "symbol": p["symbol"], 
+                        "side": p["side"],
+                        "timestamp": p.get("timestamp"),
+                        "unrealizedPnl": p.get("unrealizedPnl"),
+                        "initialMargin": p.get("initialMargin")
+                    })
     except Exception as e:
         balance_info = f"Error: {e}"
     return web.json_response({

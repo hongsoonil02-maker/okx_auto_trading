@@ -42,6 +42,7 @@ from webhook_spec import (
     WebhookPayload, ActionType, SideType,
     verify_webhook_signature, sign_payload, WEBHOOK_SIGNATURE_HEADER,
 )
+from bot_config import bot_config
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -94,10 +95,9 @@ class MasterBotOrchestrator:
         self.position_state: Dict[str, str] = {}
         self.single_position_only = os.getenv("OKX_SINGLE_POSITION_ONLY", "true").lower() == "true"
         self.max_active_subpositions = int(os.getenv("OKX_GLOBAL_MAX_POSITIONS", "20"))
-        # [Fix] DCA 물타기 허용: 심볼별 분할진입 횟수 추적 (기존엔 보유 심볼 진입을 전부 거부해서
-        # 전략의 DCA 설계가 작동하지 않았음)
+        # [Fix] DCA 물타기 허용: 심볼별 분할진입 횟수 추적
         self.dca_entry_counts: Dict[str, int] = {}
-        self.max_dca_per_symbol = int(os.getenv("OKX_MASTER_MAX_DCA", "8"))
+        self.max_dca_per_symbol = bot_config.okx_max_dca
     
     def load_active_ports(self):
         """active_ports.json에서 동적 포트 매핑 로드 및 환경변수(Remote IP) 병합"""
@@ -120,9 +120,6 @@ class MasterBotOrchestrator:
             if gcp_1_ip:
                 self.BOT_ENDPOINTS["Bot C (OKX)"] = f"http://{gcp_1_ip}:8008"
                 
-            gcp_2_ip = os.environ.get("GCP_2_IP")
-            if gcp_2_ip:
-                self.BOT_ENDPOINTS["Bot D (Upbit)"] = f"http://{gcp_2_ip}:8006"
                 
         except Exception as e:
             logger.error(f"❌ 설정(포트/IP) 로드 실패: {e}")
@@ -508,8 +505,48 @@ class MasterBotOrchestrator:
                 await asyncio.sleep(30)
                 self.load_active_ports() # 동적 포트 변경 감지
                 await self.check_bot_health()
+                await self._sweep_stagnant_positions()
             except Exception as e:
                 logger.error(f"❌ 주기적 헬스 체크 오류: {e}")
+
+    async def _sweep_stagnant_positions(self):
+        """진입 후 24시간 경과 & 수익률 5% 미만인 데드 포지션 강제 청산"""
+        try:
+            url = f"{self.BOT_ENDPOINTS.get('Bot C (OKX)', 'http://localhost:8013')}/status"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                data = await resp.json()
+            
+            now_ms = time.time() * 1000
+            for p in data.get("positions", []):
+                sym = p.get("symbol")
+                side = p.get("side")
+                ts = p.get("timestamp")
+                pnl = p.get("unrealizedPnl")
+                margin = p.get("initialMargin")
+                
+                if not ts or not margin or float(margin) == 0:
+                    continue
+                
+                # 24시간 경과 여부 (86400 * 1000 ms)
+                held_ms = now_ms - float(ts)
+                if held_ms > 86400000:
+                    pnl_pct = abs(float(pnl)) / float(margin)
+                    # 실제 변동 0.5% (레버리지 10x 적용된 pnl_pct가 0.05 미만)
+                    if pnl_pct < 0.05:
+                        logger.warning(f"🧹 [Sweeper] 24시간 정체 포지션 발견: {sym} (PnL: {float(pnl):.2f}). 강제 청산 시도!")
+                        # Webhook 생성 및 발송
+                        close_side = "CLOSE_LONG" if side == "long" else "CLOSE_SHORT"
+                        payload = {
+                            "signal_id": f"sweep_{int(time.time())}",
+                            "market": "okx_swap",
+                            "symbol": sym.replace("/", "-").replace(":USDT", "-SWAP"),
+                            "side": close_side,
+                            "qty": 0
+                        }
+                        await self.signal_queue.put(payload)
+                        
+        except Exception as e:
+            logger.error(f"⚠️ 정체 포지션 스윕 중 에러: {e}")
 
 
 async def main():

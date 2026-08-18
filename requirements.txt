@@ -137,7 +137,7 @@ python-dotenv==1.1.1
 python-multipart==0.0.24
 python-okx==0.4.3
 pytz==2026.1.post1
-pyupbit==0.2.34
+
 PyYAML==6.0.3
 referencing==0.37.0
 regex==2026.1.15
@@ -184,4 +184,4 @@ zipp==3.23.0
 zstandard==0.25.0
 prometheus_client==0.20.0
 pandas-ta==0.3.14b0
-pyupbit==0.2.34
+
