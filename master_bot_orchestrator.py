@@ -98,6 +98,10 @@ class MasterBotOrchestrator:
         # [Fix] DCA 물타기 허용: 심볼별 분할진입 횟수 추적
         self.dca_entry_counts: Dict[str, int] = {}
         self.max_dca_per_symbol = bot_config.okx_max_dca
+        # [Fix] 헬스 로그 스팸 방지: 상태 전환 시에만 로깅
+        self._prev_bot_status: Dict[str, str] = {}
+        # [Fix] Sweeper 중복 청산 방지: 심볼별 마지막 스윕 시각
+        self._sweep_cooldown: Dict[str, float] = {}
     
     def load_active_ports(self):
         """active_ports.json에서 동적 포트 매핑 로드 및 환경변수(Remote IP) 병합"""
@@ -153,28 +157,34 @@ class MasterBotOrchestrator:
                             "status": "online",
                             "data": data,
                         }
-                        logger.info(f"✅ {bot_name}: ONLINE")
+                        # [Fix] ONLINE 로그는 상태 전환 시 1회만 (30초 주기 스팸 제거)
+                        if self._prev_bot_status.get(bot_name) != "online":
+                            logger.info(f"✅ {bot_name}: ONLINE")
                     else:
                         health_status[bot_name] = {
                             "status": "error",
                             "code": resp.status,
                         }
-                        logger.warning(f"⚠️  {bot_name}: HTTP {resp.status}")
+                        if self._prev_bot_status.get(bot_name) != "error":
+                            logger.warning(f"⚠️  {bot_name}: HTTP {resp.status}")
             
             except asyncio.TimeoutError:
                 health_status[bot_name] = {
                     "status": "timeout",
                 }
-                logger.warning(f"⚠️  {bot_name}: TIMEOUT")
+                if self._prev_bot_status.get(bot_name) != "timeout":
+                    logger.warning(f"⚠️  {bot_name}: TIMEOUT")
             
             except Exception as e:
                 health_status[bot_name] = {
                     "status": "unreachable",
                     "error": str(e),
                 }
-                logger.error(f"❌ {bot_name}: {e}")
+                if self._prev_bot_status.get(bot_name) != "unreachable":
+                    logger.error(f"❌ {bot_name}: {e}")
         
         self.bot_health = health_status
+        self._prev_bot_status = {name: h.get("status", "unknown") for name, h in health_status.items()}
         return health_status
     
     async def route_signal_to_bot(
@@ -207,11 +217,16 @@ class MasterBotOrchestrator:
                 f"{endpoint}/webhook",
                 data=body,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=5),
+                # [Fix] Bot C가 실제 주문 완료 후 응답하므로 주문 소요시간만큼 타임아웃 확보
+                timeout=aiohttp.ClientTimeout(total=60),
             ) as resp:
                 if resp.status in [200, 201]:
                     result = await resp.json()
-                    logger.info(f"✅ {bot_name} 신호 처리 완료: {result.get('order_id', 'N/A')}")
+                    # [Fix] 주문 실패 응답 구분 로깅 (상태 불일치 진단용)
+                    if result.get("status") == "ok" or result.get("order_id"):
+                        logger.info(f"✅ {bot_name} 신호 처리 완료: {result.get('order_id', 'N/A')}")
+                    else:
+                        logger.warning(f"⚠️ {bot_name} 주문 실패 응답: {result}")
                     
                     # 신호 로깅
                     self.processed_signals.append({
@@ -220,6 +235,9 @@ class MasterBotOrchestrator:
                         "signal_id": webhook_payload.get("signal_id"),
                         "result": result,
                     })
+                    # [Fix] 메모리 무한 성장 방지: 최근 500건만 유지
+                    if len(self.processed_signals) > 500:
+                        del self.processed_signals[:-500]
                     
                     return result
                 else:
@@ -430,9 +448,11 @@ class MasterBotOrchestrator:
         app.router.add_get("/bots/health", handle_health)
         
         for attempt in range(5):
-            runner = aiohttp.web.AppRunner(app)
+            # [Fix] access_log 제거: 폴링 로그 스팸 방지
+            runner = aiohttp.web.AppRunner(app, access_log=None)
             await runner.setup()
-            site = aiohttp.web.TCPSite(runner, "0.0.0.0", 8009)
+            # [Fix] 0.0.0.0 → 127.0.0.1: 브레인/봇 모두 같은 호스트이므로 외부 노출 차단
+            site = aiohttp.web.TCPSite(runner, "127.0.0.1", 8009)
             try:
                 await site.start()
                 break
@@ -443,7 +463,7 @@ class MasterBotOrchestrator:
                 logger.warning(f"⚠️  Master Port 8009 사용 중, 2초 후 재시도... ({attempt+1}/5)")
                 await asyncio.sleep(2)
         
-        logger.info("✅ Master Webhook 서버 시작: http://0.0.0.0:8009")
+        logger.info("✅ Master Webhook 서버 시작: http://127.0.0.1:8009")
         
         try:
             await asyncio.Event().wait()
@@ -505,26 +525,69 @@ class MasterBotOrchestrator:
                 await asyncio.sleep(30)
                 self.load_active_ports() # 동적 포트 변경 감지
                 await self.check_bot_health()
-                await self._sweep_stagnant_positions()
+                # [Fix] /status 1회 조회로 리컨실 + 스윕 공용 사용
+                data = await self._fetch_bot_status()
+                if data:
+                    self._reconcile_positions(data)
+                    await self._sweep_stagnant_positions(data)
             except Exception as e:
                 logger.error(f"❌ 주기적 헬스 체크 오류: {e}")
 
-    async def _sweep_stagnant_positions(self):
-        """진입 후 24시간 경과 & 수익률 5% 미만인 데드 포지션 강제 청산"""
+    async def _fetch_bot_status(self) -> Optional[Dict]:
+        """Bot C /status 조회 (실패 시 None)"""
         try:
             url = f"{self.BOT_ENDPOINTS.get('Bot C (OKX)', 'http://localhost:8013')}/status"
             async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                data = await resp.json()
-            
+                return await resp.json()
+        except Exception as e:
+            logger.warning(f"⚠️ [Master] Bot 상태 조회 실패: {e}")
+            return None
+
+    def _reconcile_positions(self, data: Dict):
+        """
+        [Fix] 실제 포지션과 position_state 주기 동기화.
+        기존엔 부팅 시 1회만 동기화 → 거래소 측 청산(스탑아웃/수동/강제) 후
+        마스터 상태가 남아 재진입 가드가 오작동하는 문제 해소.
+        """
+        try:
+            actual: Dict[str, str] = {}
+            for p in data.get("positions", []):
+                sym, side = p.get("symbol"), p.get("side")
+                if sym and side in ("long", "short"):
+                    actual[sym] = side.upper()
+
+            for sym in list(self.position_state.keys()):
+                if sym not in actual and self.position_state[sym] != "FLAT":
+                    logger.info(f"🔄 [Reconcile] {sym} 실포지션 없음 → 상태 FLAT 정리")
+                    self.position_state[sym] = "FLAT"
+                    self.dca_entry_counts[sym] = 0
+
+            for sym, side in actual.items():
+                if self.position_state.get(sym, "FLAT") == "FLAT":
+                    logger.info(f"🔄 [Reconcile] {sym} 실포지션({side}) 반영")
+                    self.position_state[sym] = side
+                    self.dca_entry_counts.setdefault(sym, 1)
+        except Exception as e:
+            logger.error(f"⚠️ 포지션 리컨실 오류: {e}")
+
+    async def _sweep_stagnant_positions(self, data: Dict):
+        """진입 후 24시간 경과 & 수익률 5% 미만인 데드 포지션 강제 청산"""
+        try:
             now_ms = time.time() * 1000
             for p in data.get("positions", []):
                 sym = p.get("symbol")
                 side = p.get("side")
-                ts = p.get("timestamp")
+                # [Fix] 진입 시각은 cTime 기준 (timestamp=uTime은 DCA 시 갱신되어 24h 판정 왜곡)
+                ts = p.get("cTime") or p.get("timestamp")
                 pnl = p.get("unrealizedPnl")
                 margin = p.get("initialMargin")
                 
                 if not ts or not margin or float(margin) == 0:
+                    continue
+
+                # [Fix] 심볼별 스윕 쿨다운: 청산 완료 전까지 30초마다 중복 신호 발송 방지
+                last_sweep = self._sweep_cooldown.get(sym, 0)
+                if now_ms - last_sweep < 15 * 60 * 1000:
                     continue
                 
                 # 24시간 경과 여부 (86400 * 1000 ms)
@@ -544,6 +607,7 @@ class MasterBotOrchestrator:
                             "qty": 0
                         }
                         await self.signal_queue.put(payload)
+                        self._sweep_cooldown[sym] = now_ms
                         
         except Exception as e:
             logger.error(f"⚠️ 정체 포지션 스윕 중 에러: {e}")

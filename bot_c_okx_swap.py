@@ -4,13 +4,15 @@ bot_c_okx_swap.py — Bot C: OKX Futures 실제 주문 엔진 v2.0
 - ccxt async로 실제 OKX API 호출
 - Hedge Mode: Long/Short 동시 포지션
 - 시장가 주문 (Market Order)
-- 포트: 8003
+- 포트: 8013 (기본값, 실행 인자로 조정 가능)
 """
 import asyncio
 import json
 import os
+import re
 import sys
 import time
+import uuid
 import logging
 import logging.handlers
 import psutil
@@ -57,6 +59,21 @@ class BotCOKXSwap:
     def __init__(self):
         self._lock = None
         self.exchange = None
+        self._balance_cache = (0.0, None)  # [Fix] (timestamp, "X.XX USDT") 헬스체크 캐시
+
+    async def get_balance_str(self, max_age: float = 25.0) -> str:
+        """[Fix] 잔고 캐시 — 30초 주기 헬스체크의 중복 fetch_balance 방지."""
+        ts, cached = self._balance_cache
+        if cached is not None and time.time() - ts < max_age:
+            return cached
+        try:
+            bal = await self.exchange.fetch_balance()
+            usdt = bal.get("USDT", {}).get("free", 0)
+            s = f"{float(usdt):.2f} USDT"
+        except Exception:
+            return cached if cached is not None else "N/A"
+        self._balance_cache = (time.time(), s)
+        return s
 
     async def init(self):
         if self._lock is None:
@@ -77,10 +94,10 @@ class BotCOKXSwap:
             await self.exchange.close()
 
     async def execute_order(self, payload: WebhookPayload):
-        """실제 OKX 시장가 주문"""
+        """실제 OKX 시장가 주문. 결과 dict 반환 (status: ok/failed/rejected)."""
         if not self.exchange or not self._lock:
             logger.error("❌ exchange 미초기화")
-            return
+            return {"status": "failed", "error": "exchange_not_initialized"}
 
         async with self._lock:
             symbol = payload.symbol  # e.g. "BTC-USDT-SWAP" → ccxt용 "BTC/USDT:USDT"
@@ -88,20 +105,21 @@ class BotCOKXSwap:
             if BotConfig.is_symbol_blacklisted(symbol, market="OKX"):
                 logger.warning(f"🚫 [차단] 블랙리스트 종목 주문 거부: {symbol}")
                 send_telegram_alert(f"🚫 [Bot C] 블랙리스트 종목 주문 거부: {symbol}")
-                return
+                return {"status": "rejected", "reason": "blacklist"}
 
             # ── Last-line defense: reject new entries if max active positions reached ──
             if payload.side in (SideType.BUY, SideType.SELL):
                 single_only = os.getenv("OKX_SINGLE_POSITION_ONLY", "true").lower() == "true"
+                max_positions = int(os.getenv("OKX_GLOBAL_MAX_POSITIONS", "20"))
                 if single_only:
                     positions = await self.exchange.fetch_positions()
                     active = [p for p in positions if float(p.get("contracts", 0)) > 0]
-                    if len(active) >= int(os.getenv("OKX_GLOBAL_MAX_POSITIONS", "20")):
+                    if len(active) >= max_positions:
                         logger.warning(
                             f"🚫 [Bot C Guard] 활성 포지션 {len(active)}개 >= "
-                            f"최대 1개. 진입 거부: {payload.side.value} {symbol}"
+                            f"최대 {max_positions}개. 진입 거부: {payload.side.value} {symbol}"
                         )
-                        return
+                        return {"status": "rejected", "reason": "max_positions"}
 
             # OKX ccxt 심볼 변환: "BTC-USDT-SWAP" → "BTC/USDT:USDT"
             ccxt_symbol = symbol.replace("-SWAP", "").replace("-", "/", 1)
@@ -134,6 +152,7 @@ class BotCOKXSwap:
             max_retries = 3
             last_err = ""
             for attempt in range(max_retries):
+                cl_ord_id = None
                 try:
                     start = time.time()
                     
@@ -187,9 +206,13 @@ class BotCOKXSwap:
                                 await asyncio.sleep(0.2)
                             order = orders[-1]
                         else:
+                            # [Fix] clOrdId 부여: 타임아웃 시 체결 여부 확인으로 이중 체결 방지
+                            cl_ord_id = "kbot" + uuid.uuid4().hex[:20]
+                            order_params = dict(params)
+                            order_params["clOrdId"] = cl_ord_id
                             order = await asyncio.wait_for(
                                 self.exchange.create_market_order(
-                                    ccxt_symbol, side, amount, params=params
+                                    ccxt_symbol, side, amount, params=order_params
                                 ),
                                 timeout=10.0,
                             )
@@ -209,18 +232,66 @@ class BotCOKXSwap:
                         f"@ {avg_price} | ID: {order_id} | Latency: {latency:.3f}s"
                     )
                     _record_trade(ccxt_symbol, payload.side.value, amount, avg_price, order_id)
-                    return order
+                    return {"status": "ok", "order_id": order_id, "price": avg_price}
                 except asyncio.TimeoutError:
                     last_err = f"타임아웃 (시도 {attempt+1}/{max_retries})"
                     logger.error(f"⚠️ OKX 주문 {last_err}")
+                    # [Fix] 타임아웃 ≠ 실패: 주문이 이미 체결됐을 수 있음 → 재시도 전 확인
+                    if cl_ord_id:
+                        try:
+                            existing = await self.exchange.fetch_order(
+                                cl_ord_id, ccxt_symbol, params={"clOrdId": cl_ord_id}
+                            )
+                            if existing:
+                                ex_id = existing.get("id", "N/A")
+                                logger.info(
+                                    f"✅ 타임아웃 주문이 실제로 체결됨 (clOrdId: {cl_ord_id}) — 성공 처리"
+                                )
+                                _record_trade(ccxt_symbol, payload.side.value, amount,
+                                              existing.get("average") or 0, ex_id)
+                                return {"status": "ok", "order_id": ex_id}
+                        except Exception as lookup_err:
+                            logger.warning(f"⚠️ 타임아웃 주문 조회 실패 (재시도 진행): {lookup_err}")
                 except Exception as e:
                     last_err = str(e)
                     logger.error(f"⚠️ OKX API 에러 (시도 {attempt+1}/{max_retries}): {e}")
-                    
+
                     # [FIX] 이미 청산되었거나 포지션이 없는 경우 (51023, 51169) 에러 무시하고 성공 처리
                     if "51023" in last_err or "51169" in last_err:
                         logger.info("✅ 포지션이 이미 존재하지 않거나 청산 완료됨 (성공으로 간주)")
-                        return {"status": "already_closed"}
+                        return {"status": "ok", "order_id": "already_closed"}
+
+                    # [Fix] 51008 증거금 부족: 재시도 무의미 → 즉시 중단
+                    if "51008" in last_err:
+                        logger.warning(
+                            f"🚫 [증거금 부족] {side.upper()} {amount} {ccxt_symbol} 주문 포기 (재시도 없음)"
+                        )
+                        return {"status": "failed", "error": "insufficient_margin"}
+
+                    # [Fix] 51004 포지션 한도 초과: 한도 내로 수량 클램프 후 재시도
+                    if "51004" in last_err:
+                        m = re.search(r"more than (\d+)\(contracts\)", last_err)
+                        if m:
+                            cap = float(m.group(1))
+                            try:
+                                positions = await self.exchange.fetch_positions([ccxt_symbol])
+                                pos_side_key = params.get("posSide", "long")
+                                cur = sum(
+                                    float(p.get("contracts", 0)) for p in positions
+                                    if p.get("side") == pos_side_key
+                                )
+                                allowed = cap - cur
+                                if allowed > 0 and allowed < amount:
+                                    logger.warning(
+                                        f"⚠️ [51004] {ccxt_symbol} 포지션 한도 {cap:.0f} (보유 {cur:.0f}) — "
+                                        f"수량 {amount} → {allowed:.0f} 축소 후 재시도"
+                                    )
+                                    amount = allowed
+                                    continue
+                            except Exception as clamp_err:
+                                logger.warning(f"⚠️ [51004] 한도 파싱/재시도 준비 실패: {clamp_err}")
+                        logger.warning(f"🚫 [51004] {ccxt_symbol} 포지션 한도 초과 — 주문 포기")
+                        return {"status": "failed", "error": "position_cap_exceeded"}
 
                     if "price limit" in last_err.lower() or "limit mechanism" in last_err.lower():
                         logger.critical(
@@ -240,6 +311,7 @@ class BotCOKXSwap:
                 send_telegram_alert(f"🚨 [FATAL] Bot C (OKX) 주문 {max_retries}회 실패: {payload.side.value} {symbol} | {last_err}")
             except Exception:
                 pass
+            return {"status": "failed", "error": last_err}
 
 
 # ── TRADE RECORDER (P3: 실현손익 추적용 체결 기록) ──
@@ -261,6 +333,29 @@ def _record_trade(symbol: str, side: str, amount: float, price: float, order_id:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
         logger.warning(f"⚠️ 거래 기록 실패: {e}")
+
+
+def _rotate_trades_file(max_age_days: int = 90):
+    """[Fix] trades.jsonl 로테이션: 켈리 분석 윈도우(90일) 이전 기록 정리로 무한 성장 방지."""
+    try:
+        if not os.path.exists(_TRADES_FILE):
+            return
+        cutoff = time.time() - max_age_days * 86400
+        kept = []
+        with open(_TRADES_FILE, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    if json.loads(line).get("ts", 0) >= cutoff:
+                        kept.append(line)
+                except json.JSONDecodeError:
+                    continue
+        tmp = _TRADES_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(kept)
+        os.replace(tmp, _TRADES_FILE)
+        logger.info(f"✅ 거래 기록 로테이션 완료: {len(kept)}건 유지 (최근 {max_age_days}일)")
+    except Exception as e:
+        logger.warning(f"⚠️ 거래 기록 로테이션 실패: {e}")
 
 
 # ── PID LOCK ──
@@ -309,8 +404,13 @@ async def handle_webhook(request):
     try:
         payload = WebhookPayload.from_json(body)
         logger.info(f"📥 Webhook 수신: {payload.side.value} {payload.qty} {payload.symbol}")
-        asyncio.create_task(bot.execute_order(payload))
-        return web.json_response({"status": "ok"})
+        # [Fix] 실제 주문 실행 완료 후 결과 반환 (기존 fire-and-forget → 마스터 상태 불일치 해소)
+        result = await bot.execute_order(payload)
+        result = result or {"status": "failed", "error": "unknown"}
+        if result.get("status") == "ok":
+            return web.json_response({"status": "ok", "order_id": result.get("order_id")})
+        logger.warning(f"⚠️ 주문 실행 결과: {result}")
+        return web.json_response(result)
     except Exception as e:
         logger.error(f"Webhook 파싱 오류: {e}")
         try:
@@ -324,9 +424,7 @@ async def handle_health(request):
     balance_info = "N/A"
     try:
         if bot.exchange:
-            bal = await bot.exchange.fetch_balance()
-            usdt = bal.get("USDT", {}).get("free", 0)
-            balance_info = f"{usdt:.2f} USDT"
+            balance_info = await bot.get_balance_str()
     except Exception:
         pass
     return web.json_response({
@@ -342,15 +440,15 @@ async def handle_status(request):
     positions = []
     try:
         if bot.exchange:
-            bal = await bot.exchange.fetch_balance()
-            usdt = bal.get("USDT", {}).get("free", 0)
-            balance_info = f"{usdt:.2f} USDT"
+            balance_info = await bot.get_balance_str()
             for p in await bot.exchange.fetch_positions():
                 if float(p.get("contracts") or 0) > 0 and p.get("side") in ("long", "short"):
                     positions.append({
                         "symbol": p["symbol"], 
                         "side": p["side"],
                         "timestamp": p.get("timestamp"),
+                        # [Fix] 실제 진입 시각 노출 (timestamp=uTime은 갱신 시각이라 24h 스윕 판정 왜곡)
+                        "cTime": (p.get("info") or {}).get("cTime"),
                         "unrealizedPnl": p.get("unrealizedPnl"),
                         "initialMargin": p.get("initialMargin")
                     })
@@ -368,6 +466,12 @@ async def handle_status(request):
 
 async def handle_close_all(request):
     """EMERGENCY: Close all open positions"""
+    # [Fix] 서명 검증 추가: 미인증 전량 청산 요청 차단
+    signature = request.headers.get(WEBHOOK_SIGNATURE_HEADER, "")
+    body = await request.text()
+    if not verify_webhook_signature(body, signature):
+        logger.warning(f"⚠️ close_all 서명 검증 실패 (IP: {request.remote})")
+        return web.json_response({"error": "Invalid signature"}, status=401)
     results = []
     try:
         if not bot.exchange:
@@ -425,9 +529,11 @@ async def main():
     app.router.add_get("/health", handle_health)
     app.router.add_get("/status", handle_status)
     app.router.add_post("/close_all", handle_close_all)
-    runner = web.AppRunner(app)
+    # [Fix] access_log 제거: /health·/status 폴링 로그 스팸 방지
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    # [Fix] 0.0.0.0 → 127.0.0.1: 같은 호스트 마스터만 호출하므로 외부 노출 차단
+    site = web.TCPSite(runner, "127.0.0.1", port)
     
     for attempt in range(5):
         try:
@@ -450,6 +556,7 @@ async def main():
 if __name__ == "__main__":
     try:
         acquire_pid_lock()
+        _rotate_trades_file()
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("🛑 프로그램 종료")
