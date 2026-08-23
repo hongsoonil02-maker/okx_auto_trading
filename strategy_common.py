@@ -12,6 +12,7 @@ import json
 import logging
 import logging.handlers
 import asyncio
+from collections import defaultdict
 import aiohttp
 from datetime import datetime
 from typing import List
@@ -200,6 +201,38 @@ class BaseStrategyBrain:
     # 단계적 배포: 이 구간(소프트 경계~임계값)에서는 축소 사이즈로 진입 허용
     CHOP_SOFT_BOUNDARY = float(os.getenv("OKX_CHOP_ADX_SOFT", "22"))
     CHOP_SOFT_SIZE = float(os.getenv("OKX_CHOP_SOFT_SIZE", "0.7"))
+    # ── 섹터별 파라미터 (SECTOR_PARAMS) ──
+    # 실적 데이터(08-16~) 기반: 밈 승률 66% 최고 / 메이저 42%(ETH류 체인 과다) /
+    # 신규상장 순손실(-292, CAP -1.5k) → 섹터별 임계값·사이즈 차등화.
+    SECTOR_MAJORS = frozenset({'BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'LINK', 'DOT', 'BNB', 'TRX'})
+    SECTOR_MEMES = frozenset({
+        'DOGE', 'SHIB', 'PEPE', 'BOME', 'WIF', 'BONK', 'FLOKI', 'FARTCOIN', 'PUMP',
+        'PEOPLE', 'MOODENG', 'PNUT', 'ACT', 'NEIRO', 'TURBO', 'MEW', 'POPCAT',
+        'GIGA', 'BRETT', 'TRUMP', 'MELANIA', 'PENGU', 'AI16Z',
+    })
+    SECTOR_STOCKS = frozenset({
+        'TSLA', 'NVDA', 'AAPL', 'AMZN', 'MSFT', 'META', 'GOOG', 'GOOGL', 'COIN', 'SPCX',
+        'OPENAI', 'ANTHROPIC', 'RDDT', 'MU', 'SNDK', 'SOXL', 'SOXS', 'XAU', 'CL', 'SKHY',
+        'KORU', 'CBRS', 'AEON', 'PLTR', 'AMD', 'INTC', 'QCOM', 'BABA', 'UBER', 'ABNB',
+        'SNAP', 'MSTR', 'HOOD', 'RIVN', 'NIO', 'PYPL', 'SQ', 'SHOP', 'SPY', 'QQQ', 'IWM',
+        'DIA', 'GLD', 'SLV', 'XAG', 'AXTI', 'CRCL', 'UNITREE', 'XIAOMI', 'LITE', 'UB',
+        'KR200', 'ISRG', 'MRVL', 'SKUU', 'HOME',
+    })
+    # thr_long: 롱 진입 임계값 (숏 = +20 비대칭 유지)
+    # size_mult: 진입 목표 마진 배수
+    SECTOR_PARAMS = {
+        'major':       {'thr_long': int(os.getenv("OKX_THR_MAJOR", "80")),  'size_mult': 1.0},
+        'alt':         {'thr_long': int(os.getenv("OKX_THR_ALT", "70")),    'size_mult': 1.0},
+        'meme':        {'thr_long': int(os.getenv("OKX_THR_MEME", "65")),   'size_mult': 1.0},
+        'new_listing': {'thr_long': int(os.getenv("OKX_THR_NEW", "75")),
+                        'size_mult': float(os.getenv("OKX_NEW_LISTING_SIZE_MULT", "0.75"))},
+        'stock':       {'thr_long': 999, 'size_mult': 0.0},   # 원천 제외
+    }
+    # ── 왕복 필터 (Churn Filter) ──
+    # 최근 N청산 승률 < 기준 & 순손실인 종목을 일정 시간 신규 진입 제외 (CAP류 출혈 차단).
+    CHURN_LOOKBACK_CLOSES = int(os.getenv("OKX_CHURN_LOOKBACK", "6"))
+    CHURN_MIN_WINRATE = float(os.getenv("OKX_CHURN_MIN_WINRATE", "0.40"))
+    CHURN_COOLDOWN_HOURS = float(os.getenv("OKX_CHURN_COOLDOWN_HOURS", "12"))
     # ── [Fix #2] 일손실 서킷 브레이커 ──
     # 당일 자산이 기준(일 시작 자산) 대비 임계값 이하로 하락하면 신규 진입 차단.
     # 회복(임계값의 절반 이상) 또는 다음 날(UTC) 자동 해제. 상태는 파일로 영속화(재시작 대비).
@@ -242,6 +275,10 @@ class BaseStrategyBrain:
         self._deploy_scale = 1.0   # 단계적 배포 배율 (1.0=풀, 0.7=소프트존, 0.0=차단)
         self._deploy_state = None
         self._circuit_open = False
+        # 섹터 분류 캐시 + 왕복 필터 상태
+        self._listtime_cache = None       # {sym: ms}
+        self._churn_blacklist = {}        # sym -> 제외 만료 epoch초
+        self._churn_last_refresh = 0.0
         self._cb_state = {}
 
     def _is_trading_hour_allowed(self) -> bool:
@@ -373,16 +410,123 @@ class BaseStrategyBrain:
         interval_ms = self.DCA_MIN_CANDLES * self.TIMEFRAME_MINUTES * 60 * 1000
         return (t_curr - last) >= interval_ms
 
+    # ── 섹터 분류 & 파라미터 ──
+    def _symbol_sector(self, symbol: str) -> str:
+        """심볼을 major/alt/meme/new_listing/stock 로 분류 (listTime 60일 기준)."""
+        base = symbol.split('/')[0]
+        if base in self.SECTOR_STOCKS:
+            return 'stock'
+        if base in self.SECTOR_MAJORS:
+            return 'major'
+        lt = self._get_list_time(symbol)
+        if lt and (time.time() * 1000 - lt) < self.NEW_LISTING_DAYS * 86400 * 1000:
+            return 'new_listing'
+        if base in self.SECTOR_MEMES:
+            return 'meme'
+        return 'alt'
+
+    def _sector_params(self, symbol: str) -> dict:
+        sec = self._symbol_sector(symbol)
+        return self.SECTOR_PARAMS.get(sec, {'thr_long': 70, 'size_mult': 1.0})
+
+    def _get_list_time(self, symbol: str):
+        """상장시각(ms) 캐시 조회. exchange.markets 로딩 전이면 None."""
+        if self._listtime_cache is None:
+            self._listtime_cache = {}
+            try:
+                for sym, m in (getattr(self, 'exchange', None) and self.exchange.markets or {}).items():
+                    if not m.get('swap'):
+                        continue
+                    try:
+                        self._listtime_cache[sym] = int((m.get('info') or {}).get('listTime') or 0)
+                    except Exception:
+                        self._listtime_cache[sym] = 0
+            except Exception:
+                pass
+        return self._listtime_cache.get(symbol) or 0
+
+    def _refresh_churn_blacklist(self):
+        """
+        왕복 필터: trades.jsonl 최근 청산 성적 기준.
+        최근 N청산 승률 < 기준 & 순손실 → CHURN_COOLDOWN_HOURS 동안 신규 진입 제외.
+        10분 캐시, 변화 시에만 로깅.
+        """
+        now = time.time()
+        if now - self._churn_last_refresh < 600:
+            return
+        self._churn_last_refresh = now
+        try:
+            path = os.path.join(BASE_DIR, "state", "trades.jsonl")
+            if not os.path.exists(path):
+                return
+            cutoff = now - 7 * 86400
+            markets = getattr(self, 'exchange', None) and getattr(self.exchange, 'markets', {}) or {}
+            pos = {}
+            closes = defaultdict(list)
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = r.get('ts', 0)
+                    if ts < cutoff:
+                        continue
+                    px, amt = float(r.get('price') or 0), float(r.get('amount') or 0)
+                    if not px:
+                        continue
+                    m = markets.get(r['symbol']) or {}
+                    cs = float(m.get('contractSize') or 1)
+                    side = r['side']
+                    sk = "short" if side in ("SELL", "CLOSE_SHORT") else "long"
+                    key = (r['symbol'], sk)
+                    qty, avg = pos.get(key, (0.0, 0.0))
+                    if side in ("BUY", "SELL"):
+                        nq = qty + amt
+                        pos[key] = (nq, (avg * qty + px * amt) / nq if nq else 0.0)
+                    else:
+                        cq = qty if amt == 0 else min(amt, qty)
+                        if cq > 0 and avg > 0:
+                            sgn = 1 if sk == "long" else -1
+                            closes[r['symbol']].append((ts, (px - avg) * cq * cs * sgn))
+                        nq = qty - cq
+                        pos[key] = (max(nq, 0.0), avg if nq > 1e-9 else 0.0)
+
+            new_bl = {}
+            for sym, cl in closes.items():
+                base = sym.split('/')[0]
+                if base in self.SECTOR_MAJORS or base in self.SECTOR_STOCKS:
+                    continue  # 메이저(추세캡처 본업)/주식(원천제외)는 왕복필터 대상 아님
+                recent = cl[-self.CHURN_LOOKBACK_CLOSES:]
+                if len(recent) < 4:
+                    continue  # 표본 부족 → 제외 안 함
+                wr = sum(1 for _, p in recent if p > 0) / len(recent)
+                netp = sum(p for _, p in recent)
+                if wr < self.CHURN_MIN_WINRATE and netp < 0:
+                    new_bl[sym] = now + self.CHURN_COOLDOWN_HOURS * 3600
+
+            active_old = {s for s, u in self._churn_blacklist.items() if u > now}
+            added = set(new_bl) - active_old
+            removed = active_old - set(new_bl)
+            for s in sorted(added):
+                self.logger.warning(
+                    f"🚫 [왕복필터] {s} 최근 청산 승률 저조 — "
+                    f"{self.CHURN_COOLDOWN_HOURS:.0f}시간 신규 진입 제외"
+                )
+            for s in sorted(removed):
+                self.logger.info(f"✅ [왕복필터] {s} 제외 해제")
+            self._churn_blacklist = new_bl
+        except Exception as e:
+            self.logger.warning(f"⚠️ [{self.STRATEGY_NAME}] 왕복필터 갱신 실패(기존 유지): {e}")
+
+    def _churn_blocked(self, symbol: str) -> bool:
+        return time.time() < self._churn_blacklist.get(symbol, 0)
+
     def _get_dynamic_portion(self, symbol: str) -> float:
-        """
-        [승률 기반 탄력적 시드 분배 + 켈리 사이징]
-        - 기본 비중은 쿼터 켈리 (get_kelly_portion)
-        - 신규 상장 종목(승률 높음)은 1.5배, 오래된 종목은 0.7배
-        """
+        """[레거시 호환] 섹터별 사이즈 배수 반영한 켈리 포션."""
         base = self.get_kelly_portion()
-        if self._is_new_listing(symbol):
-            return min(base * 1.5, self.PORTION_MAX)
-        return base * 0.7
+        mult = self._sector_params(symbol).get('size_mult', 1.0)
+        return max(0.05, base * mult)
 
     def _calc_target_margin(self, free_usdt: float, total_equity: float, entry_type: str = "new") -> float:
         """
@@ -449,6 +593,10 @@ class BaseStrategyBrain:
                             vol = 0.0
                         # [긴급 패치] 24시간 거래대금 MIN_QUOTE_VOLUME 미만인 잡코인 원천 차단
                         if vol >= self.MIN_QUOTE_VOLUME:
+                            # [왕복필터] 저승률 왕복 종목 신규 선정 제외
+                            # (메이저 제외: 단기 승률 낮아도 추세 캡처가 본업 → SOL 사례)
+                            if self._churn_blocked(s) and s.split('/')[0] not in self.SECTOR_MAJORS:
+                                continue
                             if self._symbol_matches(s, t, markets) and not any(b in s for b in dynamic_blacklist):
                                 data.append({'symbol': s, 'vol': vol})
                 if not data:
@@ -610,8 +758,10 @@ class BaseStrategyBrain:
             if is_short_momentum: short_score += 20
 
             # [Fix] 비대칭 임계값: 롱 70, 숏 90 (숏은 구조적으로 위험하므로 엄격)
-            ENTRY_THRESHOLD_LONG = 70
-            ENTRY_THRESHOLD_SHORT = 90
+            # [섹터별 임계값] 종목 섹터에 따라 진입 점수 기준 차등 적용
+            _sec_p = self._sector_params(symbol)
+            ENTRY_THRESHOLD_LONG = _sec_p.get('thr_long', 70)
+            ENTRY_THRESHOLD_SHORT = ENTRY_THRESHOLD_LONG + 20  # 숏 비대칭 유지 (기존 70/90)
             is_long_sig = (long_score >= ENTRY_THRESHOLD_LONG) and vol_cond and getattr(self, '_long_regime_ok', True)
             is_short_sig = (short_score >= ENTRY_THRESHOLD_SHORT) and vol_cond and getattr(self, '_short_regime_ok', True)
             # [수익성] 베어 숏 게이팅: 불장(BTC>=EMA200)에서 숏 차단 → 숏 손실 원천 방지
@@ -1010,6 +1160,12 @@ class BaseStrategyBrain:
                 target_margin *= deploy_scale
                 if target_margin < self.MIN_POSITION_MARGIN:
                     return  # 축소해도 최소 마진 미달 시 스킵
+            # [섹터별 사이즈] 신규상장 0.75x 등 섹터 배수 적용
+            sec_size = self._sector_params(symbol).get('size_mult', 1.0)
+            if sec_size < 1.0:
+                target_margin *= sec_size
+                if target_margin < self.MIN_POSITION_MARGIN:
+                    return
             if target_margin <= 0:
                 if not self._margin_reject_logged:
                     self.logger.warning(
@@ -1296,6 +1452,8 @@ class BaseStrategyBrain:
                 # [Fix #1/#2] 횡보장 필터 & 서킷 브레이커 갱신 (사이클당 1회)
                 await self._update_chop_filter()
                 await self._update_circuit_breaker()
+                # [왕복필터] 저승률 종목 신규 진입 제외 갱신 (내부 10분 캐시)
+                self._refresh_churn_blacklist()
 
                 for symbol in symbols:
                     await self.check_auto_logic(symbol)
