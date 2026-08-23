@@ -197,6 +197,9 @@ class BaseStrategyBrain:
     # 청산/스탑/익절은 계속 동작 (기존 포지션 관리 유지).
     CHOP_FILTER_ENABLED = os.getenv("OKX_CHOP_FILTER", "true").lower() == "true"
     CHOP_ADX_THRESHOLD = float(os.getenv("OKX_CHOP_ADX", "20"))
+    # 단계적 배포: 이 구간(소프트 경계~임계값)에서는 축소 사이즈로 진입 허용
+    CHOP_SOFT_BOUNDARY = float(os.getenv("OKX_CHOP_ADX_SOFT", "22"))
+    CHOP_SOFT_SIZE = float(os.getenv("OKX_CHOP_SOFT_SIZE", "0.7"))
     # ── [Fix #2] 일손실 서킷 브레이커 ──
     # 당일 자산이 기준(일 시작 자산) 대비 임계값 이하로 하락하면 신규 진입 차단.
     # 회복(임계값의 절반 이상) 또는 다음 날(UTC) 자동 해제. 상태는 파일로 영속화(재시작 대비).
@@ -236,6 +239,8 @@ class BaseStrategyBrain:
         self._margin_reject_logged = False
         # [Fix #1/#2] 횡보장 필터 & 서킷 브레이커 상태
         self._chop_block = False
+        self._deploy_scale = 1.0   # 단계적 배포 배율 (1.0=풀, 0.7=소프트존, 0.0=차단)
+        self._deploy_state = None
         self._circuit_open = False
         self._cb_state = {}
 
@@ -999,6 +1004,12 @@ class BaseStrategyBrain:
             if self.CONVICTION_SIZING_ENABLED and entry_type in ("new", "flip", "reentry"):
                 conv_mult = max(self.CONVICTION_MIN_MULT, min(self.CONVICTION_MAX_MULT, base_score / 70.0))
                 target_margin *= conv_mult
+            # [단계적 배포] 약추세 구간(ADX 소프트 경계~임계값)에서는 축소 사이즈로 참여
+            deploy_scale = getattr(self, '_deploy_scale', 1.0)
+            if deploy_scale < 1.0:
+                target_margin *= deploy_scale
+                if target_margin < self.MIN_POSITION_MARGIN:
+                    return  # 축소해도 최소 마진 미달 시 스킵
             if target_margin <= 0:
                 if not self._margin_reject_logged:
                     self.logger.warning(
@@ -1081,11 +1092,16 @@ class BaseStrategyBrain:
 
     async def _update_chop_filter(self):
         """
-        [Fix #1] BTC 1h ADX로 횡보장 감지 → 신규 자본 투입 전면 차단.
-        로깅은 상태 전환 시에만 (스팸 방지). 실패 시 기존 상태 유지.
+        단계적 배포 (Graduated Deployment):
+          ADX ≥ 임계값(25)      → 풀 배포 (100%)
+          소프트 경계(22) ≤ ADX < 25 → 축소 배포 (70% 사이즈 진입 허용)
+          ADX < 22              → 전면 차단
+        백테스트(E 변형): 전면차단 대비 -300 USDT 희생으로 그레이존 참여 확보.
+        로깅은 상태 전환 시에만. 실패 시 기존 상태 유지.
         """
         if not self.CHOP_FILTER_ENABLED:
             self._chop_block = False
+            self._deploy_scale = 1.0
             return
         try:
             ohlcv = await self.exchange.fetch_ohlcv('BTC/USDT:USDT', '1h', limit=100)
@@ -1094,19 +1110,35 @@ class BaseStrategyBrain:
             df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             adx_series = calc_adx(df, 14)
             adx_now = float(adx_series.iloc[-2])  # 직전 확정 캔들 기준 (진행 중 캔들 노이즈 제외)
-            block = adx_now < self.CHOP_ADX_THRESHOLD
-            if block != self._chop_block:
-                if block:
-                    self.logger.warning(
-                        f"🛑 [Chop Filter] 횡보장 감지 (BTC 1h ADX {adx_now:.1f} < {self.CHOP_ADX_THRESHOLD:.0f}) "
-                        f"— 신규 진입/DCA/불타기/재진입 차단 (청산은 계속)"
-                    )
-                else:
+
+            if adx_now >= self.CHOP_ADX_THRESHOLD:
+                state, scale = "full", 1.0
+            elif adx_now >= self.CHOP_SOFT_BOUNDARY:
+                state, scale = "soft", self.CHOP_SOFT_SIZE
+            else:
+                state, scale = "blocked", 0.0
+
+            prev_state = getattr(self, '_deploy_state', None)
+            if state != prev_state:
+                if state == "full":
                     self.logger.info(
                         f"✅ [Chop Filter] 추세 복귀 (BTC 1h ADX {adx_now:.1f} ≥ {self.CHOP_ADX_THRESHOLD:.0f}) "
-                        f"— 진입 재개"
+                        f"— 풀 배포"
                     )
-            self._chop_block = block
+                elif state == "soft":
+                    self.logger.info(
+                        f"🟡 [Chop Filter] 약추세 구간 (BTC 1h ADX {adx_now:.1f}, "
+                        f"{self.CHOP_SOFT_BOUNDARY:.0f}~{self.CHOP_ADX_THRESHOLD:.0f}) — "
+                        f"사이즈 {self.CHOP_SOFT_SIZE*100:.0f}% 배포"
+                    )
+                else:
+                    self.logger.warning(
+                        f"🛑 [Chop Filter] 횡보장 감지 (BTC 1h ADX {adx_now:.1f} < {self.CHOP_SOFT_BOUNDARY:.0f}) "
+                        f"— 신규 진입/DCA/불타기/재진입 차단 (청산은 계속)"
+                    )
+                self._deploy_state = state
+            self._chop_block = (state == "blocked")
+            self._deploy_scale = scale
         except Exception as e:
             self.logger.warning(f"⚠️ [{self.STRATEGY_NAME}] 촙 필터 체크 실패(기존 상태 유지): {e}")
 
