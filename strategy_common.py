@@ -98,6 +98,13 @@ def calc_stoch_rsi(series, period=14, smooth_k=3, smooth_d=3):
     return k, d
 
 
+def calc_atr(df, period=14):
+    """ATR(평균 진폭 범위) — Chandelier 트레일링 및 위험조정 모멘텀에 사용."""
+    h, l, c = df['h'], df['l'], df['c']
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
 def calc_adx(df, period=14):
     """
     ADX (Average Directional Index) — 추세 강도 지표.
@@ -232,6 +239,27 @@ class BaseStrategyBrain:
     CHURN_LOOKBACK_CLOSES = int(os.getenv("OKX_CHURN_LOOKBACK", "6"))
     CHURN_MIN_WINRATE = float(os.getenv("OKX_CHURN_MIN_WINRATE", "0.40"))
     CHURN_COOLDOWN_HOURS = float(os.getenv("OKX_CHURN_COOLDOWN_HOURS", "12"))
+    # ── Alpha Stack ──
+    # ① ATR Chandelier 트레일링: 수익 구간에서 고점 − k×ATR 이탈 시 청산 (변동성 클수록 타이트)
+    ATR_TRAILING_ENABLED = os.getenv("OKX_ATR_TRAILING", "true").lower() == "true"
+    ATR_TRAIL_K = float(os.getenv("OKX_ATR_TRAIL_K", "2.5"))
+    ATR_TRAIL_ARM_PNL = float(os.getenv("OKX_ATR_TRAIL_ARM_PNL", "0.20"))  # 마진수익 20% 도달 후 작동
+    # ② 스퀴즈 브레이크아웃: BB 폭 압축 해제 + 방향성 돌파 → 점수 보너스
+    SQUEEZE_SIGNAL_ENABLED = os.getenv("OKX_SQUEEZE_SIGNAL", "true").lower() == "true"
+    SQUEEZE_BONUS = int(os.getenv("OKX_SQUEEZE_BONUS", "30"))
+    # ③ 모멘텀 로테이션: 위험조정 모멘텀(ROC/ATR%) 강한 종목 점수 가중 (리더 집중)
+    MOM_ROTATION_ENABLED = os.getenv("OKX_MOM_BONUS_ENABLED", "true").lower() == "true"
+    MOM_ROC_LOOKBACK = int(os.getenv("OKX_MOM_LOOKBACK", "24"))
+    MOM_RISK_ADJ_THRESHOLD = float(os.getenv("OKX_MOM_RA_THRESH", "1.5"))
+    MOM_BONUS = int(os.getenv("OKX_MOM_BONUS", "15"))
+    # ④ BTC 베타 래그: BTC 직전 봉 급등락 시 고베타 알트 동방향 보너스
+    BTC_BETA_LAG_ENABLED = os.getenv("OKX_BTC_BETA_LAG", "true").lower() == "true"
+    BTC_LAG_MOVE_PCT = float(os.getenv("OKX_BTC_MOVE_PCT", "0.8"))   # 단일 봉 ±0.8%
+    BTC_LAG_BONUS = int(os.getenv("OKX_BETA_BONUS", "15"))
+    # ⑤ 펀딩비 정렬: 극단 펀딩에서 유리한 방향 사이즈 확대 / 불리한 방향 축소
+    FUNDING_ADJUST_ENABLED = os.getenv("OKX_FUNDING_ADJUST", "true").lower() == "true"
+    FUNDING_EXTREME_POS = float(os.getenv("OKX_FUNDING_POS", "0.0015"))   # +0.15%
+    FUNDING_EXTREME_NEG = float(os.getenv("OKX_FUNDING_NEG", "-0.0010"))  # -0.10%
     # ── [Fix #2] 일손실 서킷 브레이커 ──
     # 당일 자산이 기준(일 시작 자산) 대비 임계값 이하로 하락하면 신규 진입 차단.
     # 회복(임계값의 절반 이상) 또는 다음 날(UTC) 자동 해제. 상태는 파일로 영속화(재시작 대비).
@@ -278,6 +306,9 @@ class BaseStrategyBrain:
         self._listtime_cache = None       # {sym: ms}
         self._churn_blacklist = {}        # sym -> 제외 만료 epoch초
         self._churn_last_refresh = 0.0
+        # Alpha Stack 상태
+        self._funding_cache = {}          # sym -> (ts, rate) 30분 TTL
+        self._btc_move_15m = 0.0          # 직전 확정 봉 BTC 변동률% (베타 래그용)
         self._cb_state = {}
 
     def _is_trading_hour_allowed(self) -> bool:
@@ -427,6 +458,20 @@ class BaseStrategyBrain:
     def _sector_params(self, symbol: str) -> dict:
         sec = self._symbol_sector(symbol)
         return self.SECTOR_PARAMS.get(sec, {'thr_long': 70, 'size_mult': 1.0})
+
+    async def _get_funding_rate(self, symbol: str):
+        """[Alpha ⑤] 펀딩비 캐시 조회 (30분 TTL — 펀딩은 8h 주기라 충분)."""
+        now = time.time()
+        hit = self._funding_cache.get(symbol)
+        if hit and now - hit[0] < 1800:
+            return hit[1]
+        try:
+            f = await self.exchange.fetch_funding_rate(symbol)
+            rate = float(f.get('fundingRate') or 0)
+            self._funding_cache[symbol] = (now, rate)
+            return rate
+        except Exception:
+            return None
 
     def _get_list_time(self, symbol: str):
         """상장시각(ms) 캐시 조회. exchange.markets 로딩 전이면 None."""
@@ -687,6 +732,15 @@ class BaseStrategyBrain:
             df['stoch_d'] = d
             df['vol_ma'] = df['v'].rolling(20).mean()
             df['ema_target'] = df['c'].ewm(span=self.EMA_PERIOD, adjust=False).mean()
+            # [Alpha] ATR (Chandelier 트레일링·위험조정 모멘텀용)
+            df['atr'] = calc_atr(df, 14)
+            # [Alpha] BB 스퀴즈 감지용 밴드
+            if self.SQUEEZE_SIGNAL_ENABLED:
+                bb_mid = df['c'].rolling(20).mean()
+                bb_std = df['c'].rolling(20).std()
+                df['bb_upper'] = bb_mid + 2.0 * bb_std
+                df['bb_lower'] = bb_mid - 2.0 * bb_std
+                df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / bb_mid.where(bb_mid != 0)
 
             prev, curr = df.iloc[-2], df.iloc[-1]
             t_curr = curr['t']
@@ -756,6 +810,36 @@ class BaseStrategyBrain:
             if is_short_trend_cont: short_score += 20
             if is_short_momentum: short_score += 20
 
+            # [Alpha ③] 모멘텀 로테이션: 위험조정 모멘텀(ROC/ATR%) 강한 리더 종목 가중
+            if self.MOM_ROTATION_ENABLED and len(df) > self.MOM_ROC_LOOKBACK + 1:
+                roc_ref = float(df['c'].iloc[-1 - self.MOM_ROC_LOOKBACK])
+                atr_pct = max(float(curr['atr']) / curr['c'], 1e-9)
+                if roc_ref > 0 and atr_pct > 0:
+                    ra_mom = ((curr['c'] - roc_ref) / roc_ref) / atr_pct
+                    if ra_mom >= self.MOM_RISK_ADJ_THRESHOLD:
+                        long_score += self.MOM_BONUS
+                    elif ra_mom <= -self.MOM_RISK_ADJ_THRESHOLD:
+                        short_score += self.MOM_BONUS
+
+            # [Alpha ②] 스퀴즈 브레이크아웃: BB 폭 압축 해제 + 방향성 돌파
+            if self.SQUEEZE_SIGNAL_ENABLED and 'bb_width' in df.columns and len(df) > 105:
+                w_ref = df['bb_width'].iloc[-100:-3].min()
+                prev_squeeze = float(df['bb_width'].iloc[-4]) <= w_ref * 1.1
+                if prev_squeeze and pd.notna(curr['bb_upper']):
+                    if curr['c'] > curr['bb_upper']:
+                        long_score += self.SQUEEZE_BONUS
+                    elif curr['c'] < curr['bb_lower']:
+                        short_score += self.SQUEEZE_BONUS
+
+            # [Alpha ④] BTC 베타 래그: BTC 직전 봉 급등락 → 고베타 섹터 동방향 가중
+            if self.BTC_BETA_LAG_ENABLED and abs(self._btc_move_15m) >= self.BTC_LAG_MOVE_PCT:
+                _sec_name = self._symbol_sector(symbol)
+                if _sec_name in ('alt', 'meme', 'new_listing'):
+                    if self._btc_move_15m > 0:
+                        long_score += self.BTC_LAG_BONUS
+                    else:
+                        short_score += self.BTC_LAG_BONUS
+
             # [Fix] 비대칭 임계값: 롱 70, 숏 90 (숏은 구조적으로 위험하므로 엄격)
             # [섹터별 임계값] 종목 섹터에 따라 진입 점수 기준 차등 적용
             _sec_p = self._sector_params(symbol)
@@ -783,6 +867,19 @@ class BaseStrategyBrain:
                 st_d_long = curr['st_d_tight'] if is_profit else curr['st_d_loose']
                 close_long_sig = st_d_long == -1 or curr['c'] < st_v_long
                 force_close_long = False
+
+                # [Alpha ①] ATR Chandelier 트레일링: 수익 구간에서 고점 − k×ATR 이탈 시 청산
+                # (철칙 2: 변동성 클수록 ATR이 커져 선이 넓어지는 대신, 가격 이탈 즉시 반응)
+                if self.ATR_TRAILING_ENABLED:
+                    dca['highest_px'] = max(dca.get('highest_px') or avg_price_long, float(curr['h']))
+                    _chand_l = dca['highest_px'] - self.ATR_TRAIL_K * float(curr['atr'])
+                    if dca.get('max_pnl_pct', 0.0) >= self.ATR_TRAIL_ARM_PNL and curr['c'] < _chand_l:
+                        self.logger.info(
+                            f"🎯 [Chandelier] 롱 트레일링 청산: {symbol} "
+                            f"(고점 {dca['highest_px']:.6g} − {self.ATR_TRAIL_K}×ATR, "
+                            f"최고수익 {dca.get('max_pnl_pct',0)*100:.0f}%)"
+                        )
+                        force_close_long = True
 
                 if pnl_pct_long <= self.HARD_STOP_LOSS_PCT:
                     force_close_long = True
@@ -849,6 +946,18 @@ class BaseStrategyBrain:
                 st_d_short = curr['st_d_tight'] if is_profit else curr['st_d_loose']
                 close_short_sig = st_d_short == 1 or curr['c'] > st_v_short
                 force_close_short = False
+
+                # [Alpha ①] ATR Chandelier 트레일링 (숏): 저점 + k×ATR 상향 돌파 시 청산
+                if self.ATR_TRAILING_ENABLED:
+                    dca['lowest_px'] = min(dca.get('lowest_px') or avg_price_short, float(curr['l']))
+                    _chand_s = dca['lowest_px'] + self.ATR_TRAIL_K * float(curr['atr'])
+                    if dca.get('max_pnl_pct', 0.0) >= self.ATR_TRAIL_ARM_PNL and curr['c'] > _chand_s:
+                        self.logger.info(
+                            f"🎯 [Chandelier] 숏 트레일링 청산: {symbol} "
+                            f"(저점 {dca['lowest_px']:.6g} + {self.ATR_TRAIL_K}×ATR, "
+                            f"최고수익 {dca.get('max_pnl_pct',0)*100:.0f}%)"
+                        )
+                        force_close_short = True
 
                 if pnl_pct_short <= self.HARD_STOP_LOSS_PCT:
                     force_close_short = True
@@ -1165,6 +1274,19 @@ class BaseStrategyBrain:
                 target_margin *= sec_size
                 if target_margin < self.MIN_POSITION_MARGIN:
                     return
+            # [Alpha ⑤] 펀딩비 정렬: 극단 캐리에서 유리한 방향 확대 / 불리한 방향 축소
+            if self.FUNDING_ADJUST_ENABLED:
+                fr = await self._get_funding_rate(symbol)
+                if fr is not None and abs(fr) >= min(abs(self.FUNDING_EXTREME_POS), abs(self.FUNDING_EXTREME_NEG)):
+                    if side == SideType.BUY:
+                        _fmult = 1.25 if fr <= self.FUNDING_EXTREME_NEG else (0.6 if fr >= self.FUNDING_EXTREME_POS else 1.0)
+                    else:
+                        _fmult = 1.25 if fr >= self.FUNDING_EXTREME_POS else (0.6 if fr <= self.FUNDING_EXTREME_NEG else 1.0)
+                    if _fmult != 1.0:
+                        self.logger.info(f"💸 [Funding] {symbol} 펀딩비 {fr*100:+.3f}% → 사이즈 ×{_fmult}")
+                        target_margin *= _fmult
+                        if target_margin < self.MIN_POSITION_MARGIN:
+                            return
             if target_margin <= 0:
                 if not self._margin_reject_logged:
                     self.logger.warning(
@@ -1441,6 +1563,16 @@ class BaseStrategyBrain:
                 await self._update_circuit_breaker()
                 # [왕복필터] 저승률 종목 신규 진입 제외 갱신 (내부 10분 캐시)
                 self._refresh_churn_blacklist()
+                # [Alpha ④] BTC 직전 확정 봉 변동률 추적 (베타 래그 보너스용)
+                if self.BTC_BETA_LAG_ENABLED:
+                    try:
+                        _btc_bars = await self.exchange.fetch_ohlcv('BTC/USDT:USDT', self.TIMEFRAME, limit=3)
+                        if _btc_bars and len(_btc_bars) >= 2:
+                            _b = _btc_bars[-2]  # 직전 확정 봉
+                            if _b['o']:
+                                self._btc_move_15m = (_b['c'] - _b['o']) / _b['o'] * 100
+                    except Exception:
+                        pass
 
                 for symbol in symbols:
                     await self.check_auto_logic(symbol)
