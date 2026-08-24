@@ -198,9 +198,8 @@ class BaseStrategyBrain:
     # 청산/스탑/익절은 계속 동작 (기존 포지션 관리 유지).
     CHOP_FILTER_ENABLED = os.getenv("OKX_CHOP_FILTER", "true").lower() == "true"
     CHOP_ADX_THRESHOLD = float(os.getenv("OKX_CHOP_ADX", "20"))
-    # 단계적 배포: 이 구간(소프트 경계~임계값)에서는 축소 사이즈로 진입 허용
-    CHOP_SOFT_BOUNDARY = float(os.getenv("OKX_CHOP_ADX_SOFT", "22"))
-    CHOP_SOFT_SIZE = float(os.getenv("OKX_CHOP_SOFT_SIZE", "0.7"))
+    # 연속 배포: 하드 차단 없음, 사이즈만 호흡 (철칙: 거래가 없으면 기회도 없다)
+    CHOP_FLOOR = float(os.getenv("OKX_CHOP_FLOOR", "0.25"))  # 배율 바닥 (절대 정지 안 함)
     # ── 섹터별 파라미터 (SECTOR_PARAMS) ──
     # 실적 데이터(08-16~) 기반: 밈 승률 66% 최고 / 메이저 42%(ETH류 체인 과다) /
     # 신규상장 순손실(-292, CAP -1.5k) → 섹터별 임계값·사이즈 차등화.
@@ -1248,15 +1247,12 @@ class BaseStrategyBrain:
 
     async def _update_chop_filter(self):
         """
-        단계적 배포 (Graduated Deployment):
-          ADX ≥ 임계값(25)      → 풀 배포 (100%)
-          소프트 경계(22) ≤ ADX < 25 → 축소 배포 (70% 사이즈 진입 허용)
-          ADX < 22              → 전면 차단
-        백테스트(E 변형): 전면차단 대비 -300 USDT 희생으로 그레이존 참여 확보.
-        로깅은 상태 전환 시에만. 실패 시 기존 상태 유지.
+        [항상 가동 + 사이즈 호흡] 철칙: 거래가 없으면 기회도 없다.
+        ADX에 비례한 연속 배포 곡선 — 하드 차단 폐지.
+          deploy_scale = clamp(ADX / 25, 0.25, 1.0)
+        개별 트레이드 리스크는 포지션손실한도(-15%)가 통제 → 진입은 열어두고 청산이 지킨다.
         """
         if not self.CHOP_FILTER_ENABLED:
-            self._chop_block = False
             self._deploy_scale = 1.0
             return
         try:
@@ -1265,38 +1261,29 @@ class BaseStrategyBrain:
                 return
             df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             adx_series = calc_adx(df, 14)
-            adx_now = float(adx_series.iloc[-2])  # 직전 확정 캔들 기준 (진행 중 캔들 노이즈 제외)
+            adx_now = float(adx_series.iloc[-2])  # 직전 확정 캔들 기준
 
-            if adx_now >= self.CHOP_ADX_THRESHOLD:
-                state, scale = "full", 1.0
-            elif adx_now >= self.CHOP_SOFT_BOUNDARY:
-                state, scale = "soft", self.CHOP_SOFT_SIZE
-            else:
-                state, scale = "blocked", 0.0
+            raw_scale = adx_now / max(self.CHOP_ADX_THRESHOLD, 1.0)
+            scale = max(self.CHOP_FLOOR, min(1.0, raw_scale))
 
             prev_state = getattr(self, '_deploy_state', None)
-            if state != prev_state:
-                if state == "full":
-                    self.logger.info(
-                        f"✅ [Chop Filter] 추세 복귀 (BTC 1h ADX {adx_now:.1f} ≥ {self.CHOP_ADX_THRESHOLD:.0f}) "
-                        f"— 풀 배포"
-                    )
-                elif state == "soft":
-                    self.logger.info(
-                        f"🟡 [Chop Filter] 약추세 구간 (BTC 1h ADX {adx_now:.1f}, "
-                        f"{self.CHOP_SOFT_BOUNDARY:.0f}~{self.CHOP_ADX_THRESHOLD:.0f}) — "
-                        f"사이즈 {self.CHOP_SOFT_SIZE*100:.0f}% 배포"
-                    )
+            # 로그 스팸 방지: 배율 밴드(0.25/0.50/0.75/1.00) 전환 시에만
+            band_now = round(scale * 4) / 4
+            band_prev = getattr(self, '_deploy_band', None)
+            if band_now != band_prev or prev_state is None:
+                pct = f"{band_now*100:.0f}%"
+                if band_now >= 1.0:
+                    self.logger.info(f"✅ [배포 {pct}] 강한 추세 (ADX {adx_now:.1f} ≥ {self.CHOP_ADX_THRESHOLD:.0f}) — 풀 사이즈")
+                elif band_now <= self.CHOP_FLOOR + 0.01:
+                    self.logger.info(f"🟡 [배포 {pct}] 극저변동 (ADX {adx_now:.1f}) — 최소 사이즈로 계속 거래")
                 else:
-                    self.logger.warning(
-                        f"🛑 [Chop Filter] 횡보장 감지 (BTC 1h ADX {adx_now:.1f} < {self.CHOP_SOFT_BOUNDARY:.0f}) "
-                        f"— 신규 진입/DCA/불타기/재진입 차단 (청산은 계속)"
-                    )
-                self._deploy_state = state
-            self._chop_block = (state == "blocked")
+                    self.logger.info(f"🟡 [배포 {pct}] 추세 강도 보통 (ADX {adx_now:.1f}) — 사이즈 비례 운용")
+                self._deploy_band = band_now
+            self._deploy_state = "always_on"
+            self._chop_block = False  # 하드 차단 폐지 — 항상 거래
             self._deploy_scale = scale
         except Exception as e:
-            self.logger.warning(f"⚠️ [{self.STRATEGY_NAME}] 촙 필터 체크 실패(기존 상태 유지): {e}")
+            self.logger.warning(f"⚠️ [{self.STRATEGY_NAME}] 배포 스케일 갱신 실패(기존 유지): {e}")
 
     # ── [Fix #2] 서킷 브레이커 상태 영속화 ──
     def _cb_state_path(self) -> str:
