@@ -206,7 +206,12 @@ class BaseStrategyBrain:
     CHOP_FILTER_ENABLED = os.getenv("OKX_CHOP_FILTER", "true").lower() == "true"
     CHOP_ADX_THRESHOLD = float(os.getenv("OKX_CHOP_ADX", "20"))
     # 연속 배포: 하드 차단 없음, 사이즈만 호흡 (철칙: 거래가 없으면 기회도 없다)
-    CHOP_FLOOR = float(os.getenv("OKX_CHOP_FLOOR", "0.25"))  # 배율 바닥 (절대 정지 안 함)
+    CHOP_FLOOR = float(os.getenv("OKX_CHOP_FLOOR", "0.15"))       # 배율 바닥
+    CHOP_FLOOR_ADX = float(os.getenv("OKX_CHOP_FLOOR_ADX", "8"))  # 이 아래선 바닥 배율 고정
+    # 신호 보너스 게이트: 심충보(저ADX)에서는 순행 신호(스퀴즈 등)가 오히려 함정 → 발동 하한
+    SQUEEZE_MIN_ADX = float(os.getenv("OKX_SQUEEZE_MIN_ADX", "18"))
+    MOM_MIN_ADX = float(os.getenv("OKX_MOM_MIN_ADX", "15"))
+    BETA_MIN_ADX = float(os.getenv("OKX_BETA_MIN_ADX", "20"))
     # ── 섹터별 파라미터 (SECTOR_PARAMS) ──
     # 실적 데이터(08-16~) 기반: 밈 승률 66% 최고 / 메이저 42%(ETH류 체인 과다) /
     # 신규상장 순손실(-292, CAP -1.5k) → 섹터별 임계값·사이즈 차등화.
@@ -810,8 +815,9 @@ class BaseStrategyBrain:
             if is_short_trend_cont: short_score += 20
             if is_short_momentum: short_score += 20
 
-            # [Alpha ③] 모멘텀 로테이션: 위험조정 모멘텀(ROC/ATR%) 강한 리더 종목 가중
-            if self.MOM_ROTATION_ENABLED and len(df) > self.MOM_ROC_LOOKBACK + 1:
+            # [Alpha ③] 모멘텀 로테이션: 위험조정 모멘텀 강한 리더 종목 가중 (ADX≥15에서만)
+            _adx_now = getattr(self, '_current_adx', 99.0)
+            if self.MOM_ROTATION_ENABLED and _adx_now >= self.MOM_MIN_ADX and len(df) > self.MOM_ROC_LOOKBACK + 1:
                 roc_ref = float(df['c'].iloc[-1 - self.MOM_ROC_LOOKBACK])
                 atr_pct = max(float(curr['atr']) / curr['c'], 1e-9)
                 if roc_ref > 0 and atr_pct > 0:
@@ -821,8 +827,8 @@ class BaseStrategyBrain:
                     elif ra_mom <= -self.MOM_RISK_ADJ_THRESHOLD:
                         short_score += self.MOM_BONUS
 
-            # [Alpha ②] 스퀴즈 브레이크아웃: BB 폭 압축 해제 + 방향성 돌파
-            if self.SQUEEZE_SIGNAL_ENABLED and 'bb_width' in df.columns and len(df) > 105:
+            # [Alpha ②] 스퀴즈 브레이크아웃: BB 폭 압축 해제 + 방향성 돌파 (ADX≥18 — 심충보에선 함정 신호)
+            if self.SQUEEZE_SIGNAL_ENABLED and _adx_now >= self.SQUEEZE_MIN_ADX and 'bb_width' in df.columns and len(df) > 105:
                 w_ref = df['bb_width'].iloc[-100:-3].min()
                 prev_squeeze = float(df['bb_width'].iloc[-4]) <= w_ref * 1.1
                 if prev_squeeze and pd.notna(curr['bb_upper']):
@@ -831,8 +837,8 @@ class BaseStrategyBrain:
                     elif curr['c'] < curr['bb_lower']:
                         short_score += self.SQUEEZE_BONUS
 
-            # [Alpha ④] BTC 베타 래그: BTC 직전 봉 급등락 → 고베타 섹터 동방향 가중
-            if self.BTC_BETA_LAG_ENABLED and abs(self._btc_move_15m) >= self.BTC_LAG_MOVE_PCT:
+            # [Alpha ④] BTC 베타 래그: BTC 급등락 → 고베타 섹터 동방향 가중 (ADX≥20 추세 맥락 필요)
+            if self.BTC_BETA_LAG_ENABLED and _adx_now >= self.BETA_MIN_ADX and abs(self._btc_move_15m) >= self.BTC_LAG_MOVE_PCT:
                 _sec_name = self._symbol_sector(symbol)
                 if _sec_name in ('alt', 'meme', 'new_listing'):
                     if self._btc_move_15m > 0:
@@ -1384,8 +1390,11 @@ class BaseStrategyBrain:
             df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             adx_series = calc_adx(df, 14)
             adx_now = float(adx_series.iloc[-2])  # 직전 확정 캔들 기준
+            self._current_adx = adx_now  # 신호 보너스 게이트용
 
-            raw_scale = adx_now / max(self.CHOP_ADX_THRESHOLD, 1.0)
+            # [8/24 교훈] 완만한 곡선은 저변동 심충보에서 과다 배포 → 급락 시 연쇄 손절.
+            # FLOOR_ADX 아래에서는 바닥(15%)까지만 급감.
+            raw_scale = (adx_now - self.CHOP_FLOOR_ADX) / max(self.CHOP_ADX_THRESHOLD - self.CHOP_FLOOR_ADX, 1.0)
             scale = max(self.CHOP_FLOOR, min(1.0, raw_scale))
 
             prev_state = getattr(self, '_deploy_state', None)
