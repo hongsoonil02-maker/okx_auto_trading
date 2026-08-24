@@ -554,6 +554,8 @@ async def main():
 
 
 if __name__ == "__main__":
+    # [Fix] 기본 포트를 8013으로 고정 — 인자 없이 실행해도 정상 포트 사용
+    # (기존 8003 기본값이 고스트 프로세스 반복 생성의 근본 원인이었음)
     try:
         acquire_pid_lock()
         _rotate_trades_file()

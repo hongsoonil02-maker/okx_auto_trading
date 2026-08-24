@@ -850,7 +850,7 @@ class BaseStrategyBrain:
             # [섹터별 임계값] 종목 섹터에 따라 진입 점수 기준 차등 적용
             _sec_p = self._sector_params(symbol)
             ENTRY_THRESHOLD_LONG = _sec_p.get('thr_long', 70)
-            ENTRY_THRESHOLD_SHORT = ENTRY_THRESHOLD_LONG + 20  # 숏 비대칭 유지 (기존 70/90)
+            ENTRY_THRESHOLD_SHORT = ENTRY_THRESHOLD_LONG + 30  # 숏 비대칭 강화 (기존 +20→+30): 숏 PF 0.95 적자 대응
             is_long_sig = (long_score >= ENTRY_THRESHOLD_LONG) and vol_cond and getattr(self, '_long_regime_ok', True)
             is_short_sig = (short_score >= ENTRY_THRESHOLD_SHORT) and vol_cond and getattr(self, '_short_regime_ok', True)
             # [수익성] 베어 숏 게이팅: 불장(BTC>=EMA200)에서 숏 차단 → 숏 손실 원천 방지

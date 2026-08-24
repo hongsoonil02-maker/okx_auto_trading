@@ -20,7 +20,8 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
     PYRAMID_RATIO = 0.50         # 추세 승자 적극 불타기
     
     STOCK_KEYWORDS = []
-    BLACKLIST = ['KR200', 'SKHYNIX', 'MU', 'SHAZ', 'ISRG', 'ROBO', 'RAM', 'DRAM', 'GME']
+    BLACKLIST = ['KR200', 'SKHYNIX', 'MU', 'SHAZ', 'ISRG', 'ROBO', 'RAM', 'DRAM', 'GME',
+                 'GPS', 'SNXX', 'POL']  # GPS(-64.7%), SNXX(-38.3%), POL(-21.6%) 반복 손실 차단
     # 주식/상품 토큰 전부 제외 (주식 전용 봇과 중복 거래 방지)
     MAJORS_AND_STOCKS = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'LINK', 'DOT', 'BNB', 'TRX',
                          'TSLA', 'NVDA', 'AAPL', 'AMZN', 'MSFT', 'META', 'GOOG', 'GOOGL', 'COIN',
