@@ -16,6 +16,7 @@ from utils_telegram import send_telegram_alert
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "sizing_trade_log.csv")
+TRADES_JSONL = os.path.join(BASE_DIR, "state", "trades.jsonl")  # [Fix] 실거래 데이터 원본 파일
 CONFIG_FILE = os.path.join(BASE_DIR, "auto_tune_config.json")
 REPORT_DIR = os.path.join(BASE_DIR, "reports")
 KST = ZoneInfo("Asia/Seoul")
@@ -70,36 +71,81 @@ def _apply_regime_tuning(okx_p: dict, volatility_pct: float):
 
     return okx_p, regime
 
-def analyze_trades(lookback_days: int = 30):
-    if not os.path.exists(LOG_FILE):
-        return {
-            "bad_symbols": {"OKX": []},
-            "summary": {},
-            "lookback_days": lookback_days,
-            "trade_count": 0,
-        }
+def _load_trades_jsonl(lookback_days: int):
+    """[Fix] state/trades.jsonl 실거래 데이터를 읽어서 소샄(CLOSE 포지션)만 반환."""
+    if not os.path.exists(TRADES_JSONL):
+        return []
+    cutoff_ts = (datetime.now() - timedelta(days=lookback_days)).timestamp()
+    close_map = {}  # symbol -> {'cost': usdt, 'count': n, 'wins': 0, 'losses': 0}
+    buy_prices = {}  # order_id or symbol -> entry_price (last known)
+    sym_last_buy = {}  # symbol -> last buy price
+    rows = []
+    try:
+        with open(TRADES_JSONL, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    t = json.loads(line)
+                except Exception:
+                    continue
+                ts = t.get('ts', 0)
+                if ts > 1e10:
+                    ts = ts / 1000
+                if ts < cutoff_ts:
+                    continue
+                sym = t.get('symbol', '')
+                side = (t.get('side') or '').upper()
+                price = t.get('price') or 0
+                if 'BUY' in side and price:
+                    sym_last_buy[sym] = float(price)
+                elif ('CLOSE' in side or 'SELL' in side) and price:
+                    entry = sym_last_buy.get(sym, 0)
+                    price = float(price)
+                    pnl_pct = ((price - entry) / entry * 100) if entry and price else 0.0
+                    rows.append({
+                        'symbol': sym,
+                        'market': 'OKX',
+                        'side': side,
+                        'pnl': pnl_pct,
+                        'ts': ts,
+                    })
+    except Exception as e:
+        print(f"[daily_analyzer] trades.jsonl 로드 오류: {e}")
+    return rows
 
+
+def analyze_trades(lookback_days: int = 30):
     trades = []
-    cutoff = datetime.now(KST) - timedelta(days=lookback_days)
-    with open(LOG_FILE, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            try:
-                ts = datetime.fromisoformat(row["timestamp"])
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=KST)
-                if ts.astimezone(KST) < cutoff:
+
+    # 1) sizing_trade_log.csv (원래 소스)
+    if os.path.exists(LOG_FILE):
+        cutoff = datetime.now(KST) - timedelta(days=lookback_days)
+        with open(LOG_FILE, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    ts = datetime.fromisoformat(row["timestamp"])
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=KST)
+                    if ts.astimezone(KST) < cutoff:
+                        continue
+                    row["ts"] = ts
+                    row["pnl"] = float(row["pnl_pct"])
+                    side = (row.get("side") or "").upper()
+                    if side in {"BUY", "SELL"} and row["pnl"] == 0:
+                        continue
+                    if row.get("market", "").upper() == "UPBIT":
+                        continue
+                    trades.append(row)
+                except Exception:
                     continue
-                row["ts"] = ts
-                row["pnl"] = float(row["pnl_pct"])
-                side = (row.get("side") or "").upper()
-                if side in {"BUY", "SELL"} and row["pnl"] == 0:
-                    continue
-                if row.get("market", "").upper() == "UPBIT":
-                    continue
-                trades.append(row)
-            except Exception:
-                continue
+
+    # 2) [Fix] state/trades.jsonl (실거래 원본)
+    jsonl_trades = _load_trades_jsonl(lookback_days)
+    trades.extend(jsonl_trades)
+    print(f"[daily_analyzer] CSV={len(trades)-len(jsonl_trades)}건, JSONL={len(jsonl_trades)}건 합산={len(trades)}건")
 
     if not trades:
         return {

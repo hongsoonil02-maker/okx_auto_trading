@@ -8,6 +8,7 @@ okx_major_strategy.py — OKX Major Crypto Auto Trading Engine
 """
 import asyncio
 import sys
+import os
 from strategy_common import BaseStrategyBrain
 
 
@@ -15,6 +16,7 @@ class OKXMajorStrategyBrain(BaseStrategyBrain):
     STRATEGY_NAME = "OKX_Major_Strategy"
     LOG_FILE = "okx_major_strategy.log"
     LOGGER_NAME = "OKX_Major_Strategy"
+    STRATEGY_LEVERAGE = int(os.getenv("OKX_MAJOR_LEVERAGE", "10"))
     
     # [포트폴리오 & 리스크 튜닝]
     PORTFOLIO_WEIGHT = 0.5       # 자본 분산 배분 (보수적)
