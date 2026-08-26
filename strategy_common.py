@@ -186,6 +186,10 @@ class BaseStrategyBrain:
     SCALE_OUT_STEPS = 3
     # [Fix] DCA 추가 진입 최소 간격 (캔들 수) — 매 캔들 물타기는 수수료 출혈
     DCA_MIN_CANDLES = 4
+    # [검증] 물타기/피라미딩 백테스트(6~8월): 현행 조합 최악(-3.7K, MDD 83.7%) vs 둘다없음 최고(+18.1K, 48%)
+    # DCA는 평균손실 -199→-274 확대, 피라미딩+20%가드는 승자 절단 → 기본 비활성 (env로 재활성 가능)
+    SCALE_OUT_STEPS = int(os.getenv("OKX_SCALE_OUT_STEPS", "3"))
+    PYRAMIDING_ENABLED = os.getenv("OKX_PYRAMIDING", "false").lower() == "true"
     # ── 켈리 공식 포지션 사이징 ──
     # portion = Half-Kelly × f* / 평균손실률, f* = p - (1-p)/b
     KELLY_FRACTION = 0.50          # Half-Kelly (적극적 자본배치)
@@ -933,13 +937,13 @@ class BaseStrategyBrain:
                 elif pnl_pct_long >= 0.50 and dca['exit_count'] == 2:
                     take_profit_long_sig = True
                 # ── [Winner Pyramiding] 추세 승자 롱 불타기 ──
-                if pnl_pct_long >= 0.40 and dca.get('pyramid_count', 0) == 0 and self._dca_ready(dca, t_curr) and not entries_blocked:
+                if self.PYRAMIDING_ENABLED and pnl_pct_long >= 0.40 and dca.get('pyramid_count', 0) == 0 and self._dca_ready(dca, t_curr) and not entries_blocked:
                     if is_ema_trend_up and curr['st_d_loose'] == 1:  # [Fix] Series 비교 → 스칼라 비교
                         self.logger.info(f"🔥 [Winner Pyramiding 1차 불타기] 롱 {symbol} (PnL: +{pnl_pct_long*100:.1f}%)")
                         await self.execute_auto_entry(symbol, SideType.BUY, entry_type="pyramid")
                         dca['pyramid_count'] = 1
                         dca['last_entry_t'] = t_curr
-                elif pnl_pct_long >= 1.00 and dca.get('pyramid_count', 0) == 1 and self._dca_ready(dca, t_curr) and not entries_blocked:
+                elif self.PYRAMIDING_ENABLED and pnl_pct_long >= 1.00 and dca.get('pyramid_count', 0) == 1 and self._dca_ready(dca, t_curr) and not entries_blocked:
                     if is_ema_trend_up and is_long_momentum:
                         self.logger.info(f"🚀 [Winner Pyramiding 2차 불타기] 롱 {symbol} (PnL: +{pnl_pct_long*100:.1f}%)")
                         await self.execute_auto_entry(symbol, SideType.BUY, entry_type="pyramid")
@@ -1009,13 +1013,13 @@ class BaseStrategyBrain:
                 elif pnl_pct_short >= 0.50 and dca['exit_count'] == 2:
                     take_profit_short_sig = True
                 # ── [Winner Pyramiding] 추세 승자 숏 불타기 ──
-                if pnl_pct_short >= 0.40 and dca.get('pyramid_count', 0) == 0 and self._dca_ready(dca, t_curr) and not entries_blocked:
+                if self.PYRAMIDING_ENABLED and pnl_pct_short >= 0.40 and dca.get('pyramid_count', 0) == 0 and self._dca_ready(dca, t_curr) and not entries_blocked:
                     if is_ema_trend_down and curr['st_d_loose'] == -1:  # [Fix] Series 비교 → 스칼라 비교
                         self.logger.info(f"📉 [Winner Pyramiding 숏 1차 불타기] {symbol} (PnL: +{pnl_pct_short*100:.1f}%)")
                         await self.execute_auto_entry(symbol, SideType.SELL, entry_type="pyramid")
                         dca['pyramid_count'] = 1
                         dca['last_entry_t'] = t_curr
-                elif pnl_pct_short >= 1.00 and dca.get('pyramid_count', 0) == 1 and self._dca_ready(dca, t_curr) and not entries_blocked:
+                elif self.PYRAMIDING_ENABLED and pnl_pct_short >= 1.00 and dca.get('pyramid_count', 0) == 1 and self._dca_ready(dca, t_curr) and not entries_blocked:
                     if is_ema_trend_down and is_short_momentum:
                         self.logger.info(f"🚀 [Winner Pyramiding 숏 2차 불타기] {symbol} (PnL: +{pnl_pct_short*100:.1f}%)")
                         await self.execute_auto_entry(symbol, SideType.SELL, entry_type="pyramid")
@@ -1047,7 +1051,7 @@ class BaseStrategyBrain:
                         self.logger.info(f"🔄 [FLIP] 롱 청산 → 숏 반대진입: {symbol} (최고수익: {dca['max_pnl_pct']*100:.0f}%)")
                         await self.execute_auto_entry(symbol, SideType.SELL, entry_type="flip")
                         flipped = True
-                    dca['exit_count'] = self.MAX_DCA_ENTRIES
+                    dca['exit_count'] = self.SCALE_OUT_STEPS
                     dca['entry_count'] = 0
                     dca['pyramid_count'] = 0
                     dca['last_exit_t'] = t_curr
@@ -1064,11 +1068,11 @@ class BaseStrategyBrain:
                             'last_entry_t': t_curr, 'last_close_t': 0, 'side': 'short',
                         })
                 elif close_long_sig or take_profit_long_sig:
-                    if dca['exit_count'] < self.MAX_DCA_ENTRIES and dca.get('last_exit_t') != t_curr:
+                    if dca['exit_count'] < self.SCALE_OUT_STEPS and dca.get('last_exit_t') != t_curr:
                         qty = self.auto_active_pos[(symbol, 'long')]['size']
                         if not self.SCALE_OUT_EXITS:
                             sell_qty = qty
-                            dca['exit_count'] = self.MAX_DCA_ENTRIES - 1
+                            dca['exit_count'] = self.SCALE_OUT_STEPS - 1
                         else:
                             # [Fix] 3단계 분할 (1/3 → 1/2 → 전량). 기존 1/8씩은 수익 실현이 너무 느림
                             sell_qty = qty / max(1, (self.SCALE_OUT_STEPS - dca['exit_count']))
@@ -1083,13 +1087,13 @@ class BaseStrategyBrain:
                             sell_qty = float(self.exchange.amount_to_precision(symbol, sell_qty))
                         if sell_qty >= 0:
                             if take_profit_long_sig:
-                                self.logger.info(f"💎 [Take Profit] 롱 목표가 달성 분할 익절 ({dca['exit_count']+1}/{self.MAX_DCA_ENTRIES}): {symbol} (수량: {sell_qty})")
+                                self.logger.info(f"💎 [Take Profit] 롱 목표가 달성 분할 익절 ({dca['exit_count']+1}/{self.SCALE_OUT_STEPS}): {symbol} (수량: {sell_qty})")
                             else:
-                                self.logger.info(f"💨 [{self.STRATEGY_NAME} DCA] 롱 분할 청산 ({dca['exit_count']+1}/{self.MAX_DCA_ENTRIES}): {symbol} (수량: {sell_qty if sell_qty > 0 else 'ALL'})")
+                                self.logger.info(f"💨 [{self.STRATEGY_NAME} DCA] 롱 분할 청산 ({dca['exit_count']+1}/{self.SCALE_OUT_STEPS}): {symbol} (수량: {sell_qty if sell_qty > 0 else 'ALL'})")
                             await self.send_webhook(SideType.CLOSE_LONG, symbol, sell_qty)
                         dca['exit_count'] += 1
                         dca['last_exit_t'] = t_curr
-                        if dca['exit_count'] >= self.MAX_DCA_ENTRIES:
+                        if dca['exit_count'] >= self.SCALE_OUT_STEPS:
                             dca['entry_count'] = 0
                             dca['exit_count'] = 0
                             dca['max_pnl_pct'] = 0.0
@@ -1113,7 +1117,7 @@ class BaseStrategyBrain:
                         self.logger.info(f"🔄 [FLIP] 숏 청산 → 롱 반대진입: {symbol} (최고수익: {dca['max_pnl_pct']*100:.0f}%)")
                         await self.execute_auto_entry(symbol, SideType.BUY, entry_type="flip")
                         flipped = True
-                    dca['exit_count'] = self.MAX_DCA_ENTRIES
+                    dca['exit_count'] = self.SCALE_OUT_STEPS
                     dca['entry_count'] = 0
                     dca['pyramid_count'] = 0
                     dca['last_exit_t'] = t_curr
@@ -1130,11 +1134,11 @@ class BaseStrategyBrain:
                             'last_entry_t': t_curr, 'last_close_t': 0, 'side': 'long',
                         })
                 elif close_short_sig or take_profit_short_sig:
-                    if dca['exit_count'] < self.MAX_DCA_ENTRIES and dca.get('last_exit_t') != t_curr:
+                    if dca['exit_count'] < self.SCALE_OUT_STEPS and dca.get('last_exit_t') != t_curr:
                         qty = self.auto_active_pos[(symbol, 'short')]['size']
                         if not self.SCALE_OUT_EXITS:
                             sell_qty = qty
-                            dca['exit_count'] = self.MAX_DCA_ENTRIES - 1
+                            dca['exit_count'] = self.SCALE_OUT_STEPS - 1
                         else:
                             # [Fix] 3단계 분할 (1/3 → 1/2 → 전량). 기존 1/8씩은 수익 실현이 너무 느림
                             sell_qty = qty / max(1, (self.SCALE_OUT_STEPS - dca['exit_count']))
@@ -1149,13 +1153,13 @@ class BaseStrategyBrain:
                             sell_qty = float(self.exchange.amount_to_precision(symbol, sell_qty))
                         if sell_qty >= 0:
                             if take_profit_short_sig:
-                                self.logger.info(f"💎 [Take Profit] 숏 목표가 달성 분할 익절 ({dca['exit_count']+1}/{self.MAX_DCA_ENTRIES}): {symbol} (수량: {sell_qty})")
+                                self.logger.info(f"💎 [Take Profit] 숏 목표가 달성 분할 익절 ({dca['exit_count']+1}/{self.SCALE_OUT_STEPS}): {symbol} (수량: {sell_qty})")
                             else:
-                                self.logger.info(f"💨 [{self.STRATEGY_NAME} DCA] 숏 분할 청산 ({dca['exit_count']+1}/{self.MAX_DCA_ENTRIES}): {symbol} (수량: {sell_qty if sell_qty > 0 else 'ALL'})")
+                                self.logger.info(f"💨 [{self.STRATEGY_NAME} DCA] 숏 분할 청산 ({dca['exit_count']+1}/{self.SCALE_OUT_STEPS}): {symbol} (수량: {sell_qty if sell_qty > 0 else 'ALL'})")
                             await self.send_webhook(SideType.CLOSE_SHORT, symbol, sell_qty)
                         dca['exit_count'] += 1
                         dca['last_exit_t'] = t_curr
-                        if dca['exit_count'] >= self.MAX_DCA_ENTRIES:
+                        if dca['exit_count'] >= self.SCALE_OUT_STEPS:
                             dca['entry_count'] = 0
                             dca['exit_count'] = 0
                             dca['max_pnl_pct'] = 0.0
