@@ -2,7 +2,16 @@
   "blocked_hours_kst": [],
   "blocked_hours_kst_okx": [],
   "blacklisted_symbols": {
-    "OKX": []
+    "OKX": [
+      "APR/USDT:USDT",
+      "FARTCOIN/USDT:USDT",
+      "GRVT/USDT:USDT",
+      "PEOPLE/USDT:USDT",
+      "SKDD/USDT:USDT",
+      "STX/USDT:USDT",
+      "UB/USDT:USDT",
+      "XPL/USDT:USDT"
+    ]
   },
   "okx_params": {
     "TRAILING_PCT": 0.02,

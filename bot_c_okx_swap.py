@@ -488,9 +488,14 @@ async def handle_close_all(request):
                 continue
 
             close_side = "short" if pos_side == "long" else "long"
-            ccxt_symbol = symbol.replace("-SWAP", "").replace("-", "/", 1)
-            if ":" not in ccxt_symbol:
-                ccxt_symbol = ccxt_symbol + ":USDT"
+            # [Fix] /status 응답의 symbol은 이미 ccxt 포맷(BTC/USDT:USDT).
+            # 중복 변환하면 BTC//USDT:USDT 같은 깨진 심볼이 생성됨.
+            if ":" in symbol:
+                ccxt_symbol = symbol  # 이미 ccxt 포맷
+            else:
+                ccxt_symbol = symbol.replace("-SWAP", "").replace("-", "/", 1)
+                if ":" not in ccxt_symbol:
+                    ccxt_symbol = ccxt_symbol + ":USDT"
 
             try:
                 await bot.exchange.cancel_all_orders(ccxt_symbol)

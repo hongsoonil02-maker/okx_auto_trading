@@ -593,9 +593,14 @@ class MasterBotOrchestrator:
                 # 24시간 경과 여부 (86400 * 1000 ms)
                 held_ms = now_ms - float(ts)
                 if held_ms > 129600000:  # 36시간 (기존 24시간에서 완화: 수익 거래 평균 보유 28h)
-                    pnl_pct = abs(float(pnl)) / float(margin)
+                    raw_pnl = float(pnl)
+                    # [Fix] abs() 제거: 수익 포지션은 스윕 대상에서 제외.
+                    # 손실 또는 극소 수익(마진 대비 3% 미만) 정체 포지션만 강제 청산.
+                    if raw_pnl > float(margin) * 0.03:
+                        continue  # 충분한 수익 중 → 스윕 제외
+                    pnl_pct = raw_pnl / float(margin)
                     # 실제 변동 0.5% (레버리지 10x 적용된 pnl_pct가 0.05 미만)
-                    if pnl_pct < 0.03:  # 변동률 3% 미만만 정체로 간주 (기존 5%→3% 엄격화)
+                    if pnl_pct > -0.03:  # 손실이 마진 대비 -3% 초과 (즉 -3%~+3%) 구간만 정체로 간주
                         logger.warning(f"🧹 [Sweeper] 24시간 정체 포지션 발견: {sym} (PnL: {float(pnl):.2f}). 강제 청산 시도!")
                         # Webhook 생성 및 발송
                         close_side = "CLOSE_LONG" if side == "long" else "CLOSE_SHORT"

@@ -72,13 +72,14 @@ def _apply_regime_tuning(okx_p: dict, volatility_pct: float):
     return okx_p, regime
 
 def _load_trades_jsonl(lookback_days: int):
-    """[Fix] state/trades.jsonl 실거래 데이터를 읽어서 소샄(CLOSE 포지션)만 반환."""
+    """[Fix] state/trades.jsonl 실거래 데이터를 읽어서 청산(CLOSE 포지션)만 반환.
+    [Fix #2] DCA 물타기 평균가: 마지막 매수가 대신 가중평균진입가(WAAP) 추적.
+    """
     if not os.path.exists(TRADES_JSONL):
         return []
     cutoff_ts = (datetime.now() - timedelta(days=lookback_days)).timestamp()
-    close_map = {}  # symbol -> {'cost': usdt, 'count': n, 'wins': 0, 'losses': 0}
-    buy_prices = {}  # order_id or symbol -> entry_price (last known)
-    sym_last_buy = {}  # symbol -> last buy price
+    # sym -> {'qty': float, 'total_cost': float}  가중평균 진입가 추적용
+    sym_pos = {}
     rows = []
     try:
         with open(TRADES_JSONL, encoding="utf-8") as f:
@@ -98,12 +99,35 @@ def _load_trades_jsonl(lookback_days: int):
                 sym = t.get('symbol', '')
                 side = (t.get('side') or '').upper()
                 price = t.get('price') or 0
-                if 'BUY' in side and price:
-                    sym_last_buy[sym] = float(price)
-                elif ('CLOSE' in side or 'SELL' in side) and price:
-                    entry = sym_last_buy.get(sym, 0)
-                    price = float(price)
-                    pnl_pct = ((price - entry) / entry * 100) if entry and price else 0.0
+                amount = float(t.get('amount') or 0)
+                if not price:
+                    continue
+                price = float(price)
+
+                if 'BUY' in side:
+                    # [Fix] DCA 가중평균: 기존 qty × 기존 avg + 신규 qty × 신규 px
+                    pos = sym_pos.get(sym, {'qty': 0.0, 'total_cost': 0.0})
+                    new_qty = pos['qty'] + amount
+                    new_cost = pos['total_cost'] + price * amount
+                    sym_pos[sym] = {'qty': new_qty, 'total_cost': new_cost}
+
+                elif 'CLOSE' in side or 'SELL' in side:
+                    pos = sym_pos.get(sym)
+                    if pos and pos['qty'] > 0 and pos['total_cost'] > 0:
+                        avg_entry = pos['total_cost'] / pos['qty']
+                        pnl_pct = ((price - avg_entry) / avg_entry * 100) if avg_entry else 0.0
+                        # 청산 수량 차감 (부분 청산 지원)
+                        close_qty = amount if amount > 0 else pos['qty']
+                        remaining = max(0.0, pos['qty'] - close_qty)
+                        if remaining > 1e-9:
+                            sym_pos[sym] = {
+                                'qty': remaining,
+                                'total_cost': avg_entry * remaining,
+                            }
+                        else:
+                            sym_pos[sym] = {'qty': 0.0, 'total_cost': 0.0}
+                    else:
+                        pnl_pct = 0.0
                     rows.append({
                         'symbol': sym,
                         'market': 'OKX',

@@ -54,7 +54,10 @@ def setup_logger(name: str, log_file: str) -> logging.Logger:
 
 def calc_supertrend(df, period=10, multiplier=3.0):
     hl2 = (df['h'] + df['l']) / 2
-    atr = (df['h'].combine(df['c'].shift(), max) - df['l'].combine(df['c'].shift(), min)).rolling(period).mean()
+    # [Fix] 올바른 3항목 True Range ATR (기존 H-L 단순화 → calc_atr()와 동일한 방식)
+    h, l, c = df['h'], df['l'], df['c']
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
 
     final_upperband = hl2 + (multiplier * atr)
     final_lowerband = hl2 - (multiplier * atr)
@@ -182,12 +185,11 @@ class BaseStrategyBrain:
     # Major 30m: PF 0.76→1.22 (흑자 전환) / Venture 15m: PF 1.23→1.13 (악화)
     # → 메이저처럼 박스권 성격 심볼에만 활성화
     FLIP_ON_TRAILING_CLOSE = False
-    # [Fix] 분할익절 3단계 (기존 1/8씩 8단계는 수익 실현이 너무 느림)
-    SCALE_OUT_STEPS = 3
     # [Fix] DCA 추가 진입 최소 간격 (캔들 수) — 매 캔들 물타기는 수수료 출혈
     DCA_MIN_CANDLES = 4
     # [검증] 물타기/피라미딩 백테스트(6~8월): 현행 조합 최악(-3.7K, MDD 83.7%) vs 둘다없음 최고(+18.1K, 48%)
     # DCA는 평균손실 -199→-274 확대, 피라미딩+20%가드는 승자 절단 → 기본 비활성 (env로 재활성 가능)
+    # [Fix] 중복 선언 제거: SCALE_OUT_STEPS는 env 값 하나로 통일
     SCALE_OUT_STEPS = int(os.getenv("OKX_SCALE_OUT_STEPS", "3"))
     PYRAMIDING_ENABLED = os.getenv("OKX_PYRAMIDING", "false").lower() == "true"
     # ── 켈리 공식 포지션 사이징 ──
@@ -323,6 +325,48 @@ class BaseStrategyBrain:
         self._btc_move_15m = 0.0          # 직전 확정 봉 BTC 변동률% (베타 래그용)
         self._btc_above_ema50_1h = True   # [K안] 시장 게이트 상태 (첫 갱신 전 fail-open)
         self._cb_state = {}
+        # [Fix] auto_tune_config 파라미터 인스턴스 변수로 로드
+        # daily_analyzer.py가 자동 튜닝한 값을 실제 전략 로직에 반영
+        self._apply_auto_tune_params()
+
+    def _apply_auto_tune_params(self):
+        """
+        [Fix] daily_analyzer.py가 생성한 auto_tune_config.json의 파라미터를
+        인스턴스 변수로 로드해 실제 전략 로직에 반영.
+        기존엔 bot_config에 값이 저장돼도 전략이 env 값만 읽어 자동 튜닝 효과가 없었음.
+
+        [Fix v2] 서브클래스가 클래스 속성으로 명시 오버라이드한 값은 건드리지 않음.
+        - 기본값과 같은 경우에만 auto_tune 값 적용 (서브클래스 의도 존중)
+        - 잘못된 ×10 변환 제거 (HARD_SL_PCT는 현물 비율 그대로 사용)
+        """
+        if not self.config:
+            return
+        try:
+            # 클래스 선언 기본값 (BaseStrategyBrain에서 env로 정의된 값)
+            base_hard_sl = float(os.getenv("OKX_HARD_STOP_LOSS", "-0.30"))
+
+            tuned_sl = self.config.okx_hard_sl_pct  # 양수 (예: 0.05 = 5%)
+            if tuned_sl and tuned_sl > 0:
+                tuned_val = -tuned_sl  # 음수로 변환 (-0.05)
+                # [Fix] 서브클래스가 명시 오버라이드(클래스 속성)한 경우 건드리지 않음
+                # → 현재 인스턴스 값이 base 기본값과 같을 때만 auto_tune 적용
+                if abs(self.HARD_STOP_LOSS_PCT - base_hard_sl) < 0.001:
+                    self.HARD_STOP_LOSS_PCT = tuned_val
+
+            tuned_trail = self.config.okx_trailing_pct  # 양수 (예: 0.02 = 2%)
+            if tuned_trail and tuned_trail > 0:
+                # ATR_TRAIL_ARM_PNL도 클래스 기본값(0.20)과 같을 때만 적용
+                base_arm = 0.20
+                if abs(self.ATR_TRAIL_ARM_PNL - base_arm) < 0.01:
+                    self.ATR_TRAIL_ARM_PNL = tuned_trail * 3  # 트레일링 비율 × 3배 (마진 기준)
+
+            self.logger.info(
+                f"⚙️ [AutoTune] 파라미터 확인: "
+                f"HardSL={self.HARD_STOP_LOSS_PCT*100:.1f}%, "
+                f"ATR_ARM={self.ATR_TRAIL_ARM_PNL*100:.1f}%"
+            )
+        except Exception as e:
+            self.logger.warning(f"⚠️ [AutoTune] 파라미터 로드 실패(기본값 유지): {e}")
 
     def _is_trading_hour_allowed(self) -> bool:
         """DEPRECATED: Bots now run 24/7 relying purely on technical indicators."""

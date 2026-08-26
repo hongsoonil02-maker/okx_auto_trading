@@ -20,6 +20,9 @@ class OKXMajorStrategyBrain(BaseStrategyBrain):
     
     # [포트폴리오 & 리스크 튜닝]
     PORTFOLIO_WEIGHT = 0.5       # 자본 분산 배분 (보수적)
+    # [Fix] 명시적 하드스탑 설정: 현물 기준 -20% (마진 기준 -200% → 사실상 청산가 이전 차단)
+    # auto_tune_config 값에 덮어쓰이는 것을 막기 위해 클래스 레벨에서 명시
+    HARD_STOP_LOSS_PCT = -0.20   # 현물 기준 -20% (Major는 보수적 스탑)
 
 
     TIMEFRAME = "30m"       # 신호 빈도 확대: 1h → 30m

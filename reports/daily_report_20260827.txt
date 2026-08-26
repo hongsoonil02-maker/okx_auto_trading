@@ -1,0 +1,19 @@
+📊 [Bot Daily Auto-Tuning Report]
+=========================
+📦 Lookback: 30d | Trades: 1932
+📈 Market Regime: Normal Volatility
+🔹 BTC 24h Avg Hourly Volatility: 0.64%
+
+📌 [Market Summary]
+OKX  | N=1932 | WR=39.3% | Avg=+0.079% | Sum=+152.86%
+
+⛔ [Blocked KST Hours]
+None (Crypto runs 24/7)
+
+🚫 [Blacklisted Symbols - OKX]
+APR/USDT:USDT, FARTCOIN/USDT:USDT, GRVT/USDT:USDT, PEOPLE/USDT:USDT, SKDD/USDT:USDT, STX/USDT:USDT, UB/USDT:USDT, XPL/USDT:USDT
+
+⚙️ [Adjusted Params]
+OKX: Pos 5.0%, TS 2.0%, SL 5.0%, ORB 6 candles, EB 0.04%, MOM 0.03%, RNG 0.60%
+=========================
+✅ 파라미터 자동 반영 완료.
