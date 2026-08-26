@@ -147,6 +147,9 @@ class BaseStrategyBrain:
     # [Fix] HTF(상위 타임프레임) 추세 필터 설정
     HTF_TIMEFRAME = "1h"     # 상위 타임프레임
     HTF_EMA_PERIOD = 50      # HTF EMA 기간
+    # ── [K안] 롱 이중 게이트 (백테스트 +15.5K, MDD 41.7% 검증) ──
+    # 롱 진입 조건: BTC > BTC 1h EMA50 (시장 게이트) AND 심볼 > 심볼 1h EMA50 (종목 게이트)
+    LONG_DUAL_GATE = os.getenv("OKX_LONG_DUAL_GATE", "true").lower() == "true"
     HTF_SLOPE_THRESHOLD = 0.005  # HTF EMA 기울기 임계값 (0.5%)
     # [개선안 #1] Volume 확인 배수 — 서브클래스에서 오버라이드 가능
     # 추가 전략 파라미터 (AI 토너먼트 1등 Alpha_Trend 파라미터 적용)
@@ -156,7 +159,7 @@ class BaseStrategyBrain:
     EMA_PERIOD = 50          # 추세 필터 기간
     # [안전망 추가] 긴급 하드 스탑로스: 현물 기준 -5% (레버리지 10x 적용 시 PnL -50%) 
     HARD_STOP_LOSS_PCT = float(os.getenv("OKX_HARD_STOP_LOSS", "-0.30"))  # 손익비 개선: -50%→-30%
-    SOFT_STOP_LOSS_PCT = -0.12  # 조기 손절(Soft Stop): 가랑비 출혈 방지용
+    SOFT_STOP_LOSS_PCT = float(os.getenv("OKX_SOFT_STOP_LOSS", "-0.12"))  # 조기 손절(가랑비 방어). -1 = 비활성 [8/26 백테스트]
     HARD_STOP_COOLDOWN_HOURS = 12  # 하드 스탑 시 12시간 쿨다운 (뇌동매매 방지)
     # 신규 진입 차단: Master가 max_active_subpositions 초과 시 신호를 거부하므로
     # 각 전략 뇌도 로컬에서 동일 제한을 사전 체크 (중복 신호 억제)
@@ -314,6 +317,7 @@ class BaseStrategyBrain:
         # Alpha Stack 상태
         self._funding_cache = {}          # sym -> (ts, rate) 30분 TTL
         self._btc_move_15m = 0.0          # 직전 확정 봉 BTC 변동률% (베타 래그용)
+        self._btc_above_ema50_1h = True   # [K안] 시장 게이트 상태 (첫 갱신 전 fail-open)
         self._cb_state = {}
 
     def _is_trading_hour_allowed(self) -> bool:
@@ -463,6 +467,18 @@ class BaseStrategyBrain:
     def _sector_params(self, symbol: str) -> dict:
         sec = self._symbol_sector(symbol)
         return self.SECTOR_PARAMS.get(sec, {'thr_long': 70, 'size_mult': 1.0})
+
+    async def _long_dual_gate_ok(self, symbol: str) -> bool:
+        """
+        [K안] 롱 이중 게이트: BTC > 1h EMA50 (시장) AND 심볼 > 1h EMA50 (종목).
+        백테스트(6/23~8/26): 게이트 없음 +9.3K → 이중게이트 +15.5K, MDD 53.5→41.7%.
+        """
+        if not self.LONG_DUAL_GATE:
+            return True
+        if not getattr(self, '_btc_above_ema50_1h', True):
+            return False
+        htf = await self._check_htf_trend(symbol)
+        return bool(htf.get('above_ema50', True))
 
     async def _get_funding_rate(self, symbol: str):
         """[Alpha ⑤] 펀딩비 캐시 조회 (30분 TTL — 펀딩은 8h 주기라 충분)."""
@@ -751,6 +767,8 @@ class BaseStrategyBrain:
             t_curr = curr['t']
             # [Fix #1/#2] 횡보장/서킷 브레이커 발동 시 자본 투입 전면 차단 (청산·스탑은 계속 동작)
             entries_blocked = self._chop_block or self._circuit_open
+            # [K안] 롱 이중 게이트 (BTC 1h EMA50 + 심볼 1h EMA50, 5분 캐시)
+            dual_gate = await self._long_dual_gate_ok(symbol)
             dca = self.dca_state.setdefault(symbol, {'entry_count': 0, 'exit_count': 0, 'last_entry_t': 0, 'last_exit_t': 0, 'first_entry_t': 0, 'max_pnl_pct': 0.0})
 
             pos_long = self.auto_active_pos.get((symbol, 'long'))
@@ -851,7 +869,7 @@ class BaseStrategyBrain:
             _sec_p = self._sector_params(symbol)
             ENTRY_THRESHOLD_LONG = _sec_p.get('thr_long', 70)
             ENTRY_THRESHOLD_SHORT = ENTRY_THRESHOLD_LONG + 30  # 숏 비대칭 강화 (기존 +20→+30): 숏 PF 0.95 적자 대응
-            is_long_sig = (long_score >= ENTRY_THRESHOLD_LONG) and vol_cond and getattr(self, '_long_regime_ok', True)
+            is_long_sig = (long_score >= ENTRY_THRESHOLD_LONG) and vol_cond and getattr(self, '_long_regime_ok', True) and dual_gate
             is_short_sig = (short_score >= ENTRY_THRESHOLD_SHORT) and vol_cond and getattr(self, '_short_regime_ok', True)
             # [수익성] 베어 숏 게이팅: 불장(BTC>=EMA200)에서 숏 차단 → 숏 손실 원천 방지
             if self.BEAR_SHORT_ENABLED and is_short_sig and getattr(self, '_long_regime_ok', True):
@@ -1091,7 +1109,7 @@ class BaseStrategyBrain:
                     await self.send_webhook(SideType.CLOSE_SHORT, symbol, 0)
                     # [Flip] 트레일링/방어 청산 시 즉시 롱 진입 (하드스탑 제외, 레짐 필터 적용)
                     flipped = False
-                    if self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_short and self._long_regime_ok and not entries_blocked:
+                    if self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_short and self._long_regime_ok and not entries_blocked and dual_gate:
                         self.logger.info(f"🔄 [FLIP] 숏 청산 → 롱 반대진입: {symbol} (최고수익: {dca['max_pnl_pct']*100:.0f}%)")
                         await self.execute_auto_entry(symbol, SideType.BUY, entry_type="flip")
                         flipped = True
@@ -1177,7 +1195,7 @@ class BaseStrategyBrain:
                     cooldown_ms = self.REENTRY_COOLDOWN_CANDLES * self.TIMEFRAME_MINUTES * 60 * 1000
                     if (t_curr - dca['last_close_t']) >= cooldown_ms:
                         side_closed = dca.get('last_close_side')
-                        re_long = side_closed == 'long' and curr['st_d_loose'] == 1 and curr['c'] > curr['ema_target'] and self._long_regime_ok
+                        re_long = side_closed == 'long' and curr['st_d_loose'] == 1 and curr['c'] > curr['ema_target'] and self._long_regime_ok and dual_gate
                         re_short = side_closed == 'short' and curr['st_d_loose'] == -1 and curr['c'] < curr['ema_target']
                         if re_long or re_short:
                             side = SideType.BUY if re_long else SideType.SELL
@@ -1354,6 +1372,8 @@ class BaseStrategyBrain:
             ema50_series = closes.ewm(span=50, adjust=False).mean()
             ema200 = ema200_series.iloc[-1]
             long_ok = bool(closes.iloc[-1] >= ema200)
+            # [K안] 시장 게이트: BTC > 1h EMA50
+            self._btc_above_ema50_1h = bool(closes.iloc[-1] > ema50_series.iloc[-1])
             btc_bullish = bool(closes.iloc[-1] >= ema200 and ema50_series.iloc[-1] > ema50_series.iloc[-5])
             short_ok = not btc_bullish  # True = 숏 허용, False = 숏 억제
 
@@ -1411,7 +1431,9 @@ class BaseStrategyBrain:
                     self.logger.info(f"🟡 [배포 {pct}] 추세 강도 보통 (ADX {adx_now:.1f}) — 사이즈 비례 운용")
                 self._deploy_band = band_now
             self._deploy_state = "always_on"
-            self._chop_block = False  # 하드 차단 폐지 — 항상 거래
+            # [8/26 백테스트 복원] 극저변동(BTC 1h ADX<15) 신규 진입만 차단, 청산은 계속.
+            # 90일 분할검증: 전반기 손실 축소/후반기 수익 확대/MDD 19->15%. 청산·트레일링은 항상 동작.
+            self._chop_block = adx_now < 15.0
             self._deploy_scale = scale
         except Exception as e:
             self.logger.warning(f"⚠️ [{self.STRATEGY_NAME}] 배포 스케일 갱신 실패(기존 유지): {e}")
@@ -1495,7 +1517,7 @@ class BaseStrategyBrain:
         if cached and (now - cached[0]) < 300:  # 5분 캐시
             return cached[1]
 
-        result = {'ema_slope': 0.0, 'is_uptrend': False, 'is_downtrend': False}
+        result = {'ema_slope': 0.0, 'is_uptrend': False, 'is_downtrend': False, 'above_ema50': True}
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, self.HTF_TIMEFRAME, limit=60)
             if ohlcv and len(ohlcv) >= 50:
@@ -1506,6 +1528,8 @@ class BaseStrategyBrain:
                 result['ema_slope'] = slope
                 result['is_uptrend'] = slope > self.HTF_SLOPE_THRESHOLD
                 result['is_downtrend'] = slope < -self.HTF_SLOPE_THRESHOLD
+                # [K안] 종목 게이트: 현재가 > 1h EMA50
+                result['above_ema50'] = bool(closes.iloc[-1] > ema.iloc[-1])
         except Exception as e:
             self.logger.warning(f"⚠️ HTF 추세 체크 실패 ({symbol}): {e}")
 
