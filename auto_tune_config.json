@@ -4,13 +4,11 @@
   "blacklisted_symbols": {
     "OKX": [
       "APR/USDT:USDT",
-      "FARTCOIN/USDT:USDT",
-      "GRVT/USDT:USDT",
-      "PEOPLE/USDT:USDT",
+      "LTC/USDT:USDT",
       "SKDD/USDT:USDT",
+      "SPX/USDT:USDT",
       "STX/USDT:USDT",
-      "UB/USDT:USDT",
-      "XPL/USDT:USDT"
+      "UB/USDT:USDT"
     ]
   },
   "okx_params": {
