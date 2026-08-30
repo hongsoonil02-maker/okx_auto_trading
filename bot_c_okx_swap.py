@@ -152,17 +152,17 @@ class BotCOKXSwap:
                 logger.warning(
                     f"🛡️ [안전 캡 적용] {ccxt_symbol} 주문 수량 {amount} -> {SYMBOL_MAX_CONTRACTS[base_coin]} (사전 클리핑)"
                 )
-                amount = SYMBOL_MAX_CONTRACTS[base_coin]
-
-            # [수정] 주문 전 레버리지 자동 세팅 (개별 payload 우선, 없으면 환경변수, 심볼별 오버라이드)
+            # [수정] 주문 전 레버리지 및 마진모드 자동 세팅 (개별 payload 우선, 없으면 환경변수, 기본 isolated)
+            margin_mode = os.getenv("OKX_MARGIN_MODE", "isolated").lower()
+            params["mgnMode"] = margin_mode
             try:
                 symbol_leverage = {
                     'LAB': 5,
                     'EDEN': 5,
                 }.get(base_coin)
                 leverage = payload.leverage if payload.leverage is not None else (symbol_leverage or int(os.getenv("OKX_LEVERAGE", "10")))
-                await self.exchange.set_leverage(leverage, ccxt_symbol, {"mgnMode": "cross"})
-                logger.info(f"⚙️ [레버리지 설정] {ccxt_symbol} -> {leverage}x (Cross)")
+                await self.exchange.set_leverage(leverage, ccxt_symbol, {"mgnMode": margin_mode})
+                logger.info(f"⚙️ [레버리지 설정] {ccxt_symbol} -> {leverage}x ({margin_mode.capitalize()})")
             except Exception as e:
                 logger.warning(f"⚠️ [레버리지 설정 실패] (이미 설정되어 있거나 API 제한일 수 있음): {e}")
 
@@ -178,7 +178,15 @@ class BotCOKXSwap:
                         pos_side = params.get("posSide", "long")
                         try:
                             await self.exchange.cancel_all_orders(ccxt_symbol)
-                        except:
+                            inst_id = ccxt_symbol.replace("/", "-").split(":")[0] + "-SWAP" if ":" in ccxt_symbol else ccxt_symbol
+                            # 거래소에 남아있는 해당 심볼의 SL 알고 주문 취소
+                            pending_algos = await self.exchange.request("trade/orders-algo-pending", api="private", method="GET", params={"instId": inst_id, "ordType": "conditional"})
+                            algo_ids = [a["algoId"] for a in pending_algos.get("data", []) if "algoId" in a]
+                            if algo_ids:
+                                cancel_list = [{"instId": inst_id, "algoId": a_id} for a_id in algo_ids]
+                                await self.exchange.request("trade/cancel-algos", api="private", method="POST", params=cancel_list)
+                                logger.info(f"🧹 [알고 SL 취소] {ccxt_symbol} 대기 중이던 SL {len(algo_ids)}건 정리 완료")
+                        except Exception as ex_c:
                             pass
                         
                         # [FIX] 51108 (시장가 청산 한도 초과) 방지를 위해 포지션 수량과 maxMktSz 확인 후 분할 청산
@@ -254,6 +262,40 @@ class BotCOKXSwap:
                         f"@ {avg_price} | ID: {order_id} | Latency: {latency:.3f}s"
                     )
                     _record_trade(ccxt_symbol, payload.side.value, amount, avg_price, order_id)
+
+                    # [CRITICAL FEATURE #1] 진입 성공 시 OKX 거래소 서버측 조건부 하드스탑(SL) 주문 동시 설치
+                    if payload.side in [SideType.BUY, SideType.SELL] and avg_price > 0 and amount > 0:
+                        try:
+                            inst_id = ccxt_symbol.replace("/", "-").split(":")[0] + "-SWAP" if ":" in ccxt_symbol else ccxt_symbol
+                            pos_side = "long" if payload.side == SideType.BUY else "short"
+                            sl_side = "sell" if pos_side == "long" else "buy"
+                            # 마진 -10% 기준 현물 가격 변동폭 (leverage 반영)
+                            price_drop_pct = 0.10 / max(1, leverage)
+                            if pos_side == "long":
+                                sl_price = avg_price * (1.0 - price_drop_pct)
+                            else:
+                                sl_price = avg_price * (1.0 + price_drop_pct)
+                            sl_price_str = self.exchange.price_to_precision(ccxt_symbol, sl_price)
+
+                            algo_params = {
+                                "instId": inst_id,
+                                "tdMode": margin_mode,
+                                "side": sl_side,
+                                "posSide": pos_side,
+                                "ordType": "conditional",
+                                "sz": str(amount),
+                                "slTriggerPx": str(sl_price_str),
+                                "slOrdPx": "-1",
+                                "slTriggerPxType": "last"
+                            }
+                            res_algo = await self.exchange.request("trade/order-algo", api="private", method="POST", params=algo_params)
+                            if res_algo.get("code") == "0":
+                                logger.info(f"🛡️ [거래소 하드스탑 SL 설치 성공] {ccxt_symbol} {pos_side} @ {sl_price_str} (손절폭: -{price_drop_pct*100:.2f}%)")
+                            else:
+                                logger.warning(f"⚠️ [거래소 하드스탑 SL 응답 실패] {res_algo.get('msg')}")
+                        except Exception as ex_sl:
+                            logger.warning(f"⚠️ [거래소 하드스탑 SL 설치 예외]: {ex_sl}")
+
                     return {"status": "ok", "order_id": order_id, "price": avg_price}
                 except asyncio.TimeoutError:
                     last_err = f"타임아웃 (시도 {attempt+1}/{max_retries})"
@@ -559,14 +601,12 @@ async def main():
     # [Fix] access_log 제거: /health·/status 폴링 로그 스팸 방지
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    # [Fix] 0.0.0.0 → 127.0.0.1: 같은 호스트 마스터만 호출하므로 외부 노출 차단
-    site = web.TCPSite(runner, "127.0.0.1", port)
-    
     for attempt in range(5):
         try:
+            site = web.TCPSite(runner, "127.0.0.1", port)
             await site.start()
             break
-        except OSError as e:
+        except (OSError, RuntimeError) as e:
             if attempt == 4:
                 raise e
             logger.warning(f"⚠️  Port {port} 사용 중, 2초 후 재시도... ({attempt+1}/5)")

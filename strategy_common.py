@@ -775,13 +775,15 @@ class BaseStrategyBrain:
         if self.exchange:
             await self.exchange.close()
 
-    async def send_webhook(self, side: SideType, symbol: str, qty: float):
+    async def send_webhook(self, side: SideType, symbol: str, qty: float, leverage: int = None):
+        lev = leverage if leverage is not None else getattr(self, "STRATEGY_LEVERAGE", 10)
         payload = WebhookPayload(
             action=ActionType.EXEC,
             side=side,
             symbol=symbol,
             qty=qty,
             signal_strength="STRONG",
+            leverage=lev,
         )
         json_data = json.loads(payload.to_json())
         json_data["market"] = "okx_swap"
@@ -1282,7 +1284,10 @@ class BaseStrategyBrain:
                     dca['entry_count'] += 1
                     dca['last_entry_t'] = t_curr
 
-            else:
+            # [CRITICAL BUG FIX #2] 기존 else: 는 has_short 가 아닐 때 롱을 들고 있어도 무조건 진입하여
+            # 매 캔들마다 신규 진입 난사 및 entry_count=1 리셋 버그를 유발했음.
+            # 롱/숏 포지션이 둘 다 없을 때만 신규 진입 블록 진입하도록 엄격 봉인.
+            if not has_long and not has_short:
                 active_symbols = set(sym for sym, _side in self.auto_active_pos.keys())
                 total_count = len(active_symbols)
                 new_listing_count = sum(1 for s in active_symbols if self._is_new_listing(s))
@@ -1480,7 +1485,7 @@ class BaseStrategyBrain:
                     f"🔥 [{self.STRATEGY_NAME}] 진입 시그널: {side.value} {symbol} "
                     f"(수량: {amount}, 목표마진: {target_margin:.1f} USDT, 유형: {entry_type})"
                 )
-                await self.send_webhook(side, symbol, amount)
+                await self.send_webhook(side, symbol, amount, leverage=leverage)
                 # [Fix] 사이클 내 후속 신호가 동일 마진을 중복 사용하지 않도록 예약 처리
                 self._reserved_margin += target_margin
         except Exception as e:
