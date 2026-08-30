@@ -38,10 +38,12 @@ def _send_sync(url, payload):
 def send_telegram_alert(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
+    acc = os.getenv("ACCOUNT_NAME") or "OKX"
+    tagged_message = f"[{acc}] {message}"
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
+        "text": tagged_message
     }
     # 비동기 이벤트 루프 락을 막기 위해 백그라운드 스레드로 전송 (Fire-and-Forget)
     threading.Thread(target=_send_sync, args=(url, payload), daemon=True).start()

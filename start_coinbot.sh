@@ -11,7 +11,7 @@ pkill -9 -f 'okx_major_strategy.py' >/dev/null 2>&1 || true
 pkill -9 -f 'okx_venture_strategy.py' >/dev/null 2>&1 || true
 pkill -9 -f 'daily_analyzer.py' >/dev/null 2>&1 || true
 
-for port in 8000 8001 8005 8013; do
+for port in 8000 8001 8005 8009 8013; do
   fuser -k -9 "${port}/tcp" >/dev/null 2>&1 || true
 done
 sleep 2
@@ -26,4 +26,4 @@ systemctl --user start master_bot_orchestrator bot_c_okx_swap okx_major_strategy
 
 sleep 2
 echo "✅ Coinbot 프로세스 구동 완료!"
-ss -tlnp | grep -E ':(8000|8001|8013)' || true
+ss -tlnp | grep -E ':(8000|8001|8009|8013)' || true

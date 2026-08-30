@@ -16,10 +16,17 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
     LOGGER_NAME = "OKX_Venture_Strategy"
     STRATEGY_LEVERAGE = int(os.getenv("OKX_VENTURE_LEVERAGE", "5"))
     
-    # [포트폴리오 & 리스크 튜닝]
-    PORTFOLIO_WEIGHT = 1.5       # 자본 집중 배분
-    HARD_STOP_LOSS_PCT = -0.15   # 꼬리 위험 방어 (15% 컷)
+    # [포트폴리오 & 리스크 튜닝 - alv*** 타이트 손절 원칙]
+    PORTFOLIO_WEIGHT = 1.0       # 자본 분산 균형 배분
+    HARD_STOP_LOSS_PCT = -0.10   # [타이트 손절] 마진 기준 -10% 하드스탑 (현물 기준 -2% 컷)
+    SOFT_STOP_LOSS_PCT = -0.07   # [조기 손절] 마진 기준 -7% 소프트 컷
     PYRAMID_RATIO = 0.50         # 추세 승자 적극 불타기
+    
+    # [백테스트 검증 최적화] 30m 승격 + ADX >= 20 횡보 휩쏘 차단
+    # 백테스트 성과: 수익률 +125.3%, PF 1.88, MDD 35.9% (15m 노필터 대비 2.3배 초과수익)
+    TIMEFRAME = "30m"
+    TIMEFRAME_MINUTES = 30
+    CHOP_ADX_BLOCK_THRESHOLD = 20.0
     
     STOCK_KEYWORDS = []
     BLACKLIST = ['KR200', 'SKHYNIX', 'MU', 'SHAZ', 'ISRG', 'ROBO', 'RAM', 'DRAM', 'GME',

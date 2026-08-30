@@ -153,6 +153,7 @@ class BaseStrategyBrain:
     # ── [K안] 롱 이중 게이트 (백테스트 +15.5K, MDD 41.7% 검증) ──
     # 롱 진입 조건: BTC > BTC 1h EMA50 (시장 게이트) AND 심볼 > 심볼 1h EMA50 (종목 게이트)
     LONG_DUAL_GATE = os.getenv("OKX_LONG_DUAL_GATE", "true").lower() == "true"
+    SHORT_DUAL_GATE = os.getenv("OKX_SHORT_DUAL_GATE", "true").lower() == "true"
     HTF_SLOPE_THRESHOLD = 0.005  # HTF EMA 기울기 임계값 (0.5%)
     # [개선안 #1] Volume 확인 배수 — 서브클래스에서 오버라이드 가능
     # 추가 전략 파라미터 (AI 토너먼트 1등 Alpha_Trend 파라미터 적용)
@@ -214,6 +215,7 @@ class BaseStrategyBrain:
     # 청산/스탑/익절은 계속 동작 (기존 포지션 관리 유지).
     CHOP_FILTER_ENABLED = os.getenv("OKX_CHOP_FILTER", "true").lower() == "true"
     CHOP_ADX_THRESHOLD = float(os.getenv("OKX_CHOP_ADX", "20"))
+    CHOP_ADX_BLOCK_THRESHOLD = float(os.getenv("OKX_CHOP_ADX_BLOCK", "20.0"))
     # 연속 배포: 하드 차단 없음, 사이즈만 호흡 (철칙: 거래가 없으면 기회도 없다)
     CHOP_FLOOR = float(os.getenv("OKX_CHOP_FLOOR", "0.15"))       # 배율 바닥
     CHOP_FLOOR_ADX = float(os.getenv("OKX_CHOP_FLOOR_ADX", "8"))  # 이 아래선 바닥 배율 고정
@@ -535,10 +537,31 @@ class BaseStrategyBrain:
 
         if not self.LONG_DUAL_GATE:
             return True
-        if not getattr(self, '_btc_above_ema50_1h', True):
+            
+        sec_name = self._symbol_sector(symbol)
+        exempt_btc_gate = sec_name in ('meme', 'new_listing', 'alt')
+        
+        if not exempt_btc_gate and not getattr(self, '_btc_above_ema50_1h', True):
             return False
+            
         htf = await self._check_htf_trend(symbol)
         return bool(htf.get('above_ema50', True))
+
+    async def _short_dual_gate_ok(self, symbol: str) -> bool:
+        """
+        [K안 추가] 숏 이중 게이트: BTC < 1h EMA50 AND 심볼 < 1h EMA50.
+        """
+        if not self.SHORT_DUAL_GATE:
+            return True
+            
+        sec_name = self._symbol_sector(symbol)
+        exempt_btc_gate = sec_name in ('meme', 'new_listing', 'alt')
+        
+        if not exempt_btc_gate and getattr(self, '_btc_above_ema50_1h', True):
+            return False
+            
+        htf = await self._check_htf_trend(symbol)
+        return not bool(htf.get('above_ema50', True))
 
     async def _get_funding_rate(self, symbol: str):
         """[Alpha ⑤] 펀딩비 캐시 조회 (30분 TTL — 펀딩은 8h 주기라 충분)."""
@@ -835,6 +858,7 @@ class BaseStrategyBrain:
                     short_blocked = True
             # [K안] 롱 이중 게이트 (BTC 1h EMA50 + 심볼 1h EMA50, 5분 캐시)
             dual_gate = await self._long_dual_gate_ok(symbol)
+            short_dual_gate = await self._short_dual_gate_ok(symbol)
             dca = self.dca_state.setdefault(symbol, {'entry_count': 0, 'exit_count': 0, 'last_entry_t': 0, 'last_exit_t': 0, 'first_entry_t': 0, 'max_pnl_pct': 0.0})
 
             pos_long = self.auto_active_pos.get((symbol, 'long'))
@@ -860,6 +884,18 @@ class BaseStrategyBrain:
                     })
                 elif not dca.get('side'):
                     dca['side'] = held_side  # 레거시 상태 백필
+            else:
+                # [개선 #1] 거래소 실포지션 자동 동기화 (Auto-Reconcile): 실포지션 0인데 dca 기록이 남아있는 고스트 상태 클린
+                last_entry_t = dca.get('last_entry_t', 0)
+                if dca.get('entry_count', 0) > 0 and (t_curr - last_entry_t) > 60000:
+                    self.logger.info(
+                        f"🧹 [Auto-Reconcile] {symbol} 거래소 실포지션 없음(0) 확인 — 잔여 DCA 고스트 상태 자동 초기화"
+                    )
+                    dca.clear()
+                    dca.update({
+                        'entry_count': 0, 'exit_count': 0, 'last_entry_t': 0,
+                        'last_exit_t': 0, 'first_entry_t': 0, 'max_pnl_pct': 0.0,
+                    })
 
             # [버그 수정] curr['v']는 미완성 캔들이라 거래량이 턱없이 부족할 때가 많습니다. 
             # 따라서 직전 완성 캔들(prev['v'])에서 이미 거래량이 터졌거나, 
@@ -935,20 +971,27 @@ class BaseStrategyBrain:
             _sec_p = self._sector_params(symbol)
             ENTRY_THRESHOLD_LONG = _sec_p.get('thr_long', 70)
             ENTRY_THRESHOLD_SHORT = ENTRY_THRESHOLD_LONG + 30  # 숏 비대칭 강화 (기존 +20→+30): 숏 PF 0.95 적자 대응
-            is_long_sig = (long_score >= ENTRY_THRESHOLD_LONG) and vol_cond and getattr(self, '_long_regime_ok', True) and dual_gate
-            is_short_sig = (short_score >= ENTRY_THRESHOLD_SHORT) and vol_cond and getattr(self, '_short_regime_ok', True)
+            
+            _sec_name = self._symbol_sector(symbol)
+            is_independent = _sec_name in ('meme', 'new_listing', 'alt')
+            regime_ok = True if is_independent else getattr(self, '_long_regime_ok', True)
+            
+            is_long_sig = (long_score >= ENTRY_THRESHOLD_LONG) and vol_cond and regime_ok and dual_gate
+            is_short_sig = (short_score >= ENTRY_THRESHOLD_SHORT) and vol_cond and getattr(self, '_short_regime_ok', True) and short_dual_gate
             # [수익성] 베어 숏 게이팅: 불장(BTC>=EMA200)에서 숏 차단 → 숏 손실 원천 방지
             if self.BEAR_SHORT_ENABLED and is_short_sig and getattr(self, '_long_regime_ok', True):
                 is_short_sig = False
             
-            default_leverage = int(os.getenv("OKX_LEVERAGE", "10"))
-            leverage = getattr(self, 'STRATEGY_LEVERAGE', default_leverage)
+            default_leverage_long = int(os.getenv("OKX_LEVERAGE", "10"))
+            default_leverage_short = int(os.getenv("OKX_SHORT_LEVERAGE", str(default_leverage_long)))
+            leverage_long = getattr(self, 'STRATEGY_LEVERAGE', default_leverage_long)
+            leverage_short = getattr(self, 'STRATEGY_LEVERAGE_SHORT', default_leverage_short)
             
             pnl_pct_long = 0
             is_hard_stop_long = False
             take_profit_long_sig = False
             if has_long and avg_price_long > 0:
-                pnl_pct_long = ((curr['c'] - avg_price_long) / avg_price_long) * leverage
+                pnl_pct_long = ((curr['c'] - avg_price_long) / avg_price_long) * leverage_long
                 if pnl_pct_long > dca['max_pnl_pct']:
                     dca['max_pnl_pct'] = pnl_pct_long
                 
@@ -992,6 +1035,10 @@ class BaseStrategyBrain:
                     force_close_long = True
                 elif dca['max_pnl_pct'] >= 0.20 and pnl_pct_long <= 0.05:
                     force_close_long = True
+                elif dca.get('exit_count', 0) >= 1 and pnl_pct_long <= 0.005:
+                    # [개선 #2] 1차 분할 익절 완료 후 잔량 무손실 본전 보존 스탑 (수수료 보전 +0.5%)
+                    self.logger.info(f"🛡️ [Breakeven Stop] 롱 1차 익절 후 본전 보호 전량 청산 (PnL: {pnl_pct_long*100:+.2f}%): {symbol}")
+                    force_close_long = True
                 elif pnl_pct_long >= 0.15 and dca['exit_count'] == 0:
                     take_profit_long_sig = True
                 elif pnl_pct_long >= 0.30 and dca['exit_count'] == 1:
@@ -1027,7 +1074,7 @@ class BaseStrategyBrain:
             take_profit_short_sig = False
             is_hard_stop_short = False  # [Fix] 미초기화 시 방어청산 경로에서 UnboundLocalError 발생
             if has_short and avg_price_short > 0:
-                pnl_pct_short = ((avg_price_short - curr['c']) / avg_price_short) * leverage
+                pnl_pct_short = ((avg_price_short - curr['c']) / avg_price_short) * leverage_short
                 if pnl_pct_short > dca['max_pnl_pct']:
                     dca['max_pnl_pct'] = pnl_pct_short
                 
@@ -1067,6 +1114,10 @@ class BaseStrategyBrain:
                 elif dca['max_pnl_pct'] >= 0.40 and pnl_pct_short <= 0.30:
                     force_close_short = True
                 elif dca['max_pnl_pct'] >= 0.20 and pnl_pct_short <= 0.05:
+                    force_close_short = True
+                elif dca.get('exit_count', 0) >= 1 and pnl_pct_short <= 0.005:
+                    # [개선 #2] 1차 분할 익절 완료 후 잔량 무손실 본전 보존 스탑 (수수료 보전 +0.5%)
+                    self.logger.info(f"🛡️ [Breakeven Stop] 숏 1차 익절 후 본전 보호 전량 청산 (PnL: {pnl_pct_short*100:+.2f}%): {symbol}")
                     force_close_short = True
                 elif pnl_pct_short >= 0.15 and dca['exit_count'] == 0:
                     take_profit_short_sig = True
@@ -1370,16 +1421,25 @@ class BaseStrategyBrain:
             # [Alpha ⑤] 펀딩비 정렬: 극단 캐리에서 유리한 방향 확대 / 불리한 방향 축소
             if self.FUNDING_ADJUST_ENABLED:
                 fr = await self._get_funding_rate(symbol)
-                if fr is not None and abs(fr) >= min(abs(self.FUNDING_EXTREME_POS), abs(self.FUNDING_EXTREME_NEG)):
-                    if side == SideType.BUY:
-                        _fmult = 1.25 if fr <= self.FUNDING_EXTREME_NEG else (0.6 if fr >= self.FUNDING_EXTREME_POS else 1.0)
-                    else:
-                        _fmult = 1.25 if fr >= self.FUNDING_EXTREME_POS else (0.6 if fr <= self.FUNDING_EXTREME_NEG else 1.0)
-                    if _fmult != 1.0:
-                        self.logger.info(f"💸 [Funding] {symbol} 펀딩비 {fr*100:+.3f}% → 사이즈 ×{_fmult}")
-                        target_margin *= _fmult
-                        if target_margin < self.MIN_POSITION_MARGIN:
-                            return
+                if fr is not None:
+                    # [개선 #5] 극단 펀딩비 함정 진입 원천 차단 (8h ±0.30% 이상 초과열 종목)
+                    if side == SideType.BUY and fr >= 0.0030:
+                        self.logger.warning(f"🚫 [Funding Extreme] {symbol} 롱 진입 차단 — 펀딩비 과열 ({fr*100:+.3f}% ≥ +0.30%)")
+                        return
+                    elif side == SideType.SELL and fr <= -0.0030:
+                        self.logger.warning(f"🚫 [Funding Extreme] {symbol} 숏 진입 차단 — 펀딩비 과열 ({fr*100:+.3f}% ≤ -0.30%)")
+                        return
+
+                    if abs(fr) >= min(abs(self.FUNDING_EXTREME_POS), abs(self.FUNDING_EXTREME_NEG)):
+                        if side == SideType.BUY:
+                            _fmult = 1.25 if fr <= self.FUNDING_EXTREME_NEG else (0.6 if fr >= self.FUNDING_EXTREME_POS else 1.0)
+                        else:
+                            _fmult = 1.25 if fr >= self.FUNDING_EXTREME_POS else (0.6 if fr <= self.FUNDING_EXTREME_NEG else 1.0)
+                        if _fmult != 1.0:
+                            self.logger.info(f"💸 [Funding] {symbol} 펀딩비 {fr*100:+.3f}% → 사이즈 ×{_fmult}")
+                            target_margin *= _fmult
+                            if target_margin < self.MIN_POSITION_MARGIN:
+                                return
             if target_margin <= 0:
                 if not self._margin_reject_logged:
                     self.logger.warning(
@@ -1500,9 +1560,15 @@ class BaseStrategyBrain:
                     self.logger.info(f"🟡 [배포 {pct}] 추세 강도 보통 (ADX {adx_now:.1f}) — 사이즈 비례 운용")
                 self._deploy_band = band_now
             self._deploy_state = "always_on"
-            # [8/26 백테스트 복원] 극저변동(BTC 1h ADX<15) 신규 진입만 차단, 청산은 계속.
-            # 90일 분할검증: 전반기 손실 축소/후반기 수익 확대/MDD 19->15%. 청산·트레일링은 항상 동작.
-            self._chop_block = adx_now < 15.0
+            # [백테스트 검증] 극저변동/횡보장(BTC 1h ADX < 임계값) 신규 진입만 차단, 청산은 계속 동작.
+            block_threshold = getattr(self, 'CHOP_ADX_BLOCK_THRESHOLD', 20.0)
+            was_blocked = getattr(self, '_chop_block', False)
+            self._chop_block = adx_now < block_threshold
+            if self._chop_block != was_blocked:
+                if self._chop_block:
+                    self.logger.info(f"⏸️ [{self.STRATEGY_NAME}] 횡보장 휩쏘 방어 가동 (BTC 1h ADX {adx_now:.1f} < {block_threshold:.0f}) — 신규 진입 차단 (청산/스탑 유지)")
+                else:
+                    self.logger.info(f"▶️ [{self.STRATEGY_NAME}] 추세 발생 확인 (BTC 1h ADX {adx_now:.1f} ≥ {block_threshold:.0f}) — 신규 진입 재개")
             self._deploy_scale = scale
         except Exception as e:
             self.logger.warning(f"⚠️ [{self.STRATEGY_NAME}] 배포 스케일 갱신 실패(기존 유지): {e}")

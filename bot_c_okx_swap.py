@@ -9,6 +9,7 @@ bot_c_okx_swap.py — Bot C: OKX Futures 실제 주문 엔진 v2.0
 import asyncio
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -141,9 +142,25 @@ class BotCOKXSwap:
             else:  # SELL
                 params = {"posSide": "short"}
 
-            # [수정] 주문 전 레버리지 자동 세팅 (개별 payload 우선, 없으면 환경변수)
+            # [옵션 A] 심볼별 사전 안전 캡 (OKX 51004 사전 방지)
+            base_coin = symbol.split('-')[0]
+            SYMBOL_MAX_CONTRACTS = {
+                'LAB': 5000,      # 10x 5,800 / 5x 11,600 대비 보수적 안전선
+                'EDEN': 100000,   # 10x 200,000 대비 보수적 안전선
+            }
+            if base_coin in SYMBOL_MAX_CONTRACTS and amount > SYMBOL_MAX_CONTRACTS[base_coin]:
+                logger.warning(
+                    f"🛡️ [안전 캡 적용] {ccxt_symbol} 주문 수량 {amount} -> {SYMBOL_MAX_CONTRACTS[base_coin]} (사전 클리핑)"
+                )
+                amount = SYMBOL_MAX_CONTRACTS[base_coin]
+
+            # [수정] 주문 전 레버리지 자동 세팅 (개별 payload 우선, 없으면 환경변수, 심볼별 오버라이드)
             try:
-                leverage = payload.leverage if payload.leverage is not None else int(os.getenv("OKX_LEVERAGE", "10"))
+                symbol_leverage = {
+                    'LAB': 5,
+                    'EDEN': 5,
+                }.get(base_coin)
+                leverage = payload.leverage if payload.leverage is not None else (symbol_leverage or int(os.getenv("OKX_LEVERAGE", "10")))
                 await self.exchange.set_leverage(leverage, ccxt_symbol, {"mgnMode": "cross"})
                 logger.info(f"⚙️ [레버리지 설정] {ccxt_symbol} -> {leverage}x (Cross)")
             except Exception as e:
@@ -189,6 +206,11 @@ class BotCOKXSwap:
                                 timeout=10.0
                             )
                     else:
+                        # [개선 #3] 3계정 동시 발주 호가 충돌 및 슬리피지 방지 (Random Jitter)
+                        if payload.side in [SideType.BUY, SideType.SELL]:
+                            jitter = random.uniform(0.1, 0.35)
+                            await asyncio.sleep(jitter)
+
                         # [FIX] 51202 방지를 위해 시장가 진입 분할 처리
                         await self.exchange.load_markets()
                         market_info = self.exchange.markets.get(ccxt_symbol, {}).get('info', {})
@@ -270,9 +292,9 @@ class BotCOKXSwap:
 
                     # [Fix] 51004 포지션 한도 초과: 한도 내로 수량 클램프 후 재시도
                     if "51004" in last_err:
-                        m = re.search(r"more than (\d+)\(contracts\)", last_err)
+                        m = re.search(r"more than ([\d,]+)\s*\(contracts\)", last_err)
                         if m:
-                            cap = float(m.group(1))
+                            cap = float(m.group(1).replace(',', ''))
                             try:
                                 positions = await self.exchange.fetch_positions([ccxt_symbol])
                                 pos_side_key = params.get("posSide", "long")
