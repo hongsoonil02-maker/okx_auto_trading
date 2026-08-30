@@ -141,7 +141,22 @@ class BaseStrategyBrain:
     LOG_FILE = "base_strategy.log"
     LOGGER_NAME = "BaseStrategy"
     SUPERTREND_MULT_TIGHT = 2.0
-    MASTER_WEBHOOK_URL = "http://localhost:8009/webhook"
+    # [CRITICAL FIX] 계정별 마스터 포트 분리: 클론 디렉토리 간 파일 동기화 시
+    # 하드코딩 포트가 함께 복사되어 타 계정으로 신호가 새는 회귀를 방지한다.
+    # 각 시스템의 .env에서 MASTER_WEBHOOK_URL을 반드시 지정할 것 (8009/8010/8012).
+    MASTER_WEBHOOK_URL = os.getenv("MASTER_WEBHOOK_URL", "http://localhost:8009/webhook")
+    # [Review Fix] env 미설정 폴백은 타 계정 신호 유출 사고로 직결되므로 반드시 경고
+    if os.getenv("MASTER_WEBHOOK_URL") is None:
+        import logging as _logging
+        _logging.getLogger().critical(
+            "🚨 MASTER_WEBHOOK_URL 미설정 — 기본값 8009(Main)로 폴백합니다. "
+            "클론 계정이라면 즉시 .env에 MASTER_WEBHOOK_URL을 지정하세요 (신호 유출 위험)."
+        )
+        print(
+            "🚨 [CRITICAL] MASTER_WEBHOOK_URL 미설정 — 기본값 8009(Main) 폴백. "
+            "클론 계정은 즉시 .env 지정 필요 (신호 유출 위험).",
+            flush=True,
+        )
     AUTO_TRADE_INTERVAL = 60.0
     STOCK_KEYWORDS = []
     BLACKLIST = []
@@ -1622,6 +1637,11 @@ class BaseStrategyBrain:
             if self._cb_state.get("week") != current_week:
                 self._cb_state["week"] = current_week
                 self._cb_state["weekly_peak"] = equity
+                # [Fix: Sticky Lock] 주간 락은 오직 새 주간 시작 시에만 해제
+                if self._cb_state.get("weekly_locked", False):
+                    self._cb_state["weekly_locked"] = False
+                    self._save_cb_state()
+                    self.logger.info("✅ [Global Lock] 새 주간 시작 — 주간 MDD 락 해제")
             else:
                 self._cb_state["weekly_peak"] = max(self._cb_state.get("weekly_peak", equity), equity)
                 
@@ -1629,11 +1649,13 @@ class BaseStrategyBrain:
             weekly_mdd = (equity - weekly_peak) / weekly_peak * 100 if weekly_peak > 0 else 0
             
             # 주간 MDD 락 확인
+            # [Fix: Sticky Lock] 한 번 발동한 주간 락은 등락으로 MDD가 -10% 위로 회복해도
+            # 해제하지 않는다 (락/해제 플래핑 방지). 해제는 새 주간 시작 시에만 수행.
             global_mdd_limit = getattr(self, "GLOBAL_MDD_LIMIT", -10.0)
-            if weekly_mdd <= global_mdd_limit:
+            if weekly_mdd <= global_mdd_limit or self._cb_state.get("weekly_locked", False):
                 if not self._cb_state.get("weekly_locked", False):
                     self._cb_state["weekly_locked"] = True
-                    self.logger.warning(f"🚨 [Global Lock] 주간 MDD {weekly_mdd:.2f}% ≤ 임계 {global_mdd_limit:.1f}% — 이번 주 전면 거래 정지")
+                    self.logger.warning(f"🚨 [Global Lock] 주간 MDD {weekly_mdd:.2f}% ≤ 임계 {global_mdd_limit:.1f}% — 이번 주 전면 거래 정지 (해제: 새 주간)")
                     try:
                         from utils_telegram import send_telegram_alert
                         send_telegram_alert(f"🚨 [{self.STRATEGY_NAME}] 주간 누적 손실 {weekly_mdd:.2f}% 도달 — Global Lock 발동 (이번 주 거래 차단)")
@@ -1642,10 +1664,6 @@ class BaseStrategyBrain:
                 self._circuit_open = True
                 self._save_cb_state()
                 return
-            else:
-                if self._cb_state.get("weekly_locked", False):
-                    self._cb_state["weekly_locked"] = False
-                    self.logger.info("✅ [Global Lock] 주간 MDD 회복 / 새 주간 시작 — 락 해제")
             
             # 쿨다운 타이머 확인
             cooldown_until = self._cb_state.get("cooldown_until", 0)

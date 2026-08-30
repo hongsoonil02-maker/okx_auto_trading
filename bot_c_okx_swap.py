@@ -94,6 +94,53 @@ class BotCOKXSwap:
         if self.exchange:
             await self.exchange.close()
 
+    async def _install_hard_stop(self, ccxt_symbol: str, payload_side, amount: float,
+                                 avg_price: float, leverage: int, margin_mode: str):
+        """[CRITICAL FEATURE #1] 진입 성공 시 OKX 거래소 서버측 조건부 하드스탑(SL) 설치.
+        일반 성공 경로와 멱등성(타임아웃/예외 후 체결 확인) 성공 경로 모두에서 호출한다."""
+        if payload_side not in (SideType.BUY, SideType.SELL) or amount <= 0:
+            return
+        try:
+            if not avg_price:
+                # 체결가 미상이면 현재가로 폭백 (SL 미설치 상태로 방치하지 않음)
+                try:
+                    _t = await self.exchange.fetch_ticker(ccxt_symbol)
+                    avg_price = float(_t.get("last") or 0)
+                except Exception:
+                    avg_price = 0
+            if not avg_price or avg_price <= 0:
+                logger.warning(f"⚠️ [거래소 하드스탑 SL 미설치] {ccxt_symbol} 기준가 조회 실패")
+                return
+            inst_id = ccxt_symbol.replace("/", "-").split(":")[0] + "-SWAP" if ":" in ccxt_symbol else ccxt_symbol
+            pos_side = "long" if payload_side == SideType.BUY else "short"
+            sl_side = "sell" if pos_side == "long" else "buy"
+            # 마진 -10% 기준 현물 가격 변동폭 (leverage 반영)
+            price_drop_pct = 0.10 / max(1, leverage)
+            if pos_side == "long":
+                sl_price = avg_price * (1.0 - price_drop_pct)
+            else:
+                sl_price = avg_price * (1.0 + price_drop_pct)
+            sl_price_str = self.exchange.price_to_precision(ccxt_symbol, sl_price)
+
+            algo_params = {
+                "instId": inst_id,
+                "tdMode": margin_mode,
+                "side": sl_side,
+                "posSide": pos_side,
+                "ordType": "conditional",
+                "sz": str(amount),
+                "slTriggerPx": str(sl_price_str),
+                "slOrdPx": "-1",
+                "slTriggerPxType": "last"
+            }
+            res_algo = await self.exchange.request("trade/order-algo", api="private", method="POST", params=algo_params)
+            if res_algo.get("code") == "0":
+                logger.info(f"🛡️ [거래소 하드스탑 SL 설치 성공] {ccxt_symbol} {pos_side} @ {sl_price_str} (손절폭: -{price_drop_pct*100:.2f}%)")
+            else:
+                logger.warning(f"⚠️ [거래소 하드스탑 SL 응답 실패] {res_algo.get('msg')}")
+        except Exception as ex_sl:
+            logger.warning(f"⚠️ [거래소 하드스탑 SL 설치 예외]: {ex_sl}")
+
     async def execute_order(self, payload: WebhookPayload):
         """실제 OKX 시장가 주문. 결과 dict 반환 (status: ok/failed/rejected)."""
         if not self.exchange or not self._lock:
@@ -143,33 +190,68 @@ class BotCOKXSwap:
                 params = {"posSide": "short"}
 
             # [옵션 A] 심볼별 사전 안전 캡 (OKX 51004 사전 방지)
-            base_coin = symbol.split('-')[0]
+            # [Fix] 뇌가 보내는 심볼은 ccxt 포맷("LAB/USDT:USDT")이므로 ccxt_symbol 기준으로 파싱.
+            # (기존 symbol.split('-')는 "-SWAP" 포맷만 매치되어 죽은 코드였고, 클리핑 할당도 누락돼 있었음)
+            base_coin = ccxt_symbol.split('/')[0]
             SYMBOL_MAX_CONTRACTS = {
                 'LAB': 5000,      # 10x 5,800 / 5x 11,600 대비 보수적 안전선
                 'EDEN': 100000,   # 10x 200,000 대비 보수적 안전선
             }
-            if base_coin in SYMBOL_MAX_CONTRACTS and amount > SYMBOL_MAX_CONTRACTS[base_coin]:
+            # [Review Fix] 캡은 신규 진입(BUY/SELL)에만 적용. 청산 수량을 클리핑하면
+            # 캡 초과 대형 포지션(예: EDEN 131k+) 청산 시 잔여 포지션이 남는다.
+            if (
+                payload.side in (SideType.BUY, SideType.SELL)
+                and base_coin in SYMBOL_MAX_CONTRACTS
+                and amount > SYMBOL_MAX_CONTRACTS[base_coin]
+            ):
                 logger.warning(
                     f"🛡️ [안전 캡 적용] {ccxt_symbol} 주문 수량 {amount} -> {SYMBOL_MAX_CONTRACTS[base_coin]} (사전 클리핑)"
                 )
+                amount = float(SYMBOL_MAX_CONTRACTS[base_coin])
             # [수정] 주문 전 레버리지 및 마진모드 자동 세팅 (개별 payload 우선, 없으면 환경변수, 기본 isolated)
+            # [Fix] OKX 주문 API의 마진모드 필드는 tdMode. (mgnMode는 set_leverage 전용 파라미터로,
+            # 주문 params에 넣으면 무시되어 기본 cross로 체결되는 버그가 있었음)
             margin_mode = os.getenv("OKX_MARGIN_MODE", "isolated").lower()
-            params["mgnMode"] = margin_mode
+            if payload.side in (SideType.BUY, SideType.SELL):
+                params["tdMode"] = margin_mode
+            else:
+                # [Fix: 전환 과도기 방어] 청산은 실제 보유 포지션의 마진모드를 따른다.
+                # (기존 cross 포지션에 tdMode=isolated 청산을 보내면 51169 '포지션 없음'이
+                #  성공으로 오인되어 유령 청산이 발생하는 것을 방지)
+                try:
+                    _positions = await self.exchange.fetch_positions([ccxt_symbol])
+                    _pos_side_key = params.get("posSide")
+                    _pos = next(
+                        (p for p in _positions
+                         if p.get("side") == _pos_side_key and float(p.get("contracts", 0) or 0) > 0),
+                        None,
+                    )
+                    params["tdMode"] = ((_pos.get("marginMode") or _pos.get("info", {}).get("mgnMode")) if _pos else None) or margin_mode
+                except Exception:
+                    params["tdMode"] = margin_mode
             try:
                 symbol_leverage = {
                     'LAB': 5,
                     'EDEN': 5,
                 }.get(base_coin)
                 leverage = payload.leverage if payload.leverage is not None else (symbol_leverage or int(os.getenv("OKX_LEVERAGE", "10")))
-                await self.exchange.set_leverage(leverage, ccxt_symbol, {"mgnMode": margin_mode})
-                logger.info(f"⚙️ [레버리지 설정] {ccxt_symbol} -> {leverage}x ({margin_mode.capitalize()})")
+                # [Fix] hedge(long/short) 모드에서 isolated 레버리지 설정은 posSide 필수 (51000 방지)
+                _lev_mode = params.get("tdMode", margin_mode)
+                _lev_params = {"mgnMode": _lev_mode}
+                if _lev_mode == "isolated" and params.get("posSide"):
+                    _lev_params["posSide"] = params["posSide"]
+                await self.exchange.set_leverage(leverage, ccxt_symbol, _lev_params)
+                logger.info(f"⚙️ [레버리지 설정] {ccxt_symbol} -> {leverage}x ({_lev_mode.capitalize()})")
             except Exception as e:
                 logger.warning(f"⚠️ [레버리지 설정 실패] (이미 설정되어 있거나 API 제한일 수 있음): {e}")
 
             max_retries = 3
             last_err = ""
+            # [Fix: 멱등성] clOrdId를 재시도 루프 밖에서 1회만 생성해 모든 시도에서 재사용.
+            # 첫 주문이 실제로 접수됐는데 응답만 유실된 경우, 같은 clOrdId 재전송은
+            # OKX가 중복(51016)으로 거부하므로 이중 체결이 원천 차단된다.
+            cl_ord_id = "kbot" + uuid.uuid4().hex[:20]
             for attempt in range(max_retries):
-                cl_ord_id = None
                 try:
                     start = time.time()
                     
@@ -236,8 +318,7 @@ class BotCOKXSwap:
                                 await asyncio.sleep(0.2)
                             order = orders[-1]
                         else:
-                            # [Fix] clOrdId 부여: 타임아웃 시 체결 여부 확인으로 이중 체결 방지
-                            cl_ord_id = "kbot" + uuid.uuid4().hex[:20]
+                            # [Fix] clOrdId 부여: 체결 여부 확인으로 이중 체결 방지 (루프 밖에서 생성된 ID 재사용)
                             order_params = dict(params)
                             order_params["clOrdId"] = cl_ord_id
                             order = await asyncio.wait_for(
@@ -264,37 +345,7 @@ class BotCOKXSwap:
                     _record_trade(ccxt_symbol, payload.side.value, amount, avg_price, order_id)
 
                     # [CRITICAL FEATURE #1] 진입 성공 시 OKX 거래소 서버측 조건부 하드스탑(SL) 주문 동시 설치
-                    if payload.side in [SideType.BUY, SideType.SELL] and avg_price > 0 and amount > 0:
-                        try:
-                            inst_id = ccxt_symbol.replace("/", "-").split(":")[0] + "-SWAP" if ":" in ccxt_symbol else ccxt_symbol
-                            pos_side = "long" if payload.side == SideType.BUY else "short"
-                            sl_side = "sell" if pos_side == "long" else "buy"
-                            # 마진 -10% 기준 현물 가격 변동폭 (leverage 반영)
-                            price_drop_pct = 0.10 / max(1, leverage)
-                            if pos_side == "long":
-                                sl_price = avg_price * (1.0 - price_drop_pct)
-                            else:
-                                sl_price = avg_price * (1.0 + price_drop_pct)
-                            sl_price_str = self.exchange.price_to_precision(ccxt_symbol, sl_price)
-
-                            algo_params = {
-                                "instId": inst_id,
-                                "tdMode": margin_mode,
-                                "side": sl_side,
-                                "posSide": pos_side,
-                                "ordType": "conditional",
-                                "sz": str(amount),
-                                "slTriggerPx": str(sl_price_str),
-                                "slOrdPx": "-1",
-                                "slTriggerPxType": "last"
-                            }
-                            res_algo = await self.exchange.request("trade/order-algo", api="private", method="POST", params=algo_params)
-                            if res_algo.get("code") == "0":
-                                logger.info(f"🛡️ [거래소 하드스탑 SL 설치 성공] {ccxt_symbol} {pos_side} @ {sl_price_str} (손절폭: -{price_drop_pct*100:.2f}%)")
-                            else:
-                                logger.warning(f"⚠️ [거래소 하드스탑 SL 응답 실패] {res_algo.get('msg')}")
-                        except Exception as ex_sl:
-                            logger.warning(f"⚠️ [거래소 하드스탑 SL 설치 예외]: {ex_sl}")
+                    await self._install_hard_stop(ccxt_symbol, payload.side, amount, avg_price, leverage, margin_mode)
 
                     return {"status": "ok", "order_id": order_id, "price": avg_price}
                 except asyncio.TimeoutError:
@@ -313,6 +364,11 @@ class BotCOKXSwap:
                                 )
                                 _record_trade(ccxt_symbol, payload.side.value, amount,
                                               existing.get("average") or 0, ex_id)
+                                # [Review Fix] 멱등성 성공 경로도 거래소측 하드스탑 SL 설치
+                                await self._install_hard_stop(
+                                    ccxt_symbol, payload.side, amount,
+                                    float(existing.get("average") or 0), leverage, margin_mode
+                                )
                                 return {"status": "ok", "order_id": ex_id}
                         except Exception as lookup_err:
                             logger.warning(f"⚠️ 타임아웃 주문 조회 실패 (재시도 진행): {lookup_err}")
@@ -324,6 +380,29 @@ class BotCOKXSwap:
                     if "51023" in last_err or "51169" in last_err:
                         logger.info("✅ 포지션이 이미 존재하지 않거나 청산 완료됨 (성공으로 간주)")
                         return {"status": "ok", "order_id": "already_closed"}
+
+                    # [Fix: 멱등성] 타임아웃이 아닌 예외(커넥션 리셋 등)나 clOrdId 중복(51016)도
+                    # 첫 주문이 이미 접수됐을 수 있음 → 재시도 전 체결 여부를 조회해 이중 체결 방지
+                    if payload.side in (SideType.BUY, SideType.SELL):
+                        try:
+                            existing = await self.exchange.fetch_order(
+                                cl_ord_id, ccxt_symbol, params={"clOrdId": cl_ord_id}
+                            )
+                            if existing and existing.get("status") in ("closed", "open"):
+                                ex_id = existing.get("id", "N/A")
+                                logger.info(
+                                    f"✅ 예외 발생했으나 주문이 이미 접수/체결됨 (clOrdId: {cl_ord_id}) — 성공 처리"
+                                )
+                                _record_trade(ccxt_symbol, payload.side.value, amount,
+                                              existing.get("average") or 0, ex_id)
+                                # [Review Fix] 멱등성 성공 경로도 거래소측 하드스탑 SL 설치
+                                await self._install_hard_stop(
+                                    ccxt_symbol, payload.side, amount,
+                                    float(existing.get("average") or 0), leverage, margin_mode
+                                )
+                                return {"status": "ok", "order_id": ex_id}
+                        except Exception:
+                            pass  # 조회 실패 = 미접수로 간주하고 기존 에러 분기 계속
 
                     # [Fix] 51008 증거금 부족: 재시도 무의미 → 즉시 중단
                     if "51008" in last_err:
@@ -351,6 +430,9 @@ class BotCOKXSwap:
                                         f"수량 {amount} → {allowed:.0f} 축소 후 재시도"
                                     )
                                     amount = allowed
+                                    # [Review Fix] 수량이 달라진 재시도는 논리적으로 새 주문 —
+                                    # 새 clOrdId 발급 (거부된 주문의 ID가 거래소에 등록된 경우 중복 거부 방지)
+                                    cl_ord_id = "kbot" + uuid.uuid4().hex[:20]
                                     continue
                             except Exception as clamp_err:
                                 logger.warning(f"⚠️ [51004] 한도 파싱/재시도 준비 실패: {clamp_err}")
@@ -592,7 +674,9 @@ async def handle_close_all(request):
 
 async def main():
     await bot.init()
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8013
+    # [Fix] 클론 디렉토리 간 파일 동기화로 기본 포트가 통일되는 사고 방지:
+    # 인자 > BOT_C_PORT(.env) > 8013 순으로 결정. 각 시스템 .env에 BOT_C_PORT 지정 필수.
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.getenv("BOT_C_PORT", "8013"))
     app = web.Application()
     app.router.add_post("/webhook", handle_webhook)
     app.router.add_get("/health", handle_health)
