@@ -123,4 +123,38 @@ python3 final_backtest_all.py
 python3 run_comparison_yesterday.py
 ```
 
+---
+
+## 🛡️ 7. 리스크 파라미터 (2026-09-03 실거래 분석 반영)
+
+08-30~09-03 실거래 51건(승률 5.9%, PF 0.19, 중앙 보유 1.8h) 분석 결과를 반영한 설정입니다. 모두 `.env`로 제어합니다.
+
+| 변수 | 기본값 | 설명 |
+|---|---|---|
+| `OKX_ATR_STOP_K` | `2.5` | 스탑 = 진입가 ∓ K×ATR(확정 캔들). 고정 마진% 스탑(SOFT_STOP/POSITION_LOSS_LIMIT) 대체 |
+| `OKX_ATR_STOP_MIN_PCT` | `0.02` | 스탑 거리 최소값 (가격 비율) |
+| `OKX_RISK_PER_TRADE` | `0.005` | 트레이드당 리스크 예산 = 자산 비율. 사이즈 = 예산 / 스탑거리 / 레버리지 |
+| `OKX_HARD_STOP_LOSS` | `-0.30` | 최후 방어선 (마진 기준). ATR 스탑보다 넣게 유지할 것 |
+| `OKX_MAX_ENTRIES_PER_HOUR` / `OKX_MAX_ENTRIES_PER_DAY` | `2` / `6` | 신규 자본 투입 속도 제한 (08-31 하루 28건 재발 방지) |
+| `OKX_BLOCK_WEEKEND` | `true` | UTC 토·일 신규 진입 차단 (청산은 정상) |
+| `OKX_LIQUIDITY_DEPTH_MULT` / `OKX_LIQUIDITY_MAX_SLIP` | `2.0` / `0.001` | 최우선호가 ±0.1% 안에 내 노셔널의 2배 깊이 없으면 진입 스킵 |
+| `OKX_SHORTS_ENABLED` | `false` | 숏 신규/재진입/플립 전면 스위치 (실거래 숏 PF 0.09) |
+| `OKX_FLIP_ON_TRAILING_CLOSE` | `false` | 메이저 트레일링 청산 시 반대 진입 (왕복 원인으로 기본 off) |
+| `OKX_REENTRY_COOLDOWN_CANDLES` | `16` | 재진입 쿨다운 (기존 4) |
+| `OKX_HARD_STOP_COOLDOWN_HOURS` | `24` | 손절 후 같은 종목 재진입 쿨다운 (기존 12) |
+| `OKX_ATR_TRAIL_ARM_PNL` / `OKX_ATR_TRAIL_K` | `0.06` / `3.0` | 트레일링 가동 마진수익 / 샹들리에 K (기존 0.20은 3x에서 미도달) |
+| `OKX_HEALTH_CB` / `OKX_HEALTH_CB_LOOKBACK` / `OKX_HEALTH_CB_MIN_PF` / `OKX_HEALTH_CB_MIN_WR` | `true` / `20` / `0.8` / `0.15` | 최근 20건 PF<0.8 또는 승률<15% → 24h 신규 진입 정지 |
+
+**신호 판정은 확정 캔들(-2) 기준**으로 변경되었습니다. 가격 참조(PnL/스탑/트레일링)만 진행 캔들 종가를 사용합니다.
+
+### 배포 후 검증 절차 (소액 1주)
+```ini
+OKX_RISK_PER_TRADE=0.002
+OKX_MIN_POSITION_MARGIN=30
+```
+1. 위 값으로 1주 가동 후 `python3 analyze_last5d.py --since <배포일>` 실행.
+2. 승률 ≥ 25%, PF ≥ 1.0, 중앙 보유시간 ≥ 4h 확인 시 `OKX_RISK_PER_TRADE=0.005`로 상향.
+3. `auto_tune_config.json`의 `blacklisted_symbols.OKX`는 daily_analyzer 버그 수정 전 데이터로 오염됐을 수 있으니 배포 시 뱄 것.
+4. `quant_system_20x/`, `quant_system_dontworry/`는 검증 완료 후 동기화.
+
 기타 봇의 세부적인 수정 로직이나 업데이트 기록은 `_archive/obsidian_quant_dev_log.md`를 참고해 주세요. 화이팅! 🚀

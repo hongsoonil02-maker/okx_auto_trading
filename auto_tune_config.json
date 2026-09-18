@@ -4,18 +4,21 @@
   "blacklisted_symbols": {
     "OKX": [
       "APR/USDT:USDT",
+      "GPS/USDT:USDT",
       "LTC/USDT:USDT",
       "SKDD/USDT:USDT",
       "SPX/USDT:USDT",
       "STX/USDT:USDT",
-      "UB/USDT:USDT"
+      "UB/USDT:USDT",
+      "VIRTUAL/USDT:USDT",
+      "XLM/USDT:USDT"
     ]
   },
   "okx_params": {
-    "TRAILING_PCT": 0.015,
-    "HARD_SL_PCT": 0.03,
-    "ORB_LOOKBACK": 4,
-    "POSITION_PCT": 0.18,
+    "TRAILING_PCT": 0.02,
+    "HARD_SL_PCT": 0.30,
+    "ORB_LOOKBACK": 6,
+    "POSITION_PCT": 0.05,
     "OKX_MIN_RANGE_PCT": 0.6,
     "OKX_ENTRY_BUFFER_PCT": 0.0004,
     "OKX_MIN_MOMENTUM_PCT": 0.0003

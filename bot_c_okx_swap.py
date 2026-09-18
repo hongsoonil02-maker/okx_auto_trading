@@ -95,7 +95,8 @@ class BotCOKXSwap:
             await self.exchange.close()
 
     async def _install_hard_stop(self, ccxt_symbol: str, payload_side, amount: float,
-                                 avg_price: float, leverage: int, margin_mode: str):
+                                 avg_price: float, leverage: int, margin_mode: str,
+                                 stop_pct: float = None):
         """[CRITICAL FEATURE #1] 진입 성공 시 OKX 거래소 서버측 조건부 하드스탑(SL) 설치.
         일반 성공 경로와 멱등성(타임아웃/예외 후 체결 확인) 성공 경로 모두에서 호출한다."""
         if payload_side not in (SideType.BUY, SideType.SELL) or amount <= 0:
@@ -114,8 +115,12 @@ class BotCOKXSwap:
             inst_id = ccxt_symbol.replace("/", "-").split(":")[0] + "-SWAP" if ":" in ccxt_symbol else ccxt_symbol
             pos_side = "long" if payload_side == SideType.BUY else "short"
             sl_side = "sell" if pos_side == "long" else "buy"
-            # 마진 -10% 기준 현물 가격 변동폭 (leverage 반영)
-            price_drop_pct = 0.10 / max(1, leverage)
+            # [Fix] 브레인이 보낸 ATR 스탑 거리(가격 비율) 뒤 20% 여유에 거래소 SL 설치 (브레인 스탑이 우선, 거래소 SL은 백업).
+            # stop_pct 미전달(구버전 브레인) 시 기존 마진 -10% 기준 폴백.
+            if stop_pct and stop_pct > 0:
+                price_drop_pct = float(stop_pct) * 1.2
+            else:
+                price_drop_pct = 0.10 / max(1, leverage)
             if pos_side == "long":
                 sl_price = avg_price * (1.0 - price_drop_pct)
             else:
@@ -131,7 +136,8 @@ class BotCOKXSwap:
                 "sz": str(amount),
                 "slTriggerPx": str(sl_price_str),
                 "slOrdPx": "-1",
-                "slTriggerPxType": "last"
+                "slTriggerPxType": "mark",
+                "reduceOnly": True
             }
             res_algo = await self.exchange.request("trade/order-algo", api="private", method="POST", params=algo_params)
             if res_algo.get("code") == "0":
@@ -291,8 +297,9 @@ class BotCOKXSwap:
                                 await asyncio.sleep(0.2)
                             order = {"id": "chunked_close"}
                         else:
+                            close_params = {"marginMode": params.get("tdMode", "isolated")}
                             order = await asyncio.wait_for(
-                                self.exchange.close_position(ccxt_symbol, side=pos_side),
+                                self.exchange.close_position(ccxt_symbol, side=pos_side, params=close_params),
                                 timeout=10.0
                             )
                     else:
@@ -345,7 +352,8 @@ class BotCOKXSwap:
                     _record_trade(ccxt_symbol, payload.side.value, amount, avg_price, order_id)
 
                     # [CRITICAL FEATURE #1] 진입 성공 시 OKX 거래소 서버측 조건부 하드스탑(SL) 주문 동시 설치
-                    await self._install_hard_stop(ccxt_symbol, payload.side, amount, avg_price, leverage, margin_mode)
+                    await self._install_hard_stop(ccxt_symbol, payload.side, amount, avg_price, leverage, margin_mode,
+                                                  stop_pct=getattr(payload, "stop_pct", None))
 
                     return {"status": "ok", "order_id": order_id, "price": avg_price}
                 except asyncio.TimeoutError:
@@ -367,7 +375,8 @@ class BotCOKXSwap:
                                 # [Review Fix] 멱등성 성공 경로도 거래소측 하드스탑 SL 설치
                                 await self._install_hard_stop(
                                     ccxt_symbol, payload.side, amount,
-                                    float(existing.get("average") or 0), leverage, margin_mode
+                                    float(existing.get("average") or 0), leverage, margin_mode,
+                                    stop_pct=getattr(payload, "stop_pct", None)
                                 )
                                 return {"status": "ok", "order_id": ex_id}
                         except Exception as lookup_err:
@@ -376,8 +385,17 @@ class BotCOKXSwap:
                     last_err = str(e)
                     logger.error(f"⚠️ OKX API 에러 (시도 {attempt+1}/{max_retries}): {e}")
 
-                    # [FIX] 이미 청산되었거나 포지션이 없는 경우 (51023, 51169) 에러 무시하고 성공 처리
+                    # [FIX] 이미 청산되었거나 포지션이 없는 경우 (51023, 51169)
                     if "51023" in last_err or "51169" in last_err:
+                        try:
+                            _cur_pos = await self.exchange.fetch_positions([ccxt_symbol])
+                            _act = [p for p in _cur_pos if float(p.get("contracts", 0) or 0) > 0 and p.get("side") == params.get("posSide")]
+                            if _act:
+                                logger.error(f"❌ [청산 불일치] 51023 에러이나 {ccxt_symbol} 실포지션({_act[0].get('contracts')}계약) 잔여 확인! 수동 정리 필요")
+                                send_telegram_alert(f"❌ [Bot C] {ccxt_symbol} 청산 오류(51023) 발생했으나 실포지션({_act[0].get('contracts')}계약) 잔여! 수동 점검 요망")
+                                return {"status": "error", "reason": "position_still_exists"}
+                        except Exception as chk_e:
+                            logger.warning(f"⚠️ 51023 확인 중 포지션 조회 실패: {chk_e}")
                         logger.info("✅ 포지션이 이미 존재하지 않거나 청산 완료됨 (성공으로 간주)")
                         return {"status": "ok", "order_id": "already_closed"}
 
@@ -398,7 +416,8 @@ class BotCOKXSwap:
                                 # [Review Fix] 멱등성 성공 경로도 거래소측 하드스탑 SL 설치
                                 await self._install_hard_stop(
                                     ccxt_symbol, payload.side, amount,
-                                    float(existing.get("average") or 0), leverage, margin_mode
+                                    float(existing.get("average") or 0), leverage, margin_mode,
+                                    stop_pct=getattr(payload, "stop_pct", None)
                                 )
                                 return {"status": "ok", "order_id": ex_id}
                         except Exception:
@@ -410,6 +429,17 @@ class BotCOKXSwap:
                             f"🚫 [증거금 부족] {side.upper()} {amount} {ccxt_symbol} 주문 포기 (재시도 없음)"
                         )
                         return {"status": "failed", "error": "insufficient_margin"}
+
+                    # [Fix] 51155 컴플라이언스/현지 규제 제한: 재시도 무의미 → 즉시 중단
+                    if "51155" in last_err or "compliance restrictions" in last_err.lower():
+                        logger.warning(
+                            f"🚫 [컴플라이언스 제한] {ccxt_symbol} 거래 불가 (51155): 즉시 주문 포기"
+                        )
+                        try:
+                            send_telegram_alert(f"⚠️ [OKX Bot C] {ccxt_symbol} 현지 규제(51155)로 거래 불가 — 주문 즉시 취소")
+                        except Exception:
+                            pass
+                        return {"status": "failed", "error": "compliance_restriction"}
 
                     # [Fix] 51004 포지션 한도 초과: 한도 내로 수량 클램프 후 재시도
                     if "51004" in last_err:

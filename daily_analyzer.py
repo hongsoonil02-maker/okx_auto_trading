@@ -25,7 +25,8 @@ MIN_SAMPLES_PER_MARKET = 5
 
 DEFAULT_OKX_PARAMS = {
     "TRAILING_PCT": 0.03,
-    "HARD_SL_PCT": 0.035,
+    # [Fix] HARD_SL_PCT 최후 방어선 30% (동적 ATR 스탑을 1차 스탑으로 온전히 사용)
+    "HARD_SL_PCT": abs(float(os.getenv("OKX_HARD_STOP_LOSS", "-0.30"))),
     "ORB_LOOKBACK": 4,
     "POSITION_PCT": 0.18,
     "OKX_MIN_RANGE_PCT": 0.6,
@@ -42,7 +43,6 @@ def _apply_regime_tuning(okx_p: dict, volatility_pct: float):
             "OKX_ENTRY_BUFFER_PCT": 0.0006,
             "OKX_MIN_MOMENTUM_PCT": 0.0005,
             "TRAILING_PCT": 0.03,
-            "HARD_SL_PCT": 0.07,
             "ORB_LOOKBACK": 8,
         })
         regime = "High Volatility (Expansion)"
@@ -53,7 +53,6 @@ def _apply_regime_tuning(okx_p: dict, volatility_pct: float):
             "OKX_ENTRY_BUFFER_PCT": 0.0004,
             "OKX_MIN_MOMENTUM_PCT": 0.0003,
             "TRAILING_PCT": 0.015,
-            "HARD_SL_PCT": 0.03,
             "ORB_LOOKBACK": 4,
         })
         regime = "Low Volatility (Tighter Stops)"
@@ -64,7 +63,6 @@ def _apply_regime_tuning(okx_p: dict, volatility_pct: float):
             "OKX_ENTRY_BUFFER_PCT": 0.0004,
             "OKX_MIN_MOMENTUM_PCT": 0.0003,
             "TRAILING_PCT": 0.02,
-            "HARD_SL_PCT": 0.05,
             "ORB_LOOKBACK": 6,
         })
         regime = "Normal Volatility"
@@ -104,30 +102,29 @@ def _load_trades_jsonl(lookback_days: int):
                     continue
                 price = float(price)
 
-                if 'BUY' in side:
-                    # [Fix] DCA 가중평균: 기존 qty × 기존 avg + 신규 qty × 신규 px
-                    pos = sym_pos.get(sym, {'qty': 0.0, 'total_cost': 0.0})
-                    new_qty = pos['qty'] + amount
-                    new_cost = pos['total_cost'] + price * amount
-                    sym_pos[sym] = {'qty': new_qty, 'total_cost': new_cost}
-
-                elif 'CLOSE' in side or 'SELL' in side:
-                    pos = sym_pos.get(sym)
-                    if pos and pos['qty'] > 0 and pos['total_cost'] > 0:
-                        avg_entry = pos['total_cost'] / pos['qty']
-                        pnl_pct = ((price - avg_entry) / avg_entry * 100) if avg_entry else 0.0
-                        # 청산 수량 차감 (부분 청산 지원)
-                        close_qty = amount if amount > 0 else pos['qty']
-                        remaining = max(0.0, pos['qty'] - close_qty)
-                        if remaining > 1e-9:
-                            sym_pos[sym] = {
-                                'qty': remaining,
-                                'total_cost': avg_entry * remaining,
-                            }
-                        else:
-                            sym_pos[sym] = {'qty': 0.0, 'total_cost': 0.0}
+                # [Fix] 헤지모드 정합: SELL은 숏 '진입'이므로 청산으로 취급하지 않고, 포지션은 (symbol, posSide)로 분리,
+                # CLOSE_SHORT는 부호 반전. (기존엔 숏 진입마다 가짜 청산 행 + 숏 수익이 손실로 기록되어
+                #  auto_tune_config 블랙리스트가 오염될 수 있었음)
+                ps = 'short' if side in ('SELL', 'CLOSE_SHORT') else 'long'
+                key = (sym, ps)
+                if side in ('BUY', 'SELL'):
+                    # DCA 가중평균: 기존 qty × 기존 avg + 신규 qty × 신규 px
+                    pos = sym_pos.get(key, {'qty': 0.0, 'total_cost': 0.0})
+                    sym_pos[key] = {'qty': pos['qty'] + amount, 'total_cost': pos['total_cost'] + price * amount}
+                elif side in ('CLOSE_LONG', 'CLOSE_SHORT'):
+                    pos = sym_pos.get(key)
+                    if not pos or pos['qty'] <= 0 or pos['total_cost'] <= 0:
+                        continue  # 진입 기록 없는 청산(거래소 SL/수동) → PnL 산출 불가, 집계 제외
+                    avg_entry = pos['total_cost'] / pos['qty']
+                    sgn = 1 if ps == 'long' else -1
+                    pnl_pct = (price - avg_entry) / avg_entry * 100 * sgn
+                    # 청산 수량 차감 (부분 청산 지원)
+                    close_qty = amount if amount > 0 else pos['qty']
+                    remaining = max(0.0, pos['qty'] - close_qty)
+                    if remaining > 1e-9:
+                        sym_pos[key] = {'qty': remaining, 'total_cost': avg_entry * remaining}
                     else:
-                        pnl_pct = 0.0
+                        sym_pos[key] = {'qty': 0.0, 'total_cost': 0.0}
                     rows.append({
                         'symbol': sym,
                         'market': 'OKX',

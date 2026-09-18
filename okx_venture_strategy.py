@@ -18,9 +18,11 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
     
     # [포트폴리오 & 리스크 튜닝 - alv*** 타이트 손절 원칙]
     PORTFOLIO_WEIGHT = 1.0       # 자본 분산 균형 배분
-    HARD_STOP_LOSS_PCT = -0.10   # [타이트 손절] 마진 기준 -10% 하드스탑 (현물 기준 -2% 컷)
-    SOFT_STOP_LOSS_PCT = -0.07   # [조기 손절] 마진 기준 -7% 소프트 컷
-    PYRAMID_RATIO = 0.50         # 추세 승자 적극 불타기
+    # [Fix] 마진 -10%/-7% 고정 스탑 제거 (3x에서 가격 -2.3% = 알트 30m 1 ATR 안 → 실거래 알트 28건 승률 7%).
+    # 스탑은 BaseStrategyBrain ATR 스탑(OKX_ATR_STOP_K) 사용, HARD_STOP은 env 최후 방어선만 유지.
+    HARD_STOP_LOSS_PCT = float(os.getenv("OKX_HARD_STOP_LOSS", "-0.30"))
+    # [토너먼트 1위 반영] Chandelier_Max_Runner: ARM=0.35, K=3.5 (백테스트 1위: +35.3%, PF 3.92)
+    ATR_TRAIL_ARM_PNL = 0.35
     
     # [백테스트 검증 최적화] 30m 승격 + ADX >= 20 횡보 휩쏘 차단
     # 백테스트 성과: 수익률 +125.3%, PF 1.88, MDD 35.9% (15m 노필터 대비 2.3배 초과수익)
@@ -29,7 +31,7 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
     CHOP_ADX_BLOCK_THRESHOLD = 20.0
     
     STOCK_KEYWORDS = []
-    BLACKLIST = ['KR200', 'SKHYNIX', 'MU', 'SHAZ', 'ISRG', 'ROBO', 'RAM', 'DRAM', 'GME',
+    BLACKLIST = ['KR200', 'SKHYNIX', 'SAMSUNG', 'MU', 'SHAZ', 'ISRG', 'ROBO', 'RAM', 'DRAM', 'GME',
                  'GPS', 'SNXX', 'POL',  # GPS(-64.7%), SNXX(-38.3%), POL(-21.6%) 반복 손실 차단
                  'LIT', 'CHIP', 'BOME', 'FIL',  # [8/26 백테스트] 90일 누적 출혈 상위 알트 차단
                  'CAP']  # [8/26] 5일간 48회 매수 반복 손실 — 무한 재진입 차단
@@ -42,6 +44,7 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
                          'PLTR', 'AMD', 'INTC', 'QCOM', 'BABA', 'UBER', 'ABNB', 'SNAP',
                          'MSTR', 'HOOD', 'RIVN', 'NIO', 'PYPL', 'SQ', 'SHOP',
                          'SPY', 'QQQ', 'IWM', 'DIA', 'GLD', 'SLV', 'XAG',
+                         'SAMSUNG',
                          ]
     # [백테스트 검증] Venture 15m에서 재진입 PF 1.15→1.20 (180일, N=231)
     REENTRY_ENABLED = True

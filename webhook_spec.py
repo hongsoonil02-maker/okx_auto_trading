@@ -88,6 +88,7 @@ class WebhookPayload:
     flag:            Optional[str]   = None   # 보조 플래그
     signal_strength: Optional[str]  = None   # "STRONG" / "WEAK"
     leverage:        Optional[int]   = None   # 개별 전략용 레버리지 오버라이드
+    stop_pct:        Optional[float] = None   # [Fix] 브레인 ATR 스탑 거리(가격 비율) → 실행봇 거래소 SL 정합
     signal_id:       str = ""  # 하위 호환성을 위해 유지
 
     def __post_init__(self):
@@ -124,7 +125,7 @@ class WebhookPayload:
         valid_fields = {f.name for f in fields(cls)}
         filtered_data = {k: v for k, v in data.items() if k in valid_fields}
         if "action" not in filtered_data:
-            raise ValueError("WebhookPayload: 'action' 필드 누락")
+            filtered_data['action'] = ActionType.EXEC.value
         if "side" not in filtered_data:
             raise ValueError("WebhookPayload: 'side' 필드 누락")
         filtered_data['action'] = ActionType(filtered_data['action'])
