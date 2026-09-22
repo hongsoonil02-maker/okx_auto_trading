@@ -161,6 +161,34 @@ class BotCOKXSwap:
                 send_telegram_alert(f"🚫 [Bot C] 블랙리스트 종목 주문 거부: {symbol}")
                 return {"status": "rejected", "reason": "blacklist"}
 
+            # OKX ccxt 심볼 변환: "BTC-USDT-SWAP" → "BTC/USDT:USDT"
+            ccxt_symbol = symbol.replace("-SWAP", "").replace("-", "/", 1)
+            if ":" not in ccxt_symbol:
+                ccxt_symbol = ccxt_symbol + ":USDT"
+
+            # ── [Jev AI Simulation Mode] 실계좌 체결 차단 및 가상 체결 로깅 ──
+            if getattr(payload, "is_simulation", False):
+                try:
+                    _t = await self.exchange.fetch_ticker(ccxt_symbol)
+                    sim_price = float(_t.get("last") or 0.0)
+                except Exception:
+                    sim_price = float(payload.price or payload.target_price or 0.0)
+                ord_type_str = getattr(payload, "order_type", "MARKET")
+                jev_sc = getattr(payload, "jev_score", None)
+                logger.info(
+                    f"📝 [JEV SIMULATION FILL] {payload.side.value} {payload.qty} {ccxt_symbol} "
+                    f"@ {sim_price:.4f} | Type: {ord_type_str} | JevScore: {jev_sc}"
+                )
+                return {
+                    "status": "ok",
+                    "simulation": True,
+                    "symbol": ccxt_symbol,
+                    "side": payload.side.value,
+                    "price": sim_price,
+                    "qty": payload.qty,
+                    "order_type": ord_type_str,
+                }
+
             # ── Last-line defense: reject new entries if max active positions reached ──
             if payload.side in (SideType.BUY, SideType.SELL):
                 single_only = os.getenv("OKX_SINGLE_POSITION_ONLY", "true").lower() == "true"
@@ -174,11 +202,6 @@ class BotCOKXSwap:
                             f"최대 {max_positions}개. 진입 거부: {payload.side.value} {symbol}"
                         )
                         return {"status": "rejected", "reason": "max_positions"}
-
-            # OKX ccxt 심볼 변환: "BTC-USDT-SWAP" → "BTC/USDT:USDT"
-            ccxt_symbol = symbol.replace("-SWAP", "").replace("-", "/", 1)
-            if ":" not in ccxt_symbol:
-                ccxt_symbol = ccxt_symbol + ":USDT"
 
             side = "buy" if payload.side == SideType.BUY else "sell"
             amount = payload.qty  # 계약 수량
@@ -328,12 +351,37 @@ class BotCOKXSwap:
                             # [Fix] clOrdId 부여: 체결 여부 확인으로 이중 체결 방지 (루프 밖에서 생성된 ID 재사용)
                             order_params = dict(params)
                             order_params["clOrdId"] = cl_ord_id
-                            order = await asyncio.wait_for(
-                                self.exchange.create_market_order(
-                                    ccxt_symbol, side, amount, params=order_params
-                                ),
-                                timeout=10.0,
-                            )
+
+                            # ── [Jev Maker Support] Post-Only 지정가 주문 ──
+                            target_px = getattr(payload, "price", None) or getattr(payload, "target_price", None)
+                            is_post_only = (getattr(payload, "order_type", "") == "POST_ONLY" and target_px is not None)
+
+                            if is_post_only:
+                                order_params["ordType"] = "post_only"
+                                try:
+                                    order = await asyncio.wait_for(
+                                        self.exchange.create_order(
+                                            ccxt_symbol, "limit", side, amount, float(target_px), params=order_params
+                                        ),
+                                        timeout=5.0,
+                                    )
+                                    logger.info(f"📌 [POST-ONLY 메이커 접수] {side.upper()} {amount} {ccxt_symbol} @ {target_px}")
+                                except Exception as ex_post:
+                                    logger.warning(f"⚠️ [POST-ONLY 거부/실패: {ex_post}] — 시장가로 안전 폴백")
+                                    order_params.pop("ordType", None)
+                                    order = await asyncio.wait_for(
+                                        self.exchange.create_market_order(
+                                            ccxt_symbol, side, amount, params=order_params
+                                        ),
+                                        timeout=10.0,
+                                    )
+                            else:
+                                order = await asyncio.wait_for(
+                                    self.exchange.create_market_order(
+                                        ccxt_symbol, side, amount, params=order_params
+                                    ),
+                                    timeout=10.0,
+                                )
                         
                     latency = time.time() - start
                     order_id = order.get("id", "N/A")

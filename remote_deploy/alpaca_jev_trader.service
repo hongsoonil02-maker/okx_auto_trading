@@ -1,0 +1,15 @@
+[Unit]
+Description=Alpaca Nasdaq Jev Autonomous Trader
+After=network.target jev_nasdaq.service
+
+[Service]
+Type=simple
+User=hongsoonil02
+WorkingDirectory=/home/hongsoonil02/jev_nasdaq
+ExecStart=/usr/bin/python3 /home/hongsoonil02/jev_nasdaq/alpaca_jev_trader.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

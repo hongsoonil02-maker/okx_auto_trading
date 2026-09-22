@@ -5,3 +5,8 @@ __pycache__/
 .agents/
 *.pid
 state/
+__pycache__/
+*.pyc
+*.pid
+*.log.trimmed
+_archive/compare_leverage_sim.py

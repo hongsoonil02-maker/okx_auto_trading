@@ -90,6 +90,10 @@ class WebhookPayload:
     leverage:        Optional[int]   = None   # 개별 전략용 레버리지 오버라이드
     stop_pct:        Optional[float] = None   # [Fix] 브레인 ATR 스탑 거리(가격 비율) → 실행봇 거래소 SL 정합
     signal_id:       str = ""  # 하위 호환성을 위해 유지
+    order_type:      Optional[str]   = "MARKET"  # "MARKET" or "POST_ONLY"
+    target_price:    Optional[float] = None      # Maker 지정가 호가
+    jev_score:       Optional[float] = None      # Jev AI up_in_10 확률 점수
+    is_simulation:   bool            = False     # Jev 시뮬레이션 모드 여부
 
     def __post_init__(self):
         if not self.signal_id:

@@ -287,6 +287,7 @@ class MasterBotOrchestrator:
                 # ── 포지션 상태 검사 (15개 동시 진입 방지) ──
                 side = signal.get("side", "")
                 symbol = signal.get("symbol", "")
+                is_sim = bool(signal.get("is_simulation", False))
                 active_count = sum(1 for p in self.position_state.values() if p != "FLAT")
 
                 if side in ("BUY", "SELL"):
@@ -294,38 +295,40 @@ class MasterBotOrchestrator:
                     cur_state = self.position_state.get(symbol, "FLAT")
                     is_dca = cur_state == sig_dir  # 같은 방향 보유 중 = 물타기
 
-                    if cur_state != "FLAT" and not is_dca:
-                        logger.warning(
-                            f"🚫 [Master Guard] {symbol} 반대 방향 보유 "
-                            f"({cur_state}). 진입 거부."
-                        )
-                        continue
-                    if is_dca and self.dca_entry_counts.get(symbol, 0) >= self.max_dca_per_symbol:
-                        logger.warning(
-                            f"🚫 [Master Guard] {symbol} DCA {self.max_dca_per_symbol}회 초과. 진입 거부."
-                        )
-                        continue
-                    if cur_state == "FLAT" and self.single_position_only:
-                        if active_count >= self.max_active_subpositions:
+                    if not is_sim:
+                        if cur_state != "FLAT" and not is_dca:
                             logger.warning(
-                                f"🚫 [Master Guard] 활성 포지션 {active_count}개 ≥ "
-                                f"최대 {self.max_active_subpositions}개 제한. "
-                                f"진입 거부: {side} {symbol}"
+                                f"🚫 [Master Guard] {symbol} 반대 방향 보유 "
+                                f"({cur_state}). 진입 거부."
                             )
                             continue
+                        if is_dca and self.dca_entry_counts.get(symbol, 0) >= self.max_dca_per_symbol:
+                            logger.warning(
+                                f"🚫 [Master Guard] {symbol} DCA {self.max_dca_per_symbol}회 초과. 진입 거부."
+                            )
+                            continue
+                        if cur_state == "FLAT" and self.single_position_only:
+                            if active_count >= self.max_active_subpositions:
+                                logger.warning(
+                                    f"🚫 [Master Guard] 활성 포지션 {active_count}개 ≥ "
+                                    f"최대 {self.max_active_subpositions}개 제한. "
+                                    f"진입 거부: {side} {symbol}"
+                                )
+                                continue
 
                     # 순차 라우팅 (병렬 create_task 제거 → 레이스 컨디션 방지)
                     result = await self.route_signal_to_bot(bot_name, signal)
-                    if result.get("status") == "ok" or result.get("order_id"):
-                        self.position_state[symbol] = sig_dir
-                        self.dca_entry_counts[symbol] = self.dca_entry_counts.get(symbol, 0) + 1
-                        if is_dca:
-                            logger.info(
-                                f"✅ [DCA 허용] {symbol} {sig_dir} 물타기 "
-                                f"({self.dca_entry_counts[symbol]}/{self.max_dca_per_symbol})"
-                            )
-                    elif not is_dca:
-                        self.position_state[symbol] = "FLAT"
+                    if not is_sim:
+                        if result.get("status") == "ok" or result.get("order_id"):
+                            self.position_state[symbol] = sig_dir
+                            self.dca_entry_counts[symbol] = self.dca_entry_counts.get(symbol, 0) + 1
+                            if is_dca:
+                                logger.info(
+                                    f"✅ [DCA 허용] {symbol} {sig_dir} 물타기 "
+                                    f"({self.dca_entry_counts[symbol]}/{self.max_dca_per_symbol})"
+                                )
+                        elif not is_dca:
+                            self.position_state[symbol] = "FLAT"
 
                 elif side in ("CLOSE_LONG", "CLOSE_SHORT"):
                     # 청산 신호 (qty=0이면 전량청산, qty>0이면 부분청산 → 포지션 유지)
@@ -334,7 +337,7 @@ class MasterBotOrchestrator:
                         close_qty = float(signal.get("qty", 0) or 0)
                     except (TypeError, ValueError):
                         close_qty = 0
-                    if close_qty == 0:
+                    if not is_sim and close_qty == 0:
                         self.position_state[symbol] = "FLAT"
                         self.dca_entry_counts[symbol] = 0
             

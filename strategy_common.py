@@ -349,7 +349,7 @@ class BaseStrategyBrain:
     # ── [Fix] ATR 스탑 & 트레이드당 리스크 예산 ──
     # 실거래(08-30~09-03) 51건 승률 5.9%, PF 0.19: 고정 마진% 스탑(3x에서 가격 -2%)이 종목 ATR 안에 위치해 노이즈 손절 반복.
     # 스탑 = 진입가 ∓ ATR_STOP_K×ATR(확정 캔들), 사이즈 = 자산×RISK_PER_TRADE / 스탑거리 (레버리지·종목 무관 손실 금액 균일화)
-    ATR_STOP_K = float(os.getenv("OKX_ATR_STOP_K", "2.5"))
+    ATR_STOP_K = float(os.getenv("OKX_ATR_STOP_K", "3.5"))  # [Fix] 2.5→3.5: BTC 30m ATR 기준 1.3%→1.8% 스탑거리, 노이즈 손절 방지
     ATR_STOP_MIN_PCT = float(os.getenv("OKX_ATR_STOP_MIN_PCT", "0.02"))
     RISK_PER_TRADE = float(os.getenv("OKX_RISK_PER_TRADE", "0.005"))
     # ── [Fix] 진입 속도 제한 / 주말 차단 / 호가 깊이 가드 ──
@@ -417,6 +417,22 @@ class BaseStrategyBrain:
         # [Fix] auto_tune_config 파라미터 인스턴스 변수로 로드
         # daily_analyzer.py가 자동 튜닝한 값을 실제 전략 로직에 반영
         self._apply_auto_tune_params()
+
+        # [Jev AI Integration] Sub-second orderbook prediction filter
+        try:
+            from jev.jev_signal_filter import JevSignalFilter
+            self.jev_filter = JevSignalFilter()
+            for h in self.logger.handlers:
+                logging.getLogger("JevSignalFilter").addHandler(h)
+                logging.getLogger("OKX_LOB_Feed").addHandler(h)
+                logging.getLogger("Typesafe_Jev").addHandler(h)
+            logging.getLogger("JevSignalFilter").setLevel(logging.INFO)
+            logging.getLogger("OKX_LOB_Feed").setLevel(logging.INFO)
+            logging.getLogger("Typesafe_Jev").setLevel(logging.INFO)
+            self.logger.info("⚡ [Jev AI] 호가창 서브세컨드 예측 필터 및 웹소켓 피드 장착 완료")
+        except Exception as e:
+            self.logger.warning(f"⚠️ JevSignalFilter 초기화 예외: {e}")
+            self.jev_filter = None
 
     def _apply_auto_tune_params(self):
         """
@@ -998,7 +1014,8 @@ class BaseStrategyBrain:
         if self.exchange:
             await self.exchange.close()
 
-    async def send_webhook(self, side: SideType, symbol: str, qty: float, leverage: int = None, stop_pct: float = None):
+    async def send_webhook(self, side: SideType, symbol: str, qty: float, leverage: int = None, stop_pct: float = None,
+                           order_type: str = "MARKET", target_price: float = None, jev_score: float = None, is_simulation: bool = False):
         if leverage is None:
             # [수정 1] 동적 레버리지 사용
             lev = await self._get_dynamic_leverage()
@@ -1009,9 +1026,14 @@ class BaseStrategyBrain:
             side=side,
             symbol=symbol,
             qty=qty,
+            price=target_price,
             signal_strength="STRONG",
             leverage=lev,
             stop_pct=stop_pct,  # [Fix] 브레인 ATR 스탑 거리 → 실행봇 거래소 SL 정합
+            order_type=order_type,
+            target_price=target_price,
+            jev_score=jev_score,
+            is_simulation=is_simulation,
         )
         json_data = json.loads(payload.to_json())
         json_data["market"] = "okx_swap"
@@ -1084,20 +1106,20 @@ class BaseStrategyBrain:
             t_curr = curr['t']
             px_now = float(live['c'])
             self._df_cache[symbol] = df
-            # [Fix #1/#2] 횡보장/서킷 브레이커 발동 시 자본 투입 전면 차단 (청산·스탑은 계속 동작)
-            # 평균회귀 모드: 횡보장에서 RSI 기반 반대편 진입 허용 (서킷 브레이커만 차단)
-            long_blocked = self._chop_block or self._circuit_open
-            short_blocked = self._chop_block
+            # [Jev AI First-Class Engine] Jev가 1번 판단권자: Jev 활성화 시 레거시 횡보장 차단(_chop_block) 및 EMA50 이중게이트를 바이패스
+            jev_active = bool(hasattr(self, 'jev_filter') and self.jev_filter and self.jev_filter.is_enabled)
+            long_blocked = (self._chop_block if not jev_active else False) or self._circuit_open
+            short_blocked = (self._chop_block if not jev_active else False)
             mr_long_blocked = self._circuit_open  # 평균회귀는 횡보장 차단 없이 진입 가능
             mr_short_blocked = self._circuit_open
             if self._circuit_open:
-                if getattr(self, '_short_regime_ok', False):
+                if getattr(self, '_short_regime_ok', False) or jev_active:
                     short_blocked = False
                 else:
                     short_blocked = True
-            # [K안] 롱 이중 게이트 (BTC 1h EMA50 + 심볼 1h EMA50, 5분 캐시)
-            dual_gate = await self._long_dual_gate_ok(symbol)
-            short_dual_gate = await self._short_dual_gate_ok(symbol)
+            # [K안] 롱/숏 이중 게이트 (Jev 활성화 시 Jev 실시간 호가 수급이 1번이므로 바이패스)
+            dual_gate = True if jev_active else await self._long_dual_gate_ok(symbol)
+            short_dual_gate = True if jev_active else await self._short_dual_gate_ok(symbol)
             dca = self.dca_state.setdefault(symbol, {'entry_count': 0, 'exit_count': 0, 'last_entry_t': 0, 'last_exit_t': 0, 'first_entry_t': 0, 'max_pnl_pct': 0.0})
 
             pos_long = self.auto_active_pos.get((symbol, 'long'))
@@ -1146,8 +1168,8 @@ class BaseStrategyBrain:
             # [버그 수정] curr['v']는 미완성 캔들이라 거래량이 턱없이 부족할 때가 많습니다. 
             # 따라서 직전 완성 캔들(prev['v'])에서 이미 거래량이 터졌거나, 
             # 현재 캔들에서 벌써 거래량 조건을 만족한 경우를 모두 인정합니다.
-            # [Fix] curr가 확정 캔들이므로 미완성 캔들 거래량 보정(위 주석) 불필요 → 단일 조건
-            vol_cond = curr['v'] > prev['vol_ma'] * self.VOL_CONFIRM_MULT
+            # [Fix] Jev 활성화 시 캔들 거래량 지표(vol_cond)로 실시간 호가 수급을 차단하지 않음
+            vol_cond = True if jev_active else (curr['v'] > prev['vol_ma'] * self.VOL_CONFIRM_MULT)
 
             # 기초 시그널 판단
             is_long_breakout = prev['st_d_loose'] == -1 and curr['st_d_loose'] == 1
@@ -1245,16 +1267,30 @@ class BaseStrategyBrain:
             
             _sec_name = self._symbol_sector(symbol)
             is_independent = _sec_name in ('meme', 'new_listing', 'alt')
-            regime_ok = True if is_independent else getattr(self, '_long_regime_ok', True)
-            
-            is_long_sig = (long_score >= ENTRY_THRESHOLD_LONG) and vol_cond and regime_ok and dual_gate
-            is_short_sig = (short_score >= ENTRY_THRESHOLD_SHORT) and vol_cond and getattr(self, '_short_regime_ok', True) and short_dual_gate
-            # [수익성] 베어 숏 게이팅: 불장(BTC>=EMA200)에서 숏 차단 → 숏 손실 원천 방지
-            if self.BEAR_SHORT_ENABLED and is_short_sig and getattr(self, '_long_regime_ok', True):
-                is_short_sig = False
-            # [Fix] 숏 전면 스위치: 실거래 숏 22건 PF 0.09 → 엣지 확인 전까지 기본 비활성 (기존 숏 포지션 청산은 정상 동작)
-            if not self.SHORTS_ENABLED:
-                is_short_sig = False
+            # [Jev AI 결합] Jev가 1번 판단권자: Jev 활성화 시 매크로 EMA200/EMA50 레짐으로 롱/숏을 사전 차단하지 않음
+            jev_active = bool(hasattr(self, 'jev_filter') and self.jev_filter and self.jev_filter.is_enabled)
+            regime_ok = True if (is_independent or jev_active) else getattr(self, '_long_regime_ok', True)
+            regime_short_ok = getattr(self, '_short_regime_ok', True) or jev_active
+            dual_gate_short_ok = short_dual_gate or jev_active
+
+            # [Jev AI First-Class Engine] 실시간 호가창 LOB 불균형 확인
+            lob = self.jev_filter.lob_feed.get_lob(symbol) if (jev_active and hasattr(self.jev_filter, 'lob_feed')) else None
+            lob_imb = lob.imbalance if (lob and not lob.is_stale) else 0.0
+
+            if jev_active:
+                # 1번 판단권자: Jev AI
+                # 미세 모멘텀(점수 30점 이상) 또는 호가 매수 우위(imbalance >= +0.10) 시 즉시 Jev 호가창 AI로 이관하여 최종 진입 결정
+                is_long_sig = (long_score >= 30 or lob_imb >= 0.10) and not self._circuit_open
+                is_short_sig = (short_score >= 30 or lob_imb <= -0.10) and self.SHORTS_ENABLED and not self._circuit_open
+            else:
+                entry_long_thr = ENTRY_THRESHOLD_LONG
+                entry_short_thr = ENTRY_THRESHOLD_SHORT
+                is_long_sig = (long_score >= entry_long_thr) and vol_cond and regime_ok and dual_gate
+                is_short_sig = (short_score >= entry_short_thr) and vol_cond and regime_short_ok and dual_gate_short_ok
+                if self.BEAR_SHORT_ENABLED and is_short_sig and getattr(self, '_long_regime_ok', True):
+                    is_short_sig = False
+                if not self.SHORTS_ENABLED:
+                    is_short_sig = False
             
             default_leverage_long = int(os.getenv("OKX_LEVERAGE", "10"))
             default_leverage_short = int(os.getenv("OKX_SHORT_LEVERAGE", str(default_leverage_long)))
@@ -1266,6 +1302,7 @@ class BaseStrategyBrain:
             take_profit_long_sig = False
             if has_long and avg_price_long > 0:
                 pnl_pct_long = ((px_now - avg_price_long) / avg_price_long) * leverage_long
+                spot_pnl_pct_long = (px_now - avg_price_long) / avg_price_long  # [Fix] 레버리지 제외 가격 비율 — Breakeven 비교용
                 if pnl_pct_long > dca['max_pnl_pct']:
                     dca['max_pnl_pct'] = pnl_pct_long
                 
@@ -1313,9 +1350,10 @@ class BaseStrategyBrain:
                     force_close_long = True
                 elif dca['max_pnl_pct'] >= 0.20 and pnl_pct_long <= 0.05:
                     force_close_long = True
-                elif dca.get('exit_count', 0) >= 1 and pnl_pct_long <= 0.005:
-                    # [개선 #2] 1차 분할 익절 완료 후 잔량 무손실 본전 보존 스탑 (수수료 보전 +0.5%)
-                    self.logger.info(f"🛡️ [Breakeven Stop] 롱 1차 익절 후 본전 보호 전량 청산 (PnL: {pnl_pct_long*100:+.2f}%): {symbol}")
+                elif dca.get('exit_count', 0) >= 1 and spot_pnl_pct_long <= -0.005:
+                    # [Fix] 레버리지 제외 가격 비율 비교: 진입가 대비 -0.5% 하락 시 본전 보호 청산
+                    # (기존: ROE 0.5%로 비교 → 20x에서 가격 0.025% 하락에도 발동하는 버그)
+                    self.logger.info(f"🛡️ [Breakeven Stop] 롱 1차 익절 후 본전 보호 전량 청산 (Spot: {spot_pnl_pct_long*100:+.2f}%, ROE: {pnl_pct_long*100:+.2f}%): {symbol}")
                     force_close_long = True
                 # ── [수익성 개선] 평균회귀 모드 전용 익절/스탑 — 빠른 턴오버 ──
                 if dca.get('mr_mode') and self.MEAN_REVERSION_ENABLED:
@@ -1381,6 +1419,7 @@ class BaseStrategyBrain:
             is_hard_stop_short = False  # [Fix] 미초기화 시 방어청산 경로에서 UnboundLocalError 발생
             if has_short and avg_price_short > 0:
                 pnl_pct_short = ((avg_price_short - px_now) / avg_price_short) * leverage_short
+                spot_pnl_pct_short = (avg_price_short - px_now) / avg_price_short  # [Fix] 레버리지 제외 가격 비율 — Breakeven 비교용
                 if pnl_pct_short > dca['max_pnl_pct']:
                     dca['max_pnl_pct'] = pnl_pct_short
                 
@@ -1424,9 +1463,10 @@ class BaseStrategyBrain:
                     force_close_short = True
                 elif dca['max_pnl_pct'] >= 0.20 and pnl_pct_short <= 0.05:
                     force_close_short = True
-                elif dca.get('exit_count', 0) >= 1 and pnl_pct_short <= 0.005:
-                    # [개선 #2] 1차 분할 익절 완료 후 잔량 무손실 본전 보존 스탑 (수수료 보전 +0.5%)
-                    self.logger.info(f"🛡️ [Breakeven Stop] 숏 1차 익절 후 본전 보호 전량 청산 (PnL: {pnl_pct_short*100:+.2f}%): {symbol}")
+                elif dca.get('exit_count', 0) >= 1 and spot_pnl_pct_short <= -0.005:
+                    # [Fix] 레버리지 제외 가격 비율 비교: 진입가 대비 -0.5% 역행 시 본전 보호 청산
+                    # (기존: ROE 0.5%로 비교 → 20x에서 가격 0.025% 역행에도 발동하는 버그)
+                    self.logger.info(f"🛡️ [Breakeven Stop] 숏 1차 익절 후 본전 보호 전량 청산 (Spot: {spot_pnl_pct_short*100:+.2f}%, ROE: {pnl_pct_short*100:+.2f}%): {symbol}")
                     force_close_short = True
                 # ── [수익성 개선] 평균회귀 모드 전용 익절/스탑 — 빠른 턴오버 (숏) ──
                 if dca.get('mr_mode') and self.MEAN_REVERSION_ENABLED:
@@ -1558,9 +1598,9 @@ class BaseStrategyBrain:
                     else:
                         self.logger.info(f"💨 [Breakeven Stop] 숏 전량 방어 청산: {symbol}")
                     await self.send_webhook(SideType.CLOSE_SHORT, symbol, 0)
-                    # [Flip] 트레일링/방어 청산 시 즉시 롱 진입 (하드스탑 제외, 레짐 필터 적용)
+                    # [Flip] 트레일링/방어 청산 시 즉시 롱 진입 (하드스탑 제외, Jev 활성화 시 레짐 바이패스)
                     flipped = False
-                    if self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_short and not dca.get('mr_mode') and self._long_regime_ok and not short_blocked and dual_gate:
+                    if self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_short and not dca.get('mr_mode') and (self._long_regime_ok or jev_active) and not short_blocked and (dual_gate or jev_active):
                         self.logger.info(f"🔄 [FLIP] 숏 청산 → 롱 반대진입: {symbol} (최고수익: {dca['max_pnl_pct']*100:.0f}%)")
                         await self.execute_auto_entry(symbol, SideType.BUY, entry_type="flip")
                         flipped = True
@@ -1649,7 +1689,7 @@ class BaseStrategyBrain:
                     cooldown_ms = self.REENTRY_COOLDOWN_CANDLES * self.TIMEFRAME_MINUTES * 60 * 1000
                     if (t_curr - dca['last_close_t']) >= cooldown_ms:
                         side_closed = dca.get('last_close_side')
-                        re_long = side_closed == 'long' and curr['st_d_loose'] == 1 and curr['c'] > curr['ema_target'] and self._long_regime_ok and dual_gate
+                        re_long = side_closed == 'long' and curr['st_d_loose'] == 1 and curr['c'] > curr['ema_target'] and (self._long_regime_ok or jev_active) and (dual_gate or jev_active)
                         re_short = side_closed == 'short' and curr['st_d_loose'] == -1 and curr['c'] < curr['ema_target'] and self.SHORTS_ENABLED
                         if re_long or re_short:
                             side = SideType.BUY if re_long else SideType.SELL
@@ -1666,59 +1706,63 @@ class BaseStrategyBrain:
 
                 if is_long_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not long_blocked:
                     self.logger.info(f"🟢 [Scoring System 신규 진입] {symbol} (Score: {long_score})")
-                    await self.execute_auto_entry(symbol, SideType.BUY, entry_type="new", base_score=long_score)
-                    dca['entry_count'] = 1
-                    dca['pyramid_count'] = 0
-                    dca['exit_count'] = 0
-                    dca['last_entry_t'] = t_curr
-                    dca['first_entry_t'] = t_curr
-                    dca['side'] = 'long'
-                    dca['stop_pct'] = self._stop_distance_pct(df)  # [Fix] 진입 시점 ATR 스탑 고정
+                    entered = await self.execute_auto_entry(symbol, SideType.BUY, entry_type="new", base_score=long_score)
+                    if entered:
+                        dca['entry_count'] = 1
+                        dca['pyramid_count'] = 0
+                        dca['exit_count'] = 0
+                        dca['last_entry_t'] = t_curr
+                        dca['first_entry_t'] = t_curr
+                        dca['side'] = 'long'
+                        dca['stop_pct'] = self._stop_distance_pct(df)
                 elif is_short_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not short_blocked:
-                    # [Fix] HTF 추세 필터: 1h EMA50 상승 중이면 숏 진입 차단
+                    # [Fix] HTF 추세 필터: Jev 비활성화 시에만 1h EMA50 체크 (Jev 활성화 시 Jev가 1번 판단권자)
                     htf = await self._check_htf_trend(symbol)
-                    if htf['is_uptrend']:
+                    if not jev_active and htf['is_uptrend']:
                         self.logger.info(
                             f"🚫 [HTF Filter] 숏 진입 차단 — 1h EMA50 상승 중: {symbol} "
                             f"(기울기: {htf['ema_slope']*100:+.2f}%, Score: {short_score})"
                         )
                     else:
                         self.logger.info(f"🔴 [Scoring System 신규 진입] {symbol} (Score: {short_score}, HTF: {htf['ema_slope']*100:+.2f}%)")
-                        await self.execute_auto_entry(symbol, SideType.SELL, entry_type="new", base_score=short_score)
+                        entered = await self.execute_auto_entry(symbol, SideType.SELL, entry_type="new", base_score=short_score)
+                        if entered:
+                            dca['entry_count'] = 1
+                            dca['pyramid_count'] = 0
+                            dca['exit_count'] = 0
+                            dca['last_entry_t'] = t_curr
+                            dca['first_entry_t'] = t_curr
+                            dca['side'] = 'short'
+                            dca['stop_pct'] = self._stop_distance_pct(df)
+
+                # ── [수익성 개선] 평균회귀(Mean-Reversion) 진입 — 레인지 시장용 ──
+                # 횡보장(CHOP)에서 RSI 과매수/과매도 기반 반대편 진입
+                if self.MEAN_REVERSION_ENABLED and is_mean_rev_long_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not mr_long_blocked:
+                    self.logger.info(f"🔄 [Mean-Reversion LONG] {symbol} (RSI 과매도 — 레인지 반등)")
+                    entered = await self.execute_auto_entry(symbol, SideType.BUY, entry_type="mean_rev", base_score=30, mr_mode=True)
+                    if entered:
+                        dca['entry_count'] = 1
+                        dca['pyramid_count'] = 0
+                        dca['exit_count'] = 0
+                        dca['last_entry_t'] = t_curr
+                        dca['first_entry_t'] = t_curr
+                        dca['side'] = 'long'
+                        dca['stop_pct'] = self.MEAN_REVERSION_ATR_K * float(curr['atr']) / float(curr['c']) if 'atr' in df.columns and float(curr['c']) > 0 else self._stop_distance_pct(df)
+                        dca['mr_mode'] = True
+                        dca['mr_entry_t'] = t_curr
+                elif self.MEAN_REVERSION_ENABLED and is_mean_rev_short_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not mr_short_blocked:
+                    self.logger.info(f"🔄 [Mean-Reversion SHORT] {symbol} (RSI 과매수 — 레인지 하락)")
+                    entered = await self.execute_auto_entry(symbol, SideType.SELL, entry_type="mean_rev", base_score=30, mr_mode=True)
+                    if entered:
                         dca['entry_count'] = 1
                         dca['pyramid_count'] = 0
                         dca['exit_count'] = 0
                         dca['last_entry_t'] = t_curr
                         dca['first_entry_t'] = t_curr
                         dca['side'] = 'short'
-                        dca['stop_pct'] = self._stop_distance_pct(df)  # [Fix] 진입 시점 ATR 스탑 고정
-
-                # ── [수익성 개선] 평균회귀(Mean-Reversion) 진입 — 레인지 시장용 ──
-                # 횡보장(CHOP)에서 RSI 과매수/과매도 기반 반대편 진입
-                if self.MEAN_REVERSION_ENABLED and is_mean_rev_long_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not mr_long_blocked:
-                    self.logger.info(f"🔄 [Mean-Reversion LONG] {symbol} (RSI 과매도 — 레인지 반등)")
-                    await self.execute_auto_entry(symbol, SideType.BUY, entry_type="mean_rev", base_score=30, mr_mode=True)
-                    dca['entry_count'] = 1
-                    dca['pyramid_count'] = 0
-                    dca['exit_count'] = 0
-                    dca['last_entry_t'] = t_curr
-                    dca['first_entry_t'] = t_curr
-                    dca['side'] = 'long'
-                    dca['stop_pct'] = self.MEAN_REVERSION_ATR_K * float(curr['atr']) / float(curr['c']) if 'atr' in df.columns and float(curr['c']) > 0 else self._stop_distance_pct(df)
-                    dca['mr_mode'] = True
-                    dca['mr_entry_t'] = t_curr
-                elif self.MEAN_REVERSION_ENABLED and is_mean_rev_short_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not mr_short_blocked:
-                    self.logger.info(f"🔄 [Mean-Reversion SHORT] {symbol} (RSI 과매수 — 레인지 하락)")
-                    await self.execute_auto_entry(symbol, SideType.SELL, entry_type="mean_rev", base_score=30, mr_mode=True)
-                    dca['entry_count'] = 1
-                    dca['pyramid_count'] = 0
-                    dca['exit_count'] = 0
-                    dca['last_entry_t'] = t_curr
-                    dca['first_entry_t'] = t_curr
-                    dca['side'] = 'short'
-                    dca['stop_pct'] = self.MEAN_REVERSION_ATR_K * float(curr['atr']) / float(curr['c']) if 'atr' in df.columns and float(curr['c']) > 0 else self._stop_distance_pct(df)
-                    dca['mr_mode'] = True
-                    dca['mr_entry_t'] = t_curr
+                        dca['stop_pct'] = self.MEAN_REVERSION_ATR_K * float(curr['atr']) / float(curr['c']) if 'atr' in df.columns and float(curr['c']) > 0 else self._stop_distance_pct(df)
+                        dca['mr_mode'] = True
+                        dca['mr_entry_t'] = t_curr
 
         except Exception as e:
             self.logger.error(f"⚠️ [{self.STRATEGY_NAME}] 로직 체크 실패 ({symbol}): {e}")
@@ -1787,12 +1831,14 @@ class BaseStrategyBrain:
             if self.CONVICTION_SIZING_ENABLED and entry_type in ("new", "flip", "reentry"):
                 conv_mult = max(self.CONVICTION_MIN_MULT, min(self.CONVICTION_MAX_MULT, base_score / 70.0))
                 target_margin *= conv_mult
-            # [단계적 배포] 약추세 구간(ADX 소프트 경계~임계값)에서는 축소 사이즈로 참여
-            deploy_scale = getattr(self, '_deploy_scale', 1.0)
-            if deploy_scale < 1.0:
-                target_margin *= deploy_scale
-                if target_margin < self.MIN_POSITION_MARGIN:
-                    return  # 축소해도 최소 마진 미달 시 스킵
+            # [단계적 배포] Jev 미사용 시에만 약추세 구간(ADX 소프트 경계~임계값) 축소 적용
+            jev_active = bool(hasattr(self, 'jev_filter') and self.jev_filter and self.jev_filter.is_enabled)
+            if not jev_active:
+                deploy_scale = getattr(self, '_deploy_scale', 1.0)
+                if deploy_scale < 1.0:
+                    target_margin *= deploy_scale
+                    if target_margin < self.MIN_POSITION_MARGIN:
+                        return  # 축소해도 최소 마진 미달 시 스킵
             # [섹터별 사이즈] 신규상장 0.75x 등 섹터 배수 적용
             sec_size = self._sector_params(symbol).get('size_mult', 1.0)
             if sec_size < 1.0:
@@ -1869,17 +1915,61 @@ class BaseStrategyBrain:
                         return
                     if not await self._liquidity_ok(symbol, side, amount * float(contract_size) * price):
                         return
+
+                order_type = "MARKET"
+                target_price = None
+                jev_score = None
+                is_sim = False
+
+                # [Jev AI Gate & Pricing] 초단타 호가창 예측 평가
+                if hasattr(self, 'jev_filter') and self.jev_filter and is_fresh_capital:
+                    try:
+                        proposed_side_str = "BUY" if side == SideType.BUY else "SELL"
+                        market_prec = market_info.get('precision', {}) if isinstance(market_info, dict) else {}
+                        tick_size = float(market_prec.get('price', 0.1) or 0.1)
+                        jev_res = await self.jev_filter.evaluate_signal(
+                            symbol=symbol,
+                            proposed_side=proposed_side_str,
+                            tick_size=tick_size,
+                            context_note=f"Strategy={self.STRATEGY_NAME}, Type={entry_type}, Lev={leverage}x"
+                        )
+                        if not jev_res.approved:
+                            self.logger.info(
+                                f"🚫 [Jev AI Gate] 진입 차단: {side.value} {symbol} "
+                                f"(점수: {jev_res.jev_score:.3f}, 사유: {jev_res.reason})"
+                            )
+                            return
+
+                        order_type = jev_res.order_type
+                        target_price = jev_res.target_price
+                        jev_score = jev_res.jev_score
+                        is_sim = jev_res.is_simulation
+                        self.logger.info(
+                            f"🤖 [Jev AI 승인] {side.value} {symbol} | 점수: {jev_score:.3f} | "
+                            f"방식: {order_type} @ {target_price} | 지연: {jev_res.latency_ms:.1f}ms | Sim: {is_sim}"
+                        )
+                    except Exception as ex_jev:
+                        self.logger.warning(f"⚠️ Jev 평가 중 예외 (기준 로직으로 진행): {ex_jev}")
+
                 self.logger.info(
                     f"🔥 [{self.STRATEGY_NAME}] 진입 시그널: {side.value} {symbol} "
                     f"(수량: {amount}, 목표마진: {target_margin:.1f} USDT, ATR스탑: {stop_pct*100:.2f}%, 유형: {entry_type})"
                 )
-                await self.send_webhook(side, symbol, amount, leverage=leverage, stop_pct=stop_pct)
-                if is_fresh_capital:
+                await self.send_webhook(
+                    side, symbol, amount, leverage=leverage, stop_pct=stop_pct,
+                    order_type=order_type, target_price=target_price,
+                    jev_score=jev_score, is_simulation=is_sim
+                )
+                if is_fresh_capital and not is_sim:
                     self._entry_log.append(time.time())
                 # [Fix] 사이클 내 후속 신호가 동일 마진을 중복 사용하지 않도록 예약 처리
-                self._reserved_margin += target_margin
+                if not is_sim:
+                    self._reserved_margin += target_margin
+                return True
         except Exception as e:
             self.logger.error(f"⚠️ [{self.STRATEGY_NAME}] 진입 수량 계산 실패 ({symbol}): {e}")
+            return False
+        return False
 
     async def _update_regime(self):
         """
@@ -1887,6 +1977,15 @@ class BaseStrategyBrain:
         로깅은 레짐 전환 시에만 수행 (기존 매 사이클 중복 로그 스팸 제거).
         실패 시 기존 상태 유지(안전 측).
         """
+        jev_active = bool(hasattr(self, 'jev_filter') and self.jev_filter and self.jev_filter.is_enabled)
+        if jev_active:
+            self._long_regime_ok = True
+            self._short_regime_ok = True
+            self._btc_above_ema50_1h = True
+            if not getattr(self, '_jev_logged_supreme', False):
+                self.logger.info("⚡ [Jev AI Supreme] 1번 판단권자 Jev 가동: BTC EMA50/200 및 ADX 게이트 100% 해제 (Jev AI 호가 수급 전권 행사)")
+                self._jev_logged_supreme = True
+            return
         try:
             ohlcv = await self.exchange.fetch_ohlcv('BTC/USDT:USDT', '1h', limit=220)
             if not ohlcv or len(ohlcv) < 200:
@@ -1924,6 +2023,11 @@ class BaseStrategyBrain:
           deploy_scale = clamp(ADX / 25, 0.25, 1.0)
         개별 트레이드 리스크는 포지션손실한도(-15%)가 통제 → 진입은 열어두고 청산이 지킨다.
         """
+        jev_active = bool(hasattr(self, 'jev_filter') and self.jev_filter and self.jev_filter.is_enabled)
+        if jev_active:
+            self._deploy_scale = 1.0
+            return
+
         if not self.CHOP_FILTER_ENABLED:
             self._deploy_scale = 1.0
             return
@@ -2485,7 +2589,21 @@ class BaseStrategyBrain:
 
     async def run_all(self):
         await self.init_session()
+        if hasattr(self, 'jev_filter') and self.jev_filter:
+            try:
+                target_symbols = await self.get_target_symbols()
+                if target_symbols:
+                    self.jev_filter.register_symbols(target_symbols)
+                await self.jev_filter.initialize()
+                self.logger.info(f"⚡ [Jev AI] LOB WebSocket 구독 및 피드 가동 완료 ({len(target_symbols) if target_symbols else 0}개 심볼)")
+            except Exception as ex_jev_init:
+                self.logger.warning(f"⚠️ JevFilter 시작 예외: {ex_jev_init}")
         try:
             await self.run_auto_trade_loop()
         finally:
+            if hasattr(self, 'jev_filter') and self.jev_filter:
+                try:
+                    await self.jev_filter.close()
+                except Exception:
+                    pass
             await self.close_session()

@@ -3,20 +3,19 @@
   "blocked_hours_kst_okx": [],
   "blacklisted_symbols": {
     "OKX": [
-      "APR/USDT:USDT",
-      "GPS/USDT:USDT",
+      "DOGE/USDT:USDT",
+      "DOS/USDT:USDT",
       "LTC/USDT:USDT",
-      "SKDD/USDT:USDT",
+      "SHIB/USDT:USDT",
       "SPX/USDT:USDT",
       "STX/USDT:USDT",
-      "UB/USDT:USDT",
       "VIRTUAL/USDT:USDT",
       "XLM/USDT:USDT"
     ]
   },
   "okx_params": {
     "TRAILING_PCT": 0.02,
-    "HARD_SL_PCT": 0.30,
+    "HARD_SL_PCT": 0.3,
     "ORB_LOOKBACK": 6,
     "POSITION_PCT": 0.05,
     "OKX_MIN_RANGE_PCT": 0.6,

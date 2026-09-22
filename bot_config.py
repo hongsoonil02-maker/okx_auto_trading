@@ -111,6 +111,31 @@ class BotConfig:
     def okx_dca_gap_pct(self) -> float:
         return float(self._okx_params().get("OKX_DCA_GAP_PCT", 0.005))
 
+    # -- Jev AI (Typesafe AI) configuration --
+    @property
+    def use_jev_prediction(self) -> bool:
+        return os.getenv("USE_JEV_PREDICTION", "false").lower() == "true"
+
+    @property
+    def jev_confidence_threshold(self) -> float:
+        return float(os.getenv("JEV_CONFIDENCE_THRESHOLD", "0.65"))
+
+    @property
+    def quote_inside_ticks(self) -> int:
+        return int(os.getenv("QUOTE_INSIDE_TICKS", "1"))
+
+    @property
+    def jev_simulation_mode(self) -> bool:
+        return os.getenv("JEV_SIMULATION_MODE", "true").lower() == "true"
+
+    @property
+    def jev_timeout_ms(self) -> int:
+        return int(os.getenv("JEV_TIMEOUT_MS", "500"))
+
+    @property
+    def jev_fallback_to_baseline(self) -> bool:
+        return os.getenv("JEV_FALLBACK_TO_BASELINE", "true").lower() == "true"
+
     # -- Blocked hours / symbols --
     @property
     def blocked_hours_kst(self) -> List[int]:
