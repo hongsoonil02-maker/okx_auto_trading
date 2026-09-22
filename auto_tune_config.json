@@ -3,12 +3,12 @@
   "blocked_hours_kst_okx": [],
   "blacklisted_symbols": {
     "OKX": [
+      "AAVE/USDT:USDT",
       "DOGE/USDT:USDT",
       "DOS/USDT:USDT",
       "LTC/USDT:USDT",
       "SHIB/USDT:USDT",
       "SPX/USDT:USDT",
-      "STX/USDT:USDT",
       "VIRTUAL/USDT:USDT",
       "XLM/USDT:USDT"
     ]

@@ -83,6 +83,7 @@ class AlpacaJevTrader:
         )
         self.account_info: Dict[str, Any] = {}
         self.positions: Dict[str, Any] = {}
+        self.peak_prices: Dict[str, float] = {}
         self.last_clock_check: float = 0.0
         self.is_market_open: bool = False
         self.next_open_str: str = ""
@@ -94,7 +95,7 @@ class AlpacaJevTrader:
         logger.info(f"   REST Endpoint: {ALPACA_REST_URL}")
         logger.info(f"   Tracked Universe: {', '.join(SYMBOLS_UNIVERSE)}")
         logger.info(f"   Max Positions: {MAX_CONCURRENT_POSITIONS} | Position Sizing: {MAX_POSITION_PCT*100:.1f}%")
-        logger.info(f"   Risk Config: Hard SL -{STOP_LOSS_PCT*100:.1f}%, TP +{TAKE_PROFIT_PCT*100:.1f}%, Trail Arm +{TRAILING_ARM_PCT*100:.1f}%")
+        logger.info("   Risk Config (3x ETF): SL -2.4%, TP +4.2%, Trail Arm +2.0% | (1x Stock): SL -1.2%, TP +2.8%, Trail Arm +1.5%")
         logger.info("=" * 65)
 
     def sync_account(self) -> bool:
@@ -251,6 +252,11 @@ class AlpacaJevTrader:
         q = quotes.get(symbol, {})
         base_price = limit_price or q.get("askPrice") or q.get("bidPrice") or 0.0
 
+        if base_price <= 0:
+            bars = self.fetch_bars(symbol, timeframe="1Min", limit=5)
+            if bars is not None and not bars.empty:
+                base_price = float(bars["close"].iloc[-1])
+
         order_data: Dict[str, Any] = {
             "symbol": symbol,
             "qty": str(qty),
@@ -324,12 +330,28 @@ class AlpacaJevTrader:
             unrealized_plpc = float(pos.get("unrealized_plpc", 0.0)) # Profit percentage
             current_price = float(pos.get("current_price", 0.0))
 
+            if current_price <= 0 and avg_entry > 0:
+                current_price = avg_entry * (1.0 + unrealized_plpc)
+
+            # Update high watermark for trailing stop
+            peak = max(self.peak_prices.get(symbol, current_price), current_price)
+            self.peak_prices[symbol] = peak
+
             sym_sl, sym_tp, sym_arm = get_symbol_risk(symbol)
             q = quotes.get(symbol, {})
             imb = q.get("imbalance", 0.0)
 
+            trail_delta = 0.010 if symbol in LEVERAGED_3X else 0.008
+            max_ret = (peak - avg_entry) / avg_entry if avg_entry > 0 else 0.0
+            trail_drop = (peak - current_price) / peak if peak > 0 else 0.0
+
             # Check if trailing take profit should trigger
-            if unrealized_plpc >= sym_tp:
+            if max_ret >= sym_arm and trail_drop >= trail_delta:
+                logger.info(f"🎯 [Trailing Stop Trigger] {symbol} {side.upper()} reached max +{max_ret*100:.2f}%, dropped {trail_drop*100:.2f}% from peak ${peak:.2f}")
+                self.close_position(symbol, f"TRAILING_STOP_{unrealized_plpc*100:.1f}PCT")
+
+            # Check if hard take profit triggered
+            elif unrealized_plpc >= sym_tp:
                 logger.info(f"🎯 [Take Profit Trigger] {symbol} {side.upper()} reached +{unrealized_plpc*100:.2f}% (Target: {sym_tp*100:.1f}%)")
                 self.close_position(symbol, f"TAKE_PROFIT_{unrealized_plpc*100:.1f}PCT")
 
@@ -346,6 +368,7 @@ class AlpacaJevTrader:
     def close_position(self, symbol: str, reason: str = "MANUAL"):
         """Closes an open position via Alpaca REST API"""
         logger.info(f"🔄 [Closing Position] {symbol} | Reason: {reason}")
+        self.peak_prices.pop(symbol, None)
         if self.simulation_mode:
             logger.info(f"🧪 [SIMULATION EXIT] {symbol} closed successfully | Reason: {reason}")
             self.positions.pop(symbol, None)
@@ -376,7 +399,7 @@ class AlpacaJevTrader:
         quotes = get_quotes_cache()
 
         # Step 1: Scan QQQ benchmark for macro regime
-        qqq_bars = self.fetch_bars("QQQ", timeframe="1Min", limit=55)
+        qqq_bars = self.fetch_bars("QQQ", timeframe="1Min", limit=100)
         qqq_tech = self.calculate_technical_signals(qqq_bars)
         qqq_quote = quotes.get("QQQ", {})
         qqq_imb = qqq_quote.get("imbalance", 0.0)
@@ -407,13 +430,17 @@ class AlpacaJevTrader:
                 continue
 
             # Fetch symbol bars
-            df = self.fetch_bars(sym, timeframe="1Min", limit=30)
+            df = self.fetch_bars(sym, timeframe="1Min", limit=100)
             tech = self.calculate_technical_signals(df)
 
             # Require technical alignment or strong LOB push
             sym_q = quotes.get(sym, {})
             sym_imb = sym_q.get("imbalance", 0.0)
             sym_price = sym_q.get("midPrice") or sym_q.get("askPrice") or 0.0
+
+            # Fallback to candle close if quote cache is not ready
+            if sym_price <= 0 and df is not None and not df.empty:
+                sym_price = float(df["close"].iloc[-1])
 
             if sym_price <= 0:
                 continue

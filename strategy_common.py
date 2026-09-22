@@ -1403,7 +1403,8 @@ class BaseStrategyBrain:
                         dca['pyramid_count'] = 2
                         dca['last_entry_t'] = t_curr
 
-                if dca.get('pyramid_count', 0) >= 1 and pnl_pct_long < 0.20:
+                if dca.get('pyramid_count', 0) >= 1 and pnl_pct_long < 0.05:
+                    self.logger.info(f"🛡️ [Pyramid Stop] 롱 불타기 후 이익 보존 방어 청산: {symbol} (ROE: {pnl_pct_long*100:+.2f}%)")
                     force_close_long = True
 
                 if dca['exit_count'] > 0 and px_now < avg_price_long:
@@ -1513,7 +1514,8 @@ class BaseStrategyBrain:
                         dca['pyramid_count'] = 2
                         dca['last_entry_t'] = t_curr
 
-                if dca.get('pyramid_count', 0) >= 1 and pnl_pct_short < 0.20:
+                if dca.get('pyramid_count', 0) >= 1 and pnl_pct_short < 0.05:
+                    self.logger.info(f"🛡️ [Pyramid Stop] 숏 불타기 후 이익 보존 방어 청산: {symbol} (ROE: {pnl_pct_short*100:+.2f}%)")
                     force_close_short = True
 
                 if dca['exit_count'] > 0 and px_now > avg_price_short:
@@ -1532,9 +1534,10 @@ class BaseStrategyBrain:
                     else:
                         self.logger.info(f"💨 [Breakeven Stop] 롱 전량 방어 청산: {symbol}")
                     await self.send_webhook(SideType.CLOSE_LONG, symbol, 0)
-                    # [Flip] 트레일링/방어 청산 시 즉시 숏 진입 (하드스탑 제외)
+                    # [Flip] 트레일링/방어 청산 시 즉시 숏 진입 (하드스탑 제외, trend_up 상승장 역추세 숏 차단)
                     flipped = False
-                    if self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_long and not long_blocked and not dca.get('mr_mode') and self.SHORTS_ENABLED:
+                    is_bull_season = getattr(self, "SEASON_MODE_STATE", "normal") == "trend_up"
+                    if self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_long and not long_blocked and not dca.get('mr_mode') and self.SHORTS_ENABLED and not is_bull_season:
                         self.logger.info(f"🔄 [FLIP] 롱 청산 → 숏 반대진입: {symbol} (최고수익: {dca['max_pnl_pct']*100:.0f}%)")
                         await self.execute_auto_entry(symbol, SideType.SELL, entry_type="flip")
                         flipped = True
@@ -1598,9 +1601,10 @@ class BaseStrategyBrain:
                     else:
                         self.logger.info(f"💨 [Breakeven Stop] 숏 전량 방어 청산: {symbol}")
                     await self.send_webhook(SideType.CLOSE_SHORT, symbol, 0)
-                    # [Flip] 트레일링/방어 청산 시 즉시 롱 진입 (하드스탑 제외, Jev 활성화 시 레짐 바이패스)
+                    # [Flip] 트레일링/방어 청산 시 즉시 롱 진입 (하드스탑 제외, Jev 활성화 시 레짐 바이패스, trend_down 하락장 역추세 롱 차단)
                     flipped = False
-                    if self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_short and not dca.get('mr_mode') and (self._long_regime_ok or jev_active) and not short_blocked and (dual_gate or jev_active):
+                    is_bear_season = getattr(self, "SEASON_MODE_STATE", "normal") == "trend_down"
+                    if self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_short and not dca.get('mr_mode') and (self._long_regime_ok or jev_active) and not short_blocked and (dual_gate or jev_active) and not is_bear_season:
                         self.logger.info(f"🔄 [FLIP] 숏 청산 → 롱 반대진입: {symbol} (최고수익: {dca['max_pnl_pct']*100:.0f}%)")
                         await self.execute_auto_entry(symbol, SideType.BUY, entry_type="flip")
                         flipped = True

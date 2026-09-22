@@ -403,6 +403,26 @@ class BotCOKXSwap:
                     await self._install_hard_stop(ccxt_symbol, payload.side, amount, avg_price, leverage, margin_mode,
                                                   stop_pct=getattr(payload, "stop_pct", None))
 
+                    # [Orphan SL Cleanup] 청산 주문 성공 후 잔여 포지션이 0이면 거래소 대기 알고 SL 자동 정리
+                    if payload.side in (SideType.CLOSE_LONG, SideType.CLOSE_SHORT):
+                        try:
+                            inst_id = ccxt_symbol.replace("/", "-").split(":")[0] + "-SWAP" if ":" in ccxt_symbol else ccxt_symbol
+                            pos_side = "long" if payload.side == SideType.CLOSE_LONG else "short"
+                            positions = await self.exchange.fetch_positions([ccxt_symbol])
+                            rem_pos = next((p for p in positions if p.get('side') == pos_side and float(p.get('contracts', 0)) > 0), None)
+                            if not rem_pos:
+                                pending_algos = await self.exchange.request(
+                                    "trade/orders-algo-pending", api="private", method="GET",
+                                    params={"instId": inst_id, "ordType": "conditional"}
+                                )
+                                algo_ids = [a["algoId"] for a in pending_algos.get("data", []) if "algoId" in a]
+                                if algo_ids:
+                                    cancel_list = [{"instId": inst_id, "algoId": a_id} for a_id in algo_ids]
+                                    await self.exchange.request("trade/cancel-algos", api="private", method="POST", params=cancel_list)
+                                    logger.info(f"🧹 [청산 완료 잔여 SL 정리] {ccxt_symbol} {len(algo_ids)}건 취소 완료")
+                        except Exception as ex_clean:
+                            logger.debug(f"잔여 SL 정리 예외 (무시): {ex_clean}")
+
                     return {"status": "ok", "order_id": order_id, "price": avg_price}
                 except asyncio.TimeoutError:
                     last_err = f"타임아웃 (시도 {attempt+1}/{max_retries})"
