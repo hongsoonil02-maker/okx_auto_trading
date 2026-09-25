@@ -1311,6 +1311,15 @@ class BaseStrategyBrain:
                 close_long_sig = st_d_long == -1 or curr['c'] < st_v_long
                 force_close_long = False
 
+                # [Jev AI Supreme Scalp Exit] 실시간 호가 수급 기반 조기 탈출 및 칼익절
+                if hasattr(self, 'jev_filter') and self.jev_filter and self.jev_filter.is_enabled:
+                    jev_exit, jev_reason = await self.jev_filter.evaluate_exit(
+                        symbol, "LONG", avg_price_long, px_now, leverage=leverage_long
+                    )
+                    if jev_exit:
+                        self.logger.info(f"⚡ [Jev AI 조기청산] 롱 {symbol} — {jev_reason}")
+                        force_close_long = True
+
                 # [Alpha ①] ATR Chandelier 트레일링: 수익 구간에서 고점 − k×ATR 이탈 시 청산
                 # (철칙 2: 변동성 클수록 ATR이 커져 선이 넓어지는 대신, 가격 이탈 즉시 반응)
                 if self.ATR_TRAILING_ENABLED:
@@ -1428,6 +1437,15 @@ class BaseStrategyBrain:
                 st_d_short = curr['st_d_tight'] if is_profit else curr['st_d_loose']
                 close_short_sig = st_d_short == 1 or curr['c'] > st_v_short
                 force_close_short = False
+
+                # [Jev AI Supreme Scalp Exit] 실시간 호가 수급 기반 조기 탈출 및 칼익절
+                if hasattr(self, 'jev_filter') and self.jev_filter and self.jev_filter.is_enabled:
+                    jev_exit, jev_reason = await self.jev_filter.evaluate_exit(
+                        symbol, "SHORT", avg_price_short, px_now, leverage=leverage_short
+                    )
+                    if jev_exit:
+                        self.logger.info(f"⚡ [Jev AI 조기청산] 숏 {symbol} — {jev_reason}")
+                        force_close_short = True
 
                 # [Alpha ①] ATR Chandelier 트레일링 (숏): 저점 + k×ATR 상향 돌파 시 청산
                 if self.ATR_TRAILING_ENABLED:
