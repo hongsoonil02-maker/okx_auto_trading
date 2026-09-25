@@ -207,7 +207,7 @@ class BaseStrategyBrain:
     # DCA는 평균손실 -199→-274 확대, 피라미딩+20%가드는 승자 절단 → 기본 비활성 (env로 재활성 가능)
     # [Fix] 중복 선언 제거: SCALE_OUT_STEPS는 env 값 하나로 통일
     SCALE_OUT_STEPS = int(os.getenv("OKX_SCALE_OUT_STEPS", "3"))
-    PYRAMIDING_ENABLED = os.getenv("OKX_PYRAMIDING", "false").lower() == "true"
+    PYRAMIDING_ENABLED = os.getenv("OKX_PYRAMIDING", "true").lower() == "true"
     # ── 켈리 공식 포지션 사이징 ──
     # portion = Half-Kelly × f* / 평균손실률, f* = p - (1-p)/b
     KELLY_FRACTION = 0.50          # Half-Kelly (적극적 자본배치)
@@ -227,7 +227,6 @@ class BaseStrategyBrain:
     # ── [Fix #1] 횡보장(Chop) 차단 필터 ──
     # BTC 1h ADX가 임계값 미만이면 신규 자본 투입(진입/DCA/불타기/재진입/플립) 전면 차단.
     # 08-21 꼭지 후 횡보장에서 롱 바이어스 + 물타기 + 재진입 휩소로 -27% 손실 → 재발 방지.
-    # 청산/스탑/익절은 계속 동작 (기존 포지션 관리 유지).
     CHOP_FILTER_ENABLED = os.getenv("OKX_CHOP_FILTER", "true").lower() == "true"
     CHOP_ADX_THRESHOLD = float(os.getenv("OKX_CHOP_ADX", "20"))
     CHOP_ADX_BLOCK_THRESHOLD = float(os.getenv("OKX_CHOP_ADX_BLOCK", "20.0"))
@@ -2030,6 +2029,7 @@ class BaseStrategyBrain:
         jev_active = bool(hasattr(self, 'jev_filter') and self.jev_filter and self.jev_filter.is_enabled)
         if jev_active:
             self._deploy_scale = 1.0
+            self._chop_block = False
             return
 
         if not self.CHOP_FILTER_ENABLED:
@@ -2512,13 +2512,7 @@ class BaseStrategyBrain:
                 self._entry_budget_logged = False
                 symbols = await self.get_target_symbols()
                 if not symbols:
-                    if _config_check_counter % 10 == 1:
-                        self.logger.warning(
-                            f"💓 [HEARTBEAT] 사이클 #{_config_check_counter} | "
-                            f"대상 심볼 0개 — 심볼 로드 실패 또는 필터 조건 미충족"
-                        )
-                    await asyncio.sleep(60)
-                    continue
+                    symbols = []
 
                 positions = await self.exchange.fetch_positions()
                 self.auto_active_pos = {}
@@ -2551,6 +2545,21 @@ class BaseStrategyBrain:
                     except (ValueError, TypeError):
                         pass
 
+                # [보안 패치 2: 고아 포지션 원천 차단]
+                # 계좌에 실제 보유 중인 모든 활성 포지션 심볼은 거래대금 순위/필터 통과 여부와 무관하게
+                # 감시 목록에 무조건 강제 병합하여 익절/손절/트레일링스탑을 끝까지 추적
+                active_symbols = [sym for (sym, _) in self.auto_active_pos.keys() if sym]
+                all_symbols = list(dict.fromkeys(symbols + active_symbols))
+
+                if not all_symbols:
+                    if _config_check_counter % 10 == 1:
+                        self.logger.warning(
+                            f"💓 [HEARTBEAT] 사이클 #{_config_check_counter} | "
+                            f"대상 심볼 0개 — 심볼 로드 실패 또는 필터 조건 미충족"
+                        )
+                    await asyncio.sleep(60)
+                    continue
+
                 # 시장 레짐 필터 갱신 (사이클당 1회, 단일 fetch)
                 await self._update_regime()
                 # [Fix #1/#2] 횡보장 필터 & 서킷 브레이커 갱신 (사이클당 1회)
@@ -2569,7 +2578,7 @@ class BaseStrategyBrain:
                     except Exception:
                         pass
 
-                for symbol in symbols:
+                for symbol in all_symbols:
                     await self.check_auto_logic(symbol)
                     await asyncio.sleep(0.1)
 
@@ -2582,8 +2591,8 @@ class BaseStrategyBrain:
                     pos_count = len(set(sym for sym, _ in self.auto_active_pos.keys()))
                     self.logger.info(
                         f"📊 [DEBUG] 사이클 #{_config_check_counter} | "
-                        f"심볼 수: {len(symbols)} | 포지션: {pos_count}/{self.MAX_OPEN_POSITIONS} | "
-                        f"상위 심볼: {symbols[:3]}"
+                        f"심볼 수: {len(all_symbols)} (타겟: {len(symbols)}, 활성보유: {len(active_symbols)}) | 포지션: {pos_count}/{self.MAX_OPEN_POSITIONS} | "
+                        f"상위 심볼: {all_symbols[:3]}"
                     )
 
             except Exception as e:

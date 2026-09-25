@@ -121,6 +121,20 @@ class BotCOKXSwap:
                 price_drop_pct = float(stop_pct) * 1.2
             else:
                 price_drop_pct = 0.10 / max(1, leverage)
+
+            # [보안 패치 1: SL 청산가 역전 방지 안전 캡]
+            # 격리/교차 마진에서 청산 가격은 대략 진입가 대비 (1.0 - MMR) / leverage (약 0.60~0.80 / leverage).
+            # 따라서 거래소 SL 거리는 어떠한 경우에도 (0.50 / leverage)를 넘을 수 없도록 상한을 강제한다.
+            # (예: 20x -> 최대 2.5%, 10x -> 최대 5.0%, 5x -> 최대 10.0%, 2x -> 최대 25.0%)
+            # 이를 통해 어떠한 극단적 시장 상황에서도 강제 청산 전에 거래소 SL이 무조건 먼저 체결되도록 보장한다.
+            max_safe_sl_pct = 0.50 / max(1, leverage)
+            if price_drop_pct > max_safe_sl_pct:
+                logger.warning(
+                    f"🛡️ [SL 레버리지 캡 적용] {ccxt_symbol} 요청 SL폭({price_drop_pct*100:.2f}%)이 "
+                    f"{leverage}x 청산 안전선({max_safe_sl_pct*100:.2f}%)을 초과하여 {max_safe_sl_pct*100:.2f}%로 강제 제한"
+                )
+                price_drop_pct = max_safe_sl_pct
+
             if pos_side == "long":
                 sl_price = avg_price * (1.0 - price_drop_pct)
             else:
@@ -358,6 +372,7 @@ class BotCOKXSwap:
 
                             if is_post_only:
                                 order_params["ordType"] = "post_only"
+                                post_only_success = False
                                 try:
                                     order = await asyncio.wait_for(
                                         self.exchange.create_order(
@@ -365,10 +380,76 @@ class BotCOKXSwap:
                                         ),
                                         timeout=5.0,
                                     )
-                                    logger.info(f"📌 [POST-ONLY 메이커 접수] {side.upper()} {amount} {ccxt_symbol} @ {target_px}")
+                                    logger.info(
+                                        f"📌 [POST-ONLY 메이커 접수] {side.upper()} {amount} {ccxt_symbol} "
+                                        f"@ {target_px} | ID: {order.get('id')}"
+                                    )
+                                    post_only_success = True
                                 except Exception as ex_post:
-                                    logger.warning(f"⚠️ [POST-ONLY 거부/실패: {ex_post}] — 시장가로 안전 폴백")
+                                    logger.warning(f"⚠️ [POST-ONLY 접수 거부/실패: {ex_post}] — 시장가로 안전 폴백")
+
+                                if post_only_success:
+                                    # ── Post-Only 체결 확인 및 TTL 대기 루프 ──
+                                    post_only_wait_sec = float(os.getenv("OKX_POST_ONLY_WAIT_SEC", "2.5"))
+                                    poll_interval = 0.5
+                                    wait_elapsed = 0.0
+                                    order_id = order.get("id")
+                                    check_ord = order
+
+                                    while wait_elapsed < post_only_wait_sec:
+                                        await asyncio.sleep(poll_interval)
+                                        wait_elapsed += poll_interval
+                                        try:
+                                            check_ord = await self.exchange.fetch_order(order_id, ccxt_symbol)
+                                            st = check_ord.get("status")
+                                            filled_q = float(check_ord.get("filled", 0) or 0)
+                                            if st == "closed" or filled_q >= amount:
+                                                break
+                                        except Exception as fetch_ex:
+                                            logger.debug(f"Post-Only 체결 확인 예외: {fetch_ex}")
+
+                                    filled_qty = float(check_ord.get("filled", 0) or 0)
+                                    status = check_ord.get("status")
+
+                                    if status == "closed" or filled_qty >= amount:
+                                        # 완전 체결 완료
+                                        order = check_ord
+                                        avg_price = float(check_ord.get("average") or target_px)
+                                        logger.info(f"🎯 [POST-ONLY 완전 체결] {side.upper()} {amount} {ccxt_symbol} @ {avg_price:.4f}")
+                                    else:
+                                        # 미체결 또는 부분 체결 -> 잔여 주문 즉시 취소하여 고아 SL 방지
+                                        try:
+                                            await self.exchange.cancel_order(order_id, ccxt_symbol)
+                                            logger.info(f"🧹 [POST-ONLY 잔여 주문 취소] {ccxt_symbol} ID: {order_id} (체결: {filled_qty}/{amount})")
+                                        except Exception as cancel_ex:
+                                            logger.warning(f"⚠️ POST-ONLY 취소 예외: {cancel_ex}")
+
+                                        if filled_qty > 0:
+                                            # 부분 체결된 수량만 포지션으로 인정하고 진행
+                                            order = check_ord
+                                            amount = filled_qty
+                                            avg_price = float(check_ord.get("average") or target_px)
+                                            logger.info(f"⚠️ [POST-ONLY 부분 체결] {amount}계약만 체결 반영 (@ {avg_price:.4f})")
+                                        else:
+                                            # 0건 체결: 시장가 폴백 여부 확인
+                                            fallback_market = os.getenv("OKX_POST_ONLY_FALLBACK_MARKET", "true").lower() == "true"
+                                            if fallback_market:
+                                                logger.info(f"🔄 [POST-ONLY 미체결 폴백] 시장가 대체 주문 실행: {side.upper()} {amount} {ccxt_symbol}")
+                                                order_params.pop("ordType", None)
+                                                order_params["clOrdId"] = "kbot" + uuid.uuid4().hex[:20]
+                                                order = await asyncio.wait_for(
+                                                    self.exchange.create_market_order(
+                                                        ccxt_symbol, side, amount, params=order_params
+                                                    ),
+                                                    timeout=10.0,
+                                                )
+                                            else:
+                                                logger.warning("🚫 [POST-ONLY 미체결 종료] 시장가 폴백 미사용 설정으로 주문 종료 (SL 미설치)")
+                                                return {"status": "cancelled", "reason": "post_only_timeout"}
+                                else:
+                                    # 접수 단계에서 거부된 경우 시장가 폴백
                                     order_params.pop("ordType", None)
+                                    order_params["clOrdId"] = "kbot" + uuid.uuid4().hex[:20]
                                     order = await asyncio.wait_for(
                                         self.exchange.create_market_order(
                                             ccxt_symbol, side, amount, params=order_params
