@@ -27,7 +27,7 @@ from pathlib import Path
 # ═══════════════════════════════════════════════════════════════════════════
 # .env 먼저 로드 (webhook_spec 모듈 레벨 상수 의존성: WEBHOOK_SECRET)
 # ═══════════════════════════════════════════════════════════════════════════
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_BASE_DIR = os.environ.get("QUANT_BASE_DIR", os.getcwd())
 try:
     from env_auto_scanner import auto_load_env
     _ENV_SCANNER = auto_load_env()
@@ -36,7 +36,7 @@ except ImportError:
     _ENV_SCANNER = None
     _ENV_AUTOLOAD_OK = False
     from dotenv import load_dotenv
-    load_dotenv(os.path.join(_BASE_DIR, ".env"))
+    load_dotenv(os.path.join(_BASE_DIR, ".env"), override=False)
 
 from webhook_spec import (
     WebhookPayload, ActionType, SideType,
@@ -45,7 +45,7 @@ from webhook_spec import (
 from bot_config import bot_config
 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = _BASE_DIR
 
 logging.basicConfig(
     level=logging.INFO,
@@ -100,6 +100,13 @@ class MasterBotOrchestrator:
         self.max_dca_per_symbol = bot_config.okx_max_dca
         # [Fix] 헬스 로그 스팸 방지: 상태 전환 시에만 로깅
         self._prev_bot_status: Dict[str, str] = {}
+        # Master Webhook Port
+        from urllib.parse import urlparse
+        master_url = os.getenv("MASTER_WEBHOOK_URL", "http://localhost:8009/webhook")
+        try:
+            self.master_port = int(urlparse(master_url).port or os.getenv("MASTER_PORT", "8009"))
+        except Exception:
+            self.master_port = int(os.getenv("MASTER_PORT", "8009"))
         # [Fix] Sweeper 중복 청산 방지: 심볼별 마지막 스윕 시각
         self._sweep_cooldown: Dict[str, float] = {}
     
@@ -462,7 +469,7 @@ class MasterBotOrchestrator:
             runner = aiohttp.web.AppRunner(app, access_log=None)
             await runner.setup()
             # [Fix] 0.0.0.0 → 127.0.0.1: 브레인/봇 모두 같은 호스트이므로 외부 노출 차단
-            site = aiohttp.web.TCPSite(runner, "127.0.0.1", 8009)
+            site = aiohttp.web.TCPSite(runner, "127.0.0.1", self.master_port)
             try:
                 await site.start()
                 break
@@ -470,10 +477,10 @@ class MasterBotOrchestrator:
                 await runner.cleanup()
                 if attempt == 4:
                     raise e
-                logger.warning(f"⚠️  Master Port 8009 사용 중, 2초 후 재시도... ({attempt+1}/5)")
+                logger.warning(f"⚠️  Master Port {self.master_port} 사용 중, 2초 후 재시도... ({attempt+1}/5)")
                 await asyncio.sleep(2)
         
-        logger.info("✅ Master Webhook 서버 시작: http://127.0.0.1:8009")
+        logger.info(f"✅ Master Webhook 서버 시작: http://127.0.0.1:{self.master_port}")
         
         try:
             await asyncio.Event().wait()

@@ -21,8 +21,8 @@ from dotenv import load_dotenv
 import pandas as pd
 import ccxt.async_support as ccxt_async
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+BASE_DIR = os.environ.get("QUANT_BASE_DIR", os.getcwd())
+load_dotenv(os.path.join(BASE_DIR, ".env"), override=False)
 
 try:
     from webhook_spec import WebhookPayload, ActionType, SideType, sign_payload, WEBHOOK_SIGNATURE_HEADER

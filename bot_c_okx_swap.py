@@ -640,7 +640,7 @@ class BotCOKXSwap:
 
 
 # ── TRADE RECORDER (P3: 실현손익 추적용 체결 기록) ──
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_BASE_DIR = os.environ.get("QUANT_BASE_DIR", os.getcwd())
 _TRADES_FILE = os.path.join(_BASE_DIR, "state", "trades.jsonl")
 
 def _record_trade(symbol: str, side: str, amount: float, price: float, order_id: str):
