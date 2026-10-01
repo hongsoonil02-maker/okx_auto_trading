@@ -4,12 +4,12 @@ cd "$DIR" || exit 1
 
 echo "[$(date)] coinbot cleanup/start 시작 (systemd 기반)"
 
-# 1) 기존 프로세스 정리 (실존하는 파일만)
-pkill -9 -f 'master_bot_orchestrator.py' >/dev/null 2>&1 || true
-pkill -9 -f 'bot_c_okx_swap.py' >/dev/null 2>&1 || true
-pkill -9 -f 'okx_major_strategy.py' >/dev/null 2>&1 || true
-pkill -9 -f 'okx_venture_strategy.py' >/dev/null 2>&1 || true
-pkill -9 -f 'daily_analyzer.py' >/dev/null 2>&1 || true
+# 1) 기존 프로세스 정리 (이 폴더의 프로세스만 — 서브계정 보호)
+pkill -9 -f "$DIR/master_bot_orchestrator.py" >/dev/null 2>&1 || true
+pkill -9 -f "$DIR/bot_c_okx_swap.py" >/dev/null 2>&1 || true
+pkill -9 -f "$DIR/okx_major_strategy.py" >/dev/null 2>&1 || true
+pkill -9 -f "$DIR/okx_venture_strategy.py" >/dev/null 2>&1 || true
+pkill -9 -f "$DIR/daily_analyzer.py" >/dev/null 2>&1 || true
 
 for port in 8000 8001 8005 8009 8013; do
   fuser -k -9 "${port}/tcp" >/dev/null 2>&1 || true

@@ -8,5 +8,7 @@ state/
 __pycache__/
 *.pyc
 *.pid
-*.log.trimmed
-_archive/compare_leverage_sim.py
+*.log*
+remote_deploy/kis_token.json
+remote_deploy/kis_positions.json
+

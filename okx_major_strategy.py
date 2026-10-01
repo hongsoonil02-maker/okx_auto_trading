@@ -36,7 +36,7 @@ class OKXMajorStrategyBrain(BaseStrategyBrain):
     TIMEFRAME_MINUTES = 60
     CHOP_ADX_BLOCK_THRESHOLD = 20.0  # ADX < 20 횡보장 휩쏘 진입 차단
 
-    MAJOR_COINS = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'LINK', 'DOT', 'BNB', 'TRX']
+    MAJOR_COINS = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'LINK', 'DOT', 'SUI', 'TRX']
 
     # [수익성 개선] 트레일링청산 플립 활성화: Major 30m에서 PF 0.76→1.22 (흑자 전환)
     # Venture에서는 악화(1.23→1.13)하므로 Major에만 활성화

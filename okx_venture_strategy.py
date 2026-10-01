@@ -21,20 +21,21 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
     # [Fix] 마진 -10%/-7% 고정 스탑 제거 (3x에서 가격 -2.3% = 알트 30m 1 ATR 안 → 실거래 알트 28건 승률 7%).
     # 스탑은 BaseStrategyBrain ATR 스탑(OKX_ATR_STOP_K) 사용, HARD_STOP은 env 최후 방어선만 유지.
     HARD_STOP_LOSS_PCT = float(os.getenv("OKX_HARD_STOP_LOSS", "-0.30"))
-    # [토너먼트 1위 반영] Chandelier_Max_Runner: ARM=0.35, K=3.5 (백테스트 1위: +35.3%, PF 3.92)
-    ATR_TRAIL_ARM_PNL = 0.35
+    # [Venture V3 업데이트 - User Directive] Jev AI의 초고속 판단력을 활용한 양방향 초단타 스캘핑 모드
+    ATR_TRAIL_ARM_PNL = 0.10   # 10% 수익 발생 시 트레일링 즉시 발동 (스캘핑 특화)
+    ATR_TRAIL_K = 1.5          # 고점 대비 ATR 1.5배 하락 시 칼익절 (매우 타이트하게)
+    FLIP_ON_TRAILING_CLOSE = True # 초단타 스캘핑 핵심: 익절/손절 시 즉각 반대 방향으로 스위칭(양방향 자유자재)
     
-    # [백테스트 검증 최적화] 30m 승격 + ADX >= 20 횡보 휩쏘 차단
-    # 백테스트 성과: 수익률 +125.3%, PF 1.88, MDD 35.9% (15m 노필터 대비 2.3배 초과수익)
-    TIMEFRAME = "30m"
-    TIMEFRAME_MINUTES = 30
-    CHOP_ADX_BLOCK_THRESHOLD = 20.0
+    # [Venture V3 업데이트] 1h의 둔한 움직임 폐기, 15m 초단타로 복귀
+    TIMEFRAME = "15m"
+    TIMEFRAME_MINUTES = 15
+    CHOP_ADX_BLOCK_THRESHOLD = 15.0 # 횡보장 차단 기준 대폭 완화 (횡보장에서도 단타 진입)
     
     STOCK_KEYWORDS = []
     BLACKLIST = ['KR200', 'SKHYNIX', 'SAMSUNG', 'MU', 'SHAZ', 'ISRG', 'ROBO', 'RAM', 'DRAM', 'GME',
                  'GPS', 'SNXX', 'POL',  # GPS(-64.7%), SNXX(-38.3%), POL(-21.6%) 반복 손실 차단
                  'LIT', 'CHIP', 'BOME', 'FIL',  # [8/26 백테스트] 90일 누적 출혈 상위 알트 차단
-                 'CAP']  # [8/26] 5일간 48회 매수 반복 손실 — 무한 재진입 차단
+                 'CAP', 'HYPE']  # [8/26] 5일간 48회 매수 반복 손실 — 무한 재진입 차단 / [9/28] 28연패 차단
     # 주식/상품 토큰 전부 제외 (주식 전용 봇과 중복 거래 방지)
     MAJORS_AND_STOCKS = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'LINK', 'DOT', 'BNB', 'TRX',
                          'TSLA', 'NVDA', 'AAPL', 'AMZN', 'MSFT', 'META', 'GOOG', 'GOOGL', 'COIN',

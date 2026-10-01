@@ -80,7 +80,7 @@ class MasterBotOrchestrator:
     # Currently active bots on this server:
     #   Bot C (OKX): port 8013 (실거래)
     BOT_ENDPOINTS = {
-        "Bot C (OKX)": "http://localhost:8013",
+        "Bot C (OKX)": f"http://localhost:{os.getenv('BOT_C_PORT', '8013')}",
     }
     
     def __init__(self):
@@ -118,6 +118,13 @@ class MasterBotOrchestrator:
                     if bot_file in registry:
                         port = registry[bot_file]
                         self.BOT_ENDPOINTS[bot_name] = f"http://localhost:{port}"
+
+            # .env의 BOT_C_PORT 오버라이드
+            bot_c_port = os.getenv("BOT_C_PORT")
+            if bot_c_port:
+                for bot_name in list(self.BOT_ENDPOINTS.keys()):
+                    if "Bot C" in bot_name:
+                        self.BOT_ENDPOINTS[bot_name] = f"http://localhost:{bot_c_port}"
             
             # 원격 GCP 봇 IP 덮어쓰기 (하이브리드 분산 라우팅)
             gcp_1_ip = os.environ.get("GCP_1_IP")
