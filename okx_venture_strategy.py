@@ -37,7 +37,7 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
                  'LIT', 'CHIP', 'BOME', 'FIL',  # [8/26 백테스트] 90일 누적 출혈 상위 알트 차단
                  'CAP', 'HYPE']  # [8/26] 5일간 48회 매수 반복 손실 — 무한 재진입 차단 / [9/28] 28연패 차단
     # 주식/상품 토큰 전부 제외 (주식 전용 봇과 중복 거래 방지)
-    MAJORS_AND_STOCKS = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'LINK', 'DOT', 'BNB', 'TRX',
+    MAJORS_AND_STOCKS = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'LINK', 'DOT', 'BNB', 'TRX', 'SUI',
                          'TSLA', 'NVDA', 'AAPL', 'AMZN', 'MSFT', 'META', 'GOOG', 'GOOGL', 'COIN',
                          'SPCX', 'OPENAI', 'ANTHROPIC', 'RDDT', 'MU', 'SNDK', 'SOXL', 'SOXS', 'XAU', 'CL',
                          # [Fix] 주식/ETF 토큰 추가 — 크립토와 다른 가격 패턴, 숏 구조적 불리

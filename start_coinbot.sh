@@ -2,28 +2,36 @@
 DIR="/home/hongsoonil02/quant_system"
 cd "$DIR" || exit 1
 
-echo "[$(date)] coinbot cleanup/start 시작 (systemd 기반)"
+echo "=========================================================================="
+echo "[$(date)] Main Account (Major + Venture Dual Engine) 가동 시작"
+echo "=========================================================================="
 
-# 1) 기존 프로세스 정리 (이 폴더의 프로세스만 — 서브계정 보호)
+# 1) Preflight Self-Test
+echo "🔍 [1/3] 봇 사전 자가진단(Preflight Self-Test) 실행 중..."
+python3 "$DIR/preflight_check.py" --env "$DIR/.env"
+if [ $? -ne 0 ]; then
+  echo "🚨 Pre-flight 진단 실패로 봇 가동을 즉시 중단합니다. 위 에러를 확인하세요."
+  exit 1
+fi
+
+# 2) 잔여 프로세스 정리 (메인 전용 포트 8010, 8015만 정리 - 서브계정 보호)
+echo "🧹 [2/3] 기존 잔여 프로세스 및 포트 정리 중..."
 pkill -9 -f "$DIR/master_bot_orchestrator.py" >/dev/null 2>&1 || true
 pkill -9 -f "$DIR/bot_c_okx_swap.py" >/dev/null 2>&1 || true
 pkill -9 -f "$DIR/okx_major_strategy.py" >/dev/null 2>&1 || true
 pkill -9 -f "$DIR/okx_venture_strategy.py" >/dev/null 2>&1 || true
-pkill -9 -f "$DIR/daily_analyzer.py" >/dev/null 2>&1 || true
 
-for port in 8000 8001 8005 8009 8013; do
+for port in 8010 8015; do
   fuser -k -9 "${port}/tcp" >/dev/null 2>&1 || true
 done
-sleep 2
-
-# 2) stale pidfile 정리
 rm -f bot_c_okx_swap.pid || true
+sleep 1
 
-# 3) Systemd 서비스들 시작
-echo "Systemd 기반 봇들을 시작합니다..."
+# 3) Systemd 서비스 시작
+echo "🚀 [3/3] Main Dual Strategy (Major + Venture), Orchestrator 및 Bot C 시작 중..."
 systemctl --user daemon-reload
-systemctl --user start master_bot_orchestrator bot_c_okx_swap okx_major_strategy okx_venture_strategy
+systemctl --user start bot_c_okx_swap master_bot_orchestrator okx_major_strategy okx_venture_strategy
 
 sleep 2
-echo "✅ Coinbot 프로세스 구동 완료!"
-ss -tlnp | grep -E ':(8000|8001|8009|8013)' || true
+echo "✅ Main Account (Major + Venture 1+2) 구동 완료!"
+ss -tlnp | grep -E ':(8010|8015)' || true
