@@ -103,6 +103,58 @@ class TestEndToEndSimulation(unittest.IsolatedAsyncioTestCase):
 
         await filter_engine.close()
 
+    async def test_post_only_unfilled_cancels_and_prevents_orphan_sl(self):
+        """Verify that unfilled Post-Only orders are cancelled and do NOT install orphan SL when fallback is disabled."""
+        os.environ["OKX_POST_ONLY_WAIT_SEC"] = "0.2"
+        os.environ["OKX_POST_ONLY_FALLBACK_MARKET"] = "false"
+
+        payload = WebhookPayload(
+            action=ActionType.EXEC,
+            side=SideType.BUY,
+            symbol="BTC-USDT-SWAP",
+            qty=0.05,
+            price=80500.1,
+            order_type="POST_ONLY",
+            target_price=80500.1,
+            jev_score=0.75,
+            is_simulation=False,  # Live execution path
+        )
+
+        bot_c = BotCOKXSwap()
+        bot_c._lock = asyncio.Lock()
+
+        cancelled_orders = []
+        installed_sl = []
+
+        class MockExchangeLive:
+            def __init__(self):
+                self.markets = {"BTC/USDT:USDT": {"info": {"maxMktSz": 100}}}
+            async def load_markets(self):
+                pass
+            async def fetch_positions(self, symbols=None):
+                return []
+            async def create_order(self, symbol, type, side, amount, price, params=None):
+                return {"id": "ord_mock_123", "status": "open", "filled": 0.0, "price": price}
+            async def fetch_order(self, order_id, symbol):
+                return {"id": order_id, "status": "open", "filled": 0.0, "price": 80500.1}
+            async def cancel_order(self, order_id, symbol):
+                cancelled_orders.append(order_id)
+                return {"id": order_id, "status": "canceled"}
+            async def fetch_ticker(self, symbol):
+                return {"last": 80500.5}
+
+        bot_c.exchange = MockExchangeLive()
+        bot_c._install_hard_stop = lambda *args, **kwargs: installed_sl.append(args)
+
+        res = await bot_c.execute_order(payload)
+
+        # 1. Order should be cancelled
+        self.assertIn("ord_mock_123", cancelled_orders)
+        # 2. Result status should be cancelled
+        self.assertEqual(res.get("status"), "cancelled")
+        # 3. CRITICAL: No SL should be installed!
+        self.assertEqual(len(installed_sl), 0, "No orphan SL must be installed for unfilled order!")
+
 
 if __name__ == "__main__":
     unittest.main()

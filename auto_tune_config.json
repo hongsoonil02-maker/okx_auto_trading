@@ -4,20 +4,16 @@
   "blacklisted_symbols": {
     "OKX": [
       "AAVE/USDT:USDT",
-      "DOGE/USDT:USDT",
-      "DOS/USDT:USDT",
-      "LTC/USDT:USDT",
-      "SHIB/USDT:USDT",
-      "SPX/USDT:USDT",
-      "VIRTUAL/USDT:USDT",
-      "XLM/USDT:USDT"
+      "BNB/USDT:USDT",
+      "ENA/USDT:USDT",
+      "WLD/USDT:USDT"
     ]
   },
   "okx_params": {
-    "TRAILING_PCT": 0.02,
+    "TRAILING_PCT": 0.015,
     "HARD_SL_PCT": 0.3,
-    "ORB_LOOKBACK": 6,
-    "POSITION_PCT": 0.05,
+    "ORB_LOOKBACK": 4,
+    "POSITION_PCT": 0.18,
     "OKX_MIN_RANGE_PCT": 0.6,
     "OKX_ENTRY_BUFFER_PCT": 0.0004,
     "OKX_MIN_MOMENTUM_PCT": 0.0003

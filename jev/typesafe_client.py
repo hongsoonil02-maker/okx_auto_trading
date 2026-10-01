@@ -17,6 +17,9 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Any
 import aiohttp
 
+# Model Version Pinning: 프로덕션 환경의 일관된 매매 임계값 확률 보장을 위해 가변 에일리어스 대신 특정 버전으로 하드코딩 고정
+PINNED_MODEL_VERSION = "jev-1.15-prod"
+
 logger = logging.getLogger("Typesafe_Jev")
 
 
@@ -29,7 +32,7 @@ class JevDecision:
     latency_ms: float = 0.0
     is_fallback: bool = False
     error: Optional[str] = None
-    model_version: str = "jev-latest"
+    model_version: str = PINNED_MODEL_VERSION
 
 
 class TypesafeJevClient:
@@ -39,12 +42,20 @@ class TypesafeJevClient:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "jev-latest",
-        timeout_ms: int = 500,
+        model: str = PINNED_MODEL_VERSION,
+        timeout_ms: int = 400,
     ):
         raw_key = api_key if api_key is not None else (os.getenv("TYPESAFE_AI_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", ""))
         self.api_key = raw_key.strip()
-        self.model = os.getenv("JEV_MODEL", model)
+        
+        # [Rule 1: Version Pinning] 'jev-latest' 등 가변 에일리어스 방지 및 고정 버전 강제
+        configured_model = os.getenv("JEV_MODEL", model)
+        if configured_model in ("jev-latest", "latest", ""):
+            logger.info(f"🔒 [Version Pinning] 가변 모델('{configured_model}') 대신 검증된 고정 모델('{PINNED_MODEL_VERSION}')로 바인딩합니다.")
+            self.model = PINNED_MODEL_VERSION
+        else:
+            self.model = configured_model
+
         self.timeout_ms = int(os.getenv("JEV_TIMEOUT_MS", str(timeout_ms)))
         self._session: Optional[aiohttp.ClientSession] = None
         self._lock = asyncio.Lock()
@@ -55,16 +66,18 @@ class TypesafeJevClient:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            # [Rule 3: Latency Optimization] 도쿄/싱가포르 AWS 다이렉트 통신을 위한 초경량 커넥터 설정
             connector = aiohttp.TCPConnector(
                 limit=10,
-                ttl_dns_cache=300,
+                ttl_dns_cache=600,             # DNS 캐싱 10분
                 enable_cleanup_closed=True,
                 force_close=False,
+                keepalive_timeout=60,          # TCP Keep-Alive 유지
             )
             client_timeout = aiohttp.ClientTimeout(
-                total=max(1.0, self.timeout_ms / 1000.0),
-                connect=0.25,
-                sock_read=0.75,
+                total=max(0.4, self.timeout_ms / 1000.0),
+                connect=0.15,                  # Fast Connect (150ms)
+                sock_read=0.35,                # Fast Read (350ms)
             )
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
@@ -72,10 +85,12 @@ class TypesafeJevClient:
                 "HTTP-Referer": "https://github.com/quant_system",
                 "X-Title": "OKX Jev Trader",
             }
+            # trust_env=False: OS 환경변수의 HTTP_PROXY 오버헤드를 우회하여 Direct 초저지연 연결
             self._session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=client_timeout,
                 headers=headers,
+                trust_env=False,
             )
         return self._session
 
@@ -159,29 +174,17 @@ class TypesafeJevClient:
                 else:
                     err_text = await resp.text()
                     logger.warning(f"⚠️ Jev API 응답 에러 (HTTP {resp.status}): {err_text[:200]}")
-                    fallback = self._heuristic_simulation(lob_imbalance)
-                    fallback.latency_ms = elapsed_ms
-                    fallback.is_fallback = True
-                    fallback.error = f"HTTP_{resp.status}"
-                    return fallback
+                    return self._safe_hold_fallback(f"HTTP_{resp.status}", elapsed_ms)
 
         except asyncio.TimeoutError:
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-            logger.warning(f"⏱️ Jev API 타임아웃 발생 ({elapsed_ms:.1f}ms > {t_limit*1000}ms) — 즉시 폴백")
-            fallback = self._heuristic_simulation(lob_imbalance)
-            fallback.latency_ms = elapsed_ms
-            fallback.is_fallback = True
-            fallback.error = "TIMEOUT"
-            return fallback
+            logger.warning(f"⏱️ Jev API 타임아웃 발생 ({elapsed_ms:.1f}ms > {t_limit*1000}ms) — 즉시 HOLD 폴백")
+            return self._safe_hold_fallback("TIMEOUT", elapsed_ms)
 
         except Exception as e:
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-            logger.error(f"❌ Jev API 요청 예외: {e}")
-            fallback = self._heuristic_simulation(lob_imbalance)
-            fallback.latency_ms = elapsed_ms
-            fallback.is_fallback = True
-            fallback.error = str(e)
-            return fallback
+            logger.error(f"❌ Jev API 요청 예외 ({type(e).__name__}): {e} — 즉시 HOLD 폴백")
+            return self._safe_hold_fallback(str(e), elapsed_ms)
 
     async def _predict_openrouter(
         self,
@@ -270,10 +273,28 @@ class TypesafeJevClient:
             fallback.error = str(e)
             return fallback
 
+    def _safe_hold_fallback(self, error_reason: str, elapsed_ms: float = 0.0) -> JevDecision:
+        """
+        [Rule 3: Deterministic Safe HOLD Fallback]
+        타임아웃, 503, 통신 오류 발생 시 에이전트가 무한 재시도 루프에 빠지거나 오작동하지 않도록
+        즉각 HOLD(대기) 상태로 빠져나와 100% 자산을 보존하는 세이프티 폴백.
+        """
+        logger.warning(f"🛡️ [Jev Safe Fallback] 즉시 HOLD(대기) 전환 — 원인: {error_reason} (소요: {elapsed_ms:.1f}ms)")
+        return JevDecision(
+            up_in_10=0.50,
+            action="HOLD",
+            action_confidence=0.0,
+            action_probabilities={"buy": 0.0, "sell": 0.0, "neutral": 1.0},
+            latency_ms=elapsed_ms,
+            is_fallback=True,
+            error=error_reason,
+            model_version=PINNED_MODEL_VERSION,
+        )
+
     def _heuristic_simulation(self, lob_imbalance: float) -> JevDecision:
         """
         Internal fallback heuristic based on Orderbook Imbalance Ratio (OIR).
-        Used when offline, during network failure, or timeout.
+        Used when offline or during simulated paper trading.
         """
         # Map imbalance (-1.0 to 1.0) to probability (0.0 to 1.0)
         prob_up = max(0.01, min(0.99, 0.50 + (lob_imbalance * 0.40)))
@@ -300,3 +321,4 @@ class TypesafeJevClient:
             is_fallback=True,
             model_version="heuristic-fallback-v1",
         )
+
