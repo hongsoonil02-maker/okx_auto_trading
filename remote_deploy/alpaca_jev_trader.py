@@ -20,10 +20,12 @@ Features:
 
 import os
 import sys
+import csv
+import json
 import time
 import math
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple, Any, Set
 import requests
 from requests.adapters import HTTPAdapter
@@ -95,6 +97,23 @@ LOOP_INTERVAL_SEC = 10           # Poll market every 10 seconds during open hour
 POST_LOSS_COOLDOWN_SEC = 1800.0  # 30-minute lockout after stop-loss to eliminate churn
 NORMAL_COOLDOWN_SEC = 300.0      # 5-minute normal exit cooldown
 
+# ── EXIT MODE (V2: ATR Chandelier, validated in 13-month OOS backtest 2026-10-04) ──
+# legacy : % bracket TP/SL + trailing/breakeven/microstructure exits (pre-2026-10-04 behaviour)
+# atr    : chandelier stop = peak - ATR_MULT * ATR(14, 5Min RTH), no take-profit.
+#          Stop is held on Alpaca as a standalone GTC stop order and only ever raised.
+# Rollback: set ALPACA_EXIT_MODE=legacy in .env and restart the service.
+EXIT_MODE = os.getenv("ALPACA_EXIT_MODE", "legacy").strip().lower()
+ATR_MULT = float(os.getenv("ALPACA_ATR_MULT", "6"))
+ATR_PERIOD = 14
+ATR_REFRESH_SEC = 60.0
+STOP_RAISE_MIN_PCT = 0.001       # only replace exchange stop if it rises by >= 0.1%
+ATR_STOP_CLIENT_PREFIX = "atrstop-"
+STATE_FILE = os.path.join(CURRENT_DIR, "exec_state.json")
+SLIPPAGE_CSV = os.path.join(CURRENT_DIR, "slippage_log.csv")
+QUOTE_MAX_AGE_MS = 5000          # quotes older than this are not used as slippage reference
+LIVE_ORDER_STATUSES = {"new", "accepted", "held", "pending_new", "partially_filled",
+                       "pending_replace", "accepted_for_bidding", "calculated", "pending_cancel"}
+
 def get_symbol_risk(symbol: str) -> Tuple[float, float, float]:
     """Returns (stop_loss_pct, take_profit_pct, trailing_arm_pct) tailored to asset volatility"""
     if symbol in LEVERAGED_3X:
@@ -118,6 +137,15 @@ class AlpacaJevTrader:
         self.next_close_str: str = ""
         self.trade_cooldowns: Dict[str, float] = {}  # Symbol -> cooldown timestamp
         self.position_entry_times: Dict[str, float] = {}  # Symbol -> entry timestamp (buffer protection)
+
+        # ATR chandelier + slippage state (persisted across restarts)
+        self.atr_cache: Dict[str, Tuple[float, float]] = {}   # symbol -> (fetched_ts, atr)
+        self.atr_peaks: Dict[str, float] = {}                 # symbol -> highest price since entry
+        self.pending_fills: Dict[str, Dict[str, Any]] = {}    # order_id -> reference quote at submit
+        self.processed_fill_ids: List[str] = []
+        self.last_fill_check: float = 0.0
+        self.last_atr_log: float = 0.0
+        self._load_state()
         
         logger.info("=" * 70)
         logger.info(f"🚀 [Alpaca Jev Trader v2.1] Initializing Autonomous Nasdaq Quant Engine")
@@ -130,6 +158,11 @@ class AlpacaJevTrader:
         logger.info(f"   Risk Config (1x Stock): SL -1.2%, TP +2.8%, Trail Arm +1.5%")
         logger.info(f"   Lockout Guard: {POST_LOSS_COOLDOWN_SEC/60:.0f}m cooldown post stop-loss")
         logger.info(f"   Mutual Exclusion: Long ETF vs Inverse ETF conflict strictly prohibited")
+        if EXIT_MODE == "atr":
+            logger.info(f"   EXIT MODE: ATR CHANDELIER (peak - {ATR_MULT:g} x ATR{ATR_PERIOD} 5Min) | TP disabled | % SL/trail/breakeven disabled")
+        else:
+            logger.info(f"   EXIT MODE: LEGACY (% bracket TP/SL + trailing)")
+        logger.info(f"   Slippage Log: {SLIPPAGE_CSV}")
         logger.info("=" * 70)
 
     def sync_account(self) -> bool:
@@ -159,7 +192,22 @@ class AlpacaJevTrader:
             resp = session.get(f"{ALPACA_REST_URL}/positions", headers=HEADERS, timeout=5)
             if resp.status_code == 200:
                 pos_list = resp.json()
-                self.positions = {p["symbol"]: p for p in pos_list}
+                new_positions = {p["symbol"]: p for p in pos_list}
+                # Positions closed on the exchange side (stop order / bracket leg fill) never pass
+                # through close_position(), so apply the same cooldown rules here.
+                for sym, old in self.positions.items():
+                    if sym in new_positions:
+                        continue
+                    last_pl = float(old.get("unrealized_pl", 0.0) or 0.0)
+                    cd = POST_LOSS_COOLDOWN_SEC if last_pl < 0 else NORMAL_COOLDOWN_SEC
+                    self.trade_cooldowns[sym] = max(self.trade_cooldowns.get(sym, 0.0), time.time() + cd)
+                    self.peak_prices.pop(sym, None)
+                    self.position_entry_times.pop(sym, None)
+                    if self.atr_peaks.pop(sym, None) is not None:
+                        self._save_state()
+                    logger.info(f"🔔 [Exchange Exit Detected] {sym} closed by exchange-side order "
+                                f"(last uPnL ${last_pl:+.2f}). Cooldown {cd/60:.0f}m.")
+                self.positions = new_positions
                 return self.positions
             else:
                 logger.error(f"❌ Positions sync failed: HTTP {resp.status_code}")
@@ -332,20 +380,27 @@ class AlpacaJevTrader:
         sl_pct = stop_loss_pct if stop_loss_pct is not None else sym_sl
         tp_pct = take_profit_pct if take_profit_pct is not None else sym_tp
 
-        # Add bracket stop-loss and take-profit if price is known
-        if base_price > 0:
-            if side.lower() == "buy":
-                tp_price = round(base_price * (1.0 + tp_pct), 2)
-                sl_price = round(base_price * (1.0 - sl_pct), 2)
-            else:
-                tp_price = round(base_price * (1.0 - tp_pct), 2)
-                sl_price = round(base_price * (1.0 + sl_pct), 2)
+        tp_price: Any = "N/A"
+        sl_price: Any = "N/A"
+        if EXIT_MODE == "atr":
+            # V2: no bracket. Protective ATR stop is placed by ensure_atr_protection() once filled.
+            bracket_desc = f"ATR stop (x{ATR_MULT:g}) after fill, no TP"
+        else:
+            # Add bracket stop-loss and take-profit if price is known
+            if base_price > 0:
+                if side.lower() == "buy":
+                    tp_price = round(base_price * (1.0 + tp_pct), 2)
+                    sl_price = round(base_price * (1.0 - sl_pct), 2)
+                else:
+                    tp_price = round(base_price * (1.0 - tp_pct), 2)
+                    sl_price = round(base_price * (1.0 + sl_pct), 2)
 
-            order_data["order_class"] = "bracket"
-            order_data["take_profit"] = {"limit_price": str(tp_price)}
-            order_data["stop_loss"] = {"stop_price": str(sl_price)}
+                order_data["order_class"] = "bracket"
+                order_data["take_profit"] = {"limit_price": str(tp_price)}
+                order_data["stop_loss"] = {"stop_price": str(sl_price)}
+            bracket_desc = f"Bracket TP: ${tp_price} / SL: ${sl_price}"
 
-        logger.info(f"📤 [Order Submit] {side.upper()} {qty}x {symbol} | Type: {order_type} (GTC) | Bracket TP: ${tp_price if base_price > 0 else 'N/A'} / SL: ${sl_price if base_price > 0 else 'N/A'}")
+        logger.info(f"📤 [Order Submit] {side.upper()} {qty}x {symbol} | Type: {order_type} (GTC) | {bracket_desc}")
 
         if self.simulation_mode:
             logger.info(f"🧪 [SIMULATION FILL] {side.upper()} {qty}x {symbol} @ ${base_price:.2f} | Bracket TP: ${tp_price} / SL: ${sl_price}")
@@ -367,6 +422,7 @@ class AlpacaJevTrader:
             if resp.status_code in [200, 201]:
                 res_json = resp.json()
                 logger.info(f"✅ [Order Confirmed] ID: {res_json.get('id')} | Status: {res_json.get('status')} | {symbol}")
+                self.record_order_ref(res_json, symbol, side.lower(), "entry", quote=q)
                 self.trade_cooldowns[symbol] = time.time() + 180  # 3 min cooldown
                 self.position_entry_times[symbol] = time.time()
                 return res_json
@@ -396,6 +452,12 @@ class AlpacaJevTrader:
                 status_parts.append(f"{s}: {pnl:+.2f}%")
             logger.info(f"📊 [Active Positions {len(self.positions)}/{MAX_CONCURRENT_POSITIONS}] " + " | ".join(status_parts))
             self.last_portfolio_log = now
+
+        if EXIT_MODE == "atr":
+            # V2 exits: ATR chandelier only (TP / % trail / breakeven / microstructure exits disabled,
+            # matching the configuration validated in the OOS backtest).
+            self.ensure_atr_protection(allow_close=True)
+            return
 
         for symbol, pos in list(self.positions.items()):
             qty = abs(float(pos.get("qty", 0)))
@@ -456,6 +518,8 @@ class AlpacaJevTrader:
 
         self.peak_prices.pop(symbol, None)
         self.position_entry_times.pop(symbol, None)
+        if self.atr_peaks.pop(symbol, None) is not None:
+            self._save_state()
 
         # ── POST-LOSS LOCKOUT LOGIC ──
         is_loss = (unrealized_pl < 0) or ("STOP_LOSS" in reason) or ("HEAVY_ASK" in reason)
@@ -494,6 +558,7 @@ class AlpacaJevTrader:
                 resp = session.delete(f"{ALPACA_REST_URL}/positions/{symbol}?cancel_orders=true", headers=HEADERS, timeout=8)
                 if resp.status_code in [200, 204]:
                     logger.info(f"✅ [Position Closed] {symbol} closed successfully.")
+                    self._record_close_ref(resp, symbol, reason)
                     self.positions.pop(symbol, None)
                     break
                 elif resp.status_code == 404:
@@ -524,6 +589,7 @@ class AlpacaJevTrader:
                     resp = session.delete(f"{ALPACA_REST_URL}/positions/{symbol}", headers=HEADERS, timeout=8)
                     if resp.status_code in [200, 204]:
                         logger.info(f"✅ [Position Closed] {symbol} closed after last-resort cancel-all.")
+                        self._record_close_ref(resp, symbol, reason)
                         self.positions.pop(symbol, None)
                     else:
                         logger.error(f"❌ [Last Resort Failed] {symbol}: HTTP {resp.status_code} - {resp.text}")
@@ -713,8 +779,333 @@ class AlpacaJevTrader:
                     elif sym in BEARISH_ETFS:
                         has_bear_etf = True
 
+    # ══════════════════════════════════════════════════════════════════════
+    # State persistence
+    # ══════════════════════════════════════════════════════════════════════
+    def _load_state(self):
+        try:
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+                self.atr_peaks = {k: float(v) for k, v in st.get("atr_peaks", {}).items()}
+                self.pending_fills = st.get("pending_fills", {})
+                self.processed_fill_ids = list(st.get("processed_fill_ids", []))
+                self._fills_seeded = bool(st.get("fills_seeded", False))
+            else:
+                self._fills_seeded = False
+        except Exception as e:
+            logger.error(f"❌ State load failed ({STATE_FILE}): {e}")
+            self._fills_seeded = False
+
+    def _save_state(self):
+        try:
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({
+                    "atr_peaks": self.atr_peaks,
+                    "pending_fills": self.pending_fills,
+                    "processed_fill_ids": self.processed_fill_ids[-2000:],
+                    "fills_seeded": self._fills_seeded,
+                    "saved_at": datetime.now(timezone.utc).isoformat(),
+                }, f, indent=1)
+            os.replace(tmp, STATE_FILE)
+        except Exception as e:
+            logger.error(f"❌ State save failed: {e}")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # V2: ATR chandelier stop
+    # ══════════════════════════════════════════════════════════════════════
+    def get_atr(self, symbol: str) -> Optional[float]:
+        """ATR(14) on regular-session 5Min bars (Wilder smoothing) - same definition as the backtest."""
+        cached = self.atr_cache.get(symbol)
+        if cached and time.time() - cached[0] < ATR_REFRESH_SEC:
+            return cached[1]
+        try:
+            start = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            params = {"timeframe": "5Min", "start": start, "limit": 10000, "feed": "iex",
+                      "sort": "asc", "adjustment": "split"}
+            resp = session.get(f"{ALPACA_DATA_URL}/stocks/{symbol}/bars", headers=HEADERS, params=params, timeout=8)
+            if resp.status_code != 200:
+                logger.warning(f"⚠️ [ATR] {symbol} bars HTTP {resp.status_code}")
+                return cached[1] if cached else None
+            bars = resp.json().get("bars") or []
+            df = pd.DataFrame(bars)
+            if df.empty:
+                return cached[1] if cached else None
+            t = pd.to_datetime(df["t"], utc=True).dt.tz_convert("America/New_York")
+            tod = t.dt.hour * 60 + t.dt.minute
+            df = df[(tod >= 9 * 60 + 30) & (tod < 16 * 60)]
+            if len(df) < ATR_PERIOD * 3:
+                return cached[1] if cached else None
+            h, l, c = df["h"].astype(float), df["l"].astype(float), df["c"].astype(float)
+            pc = c.shift()
+            tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+            atr = float(tr.ewm(alpha=1.0 / ATR_PERIOD, adjust=False).mean().iloc[-1])
+            if not (atr > 0):
+                return cached[1] if cached else None
+            self.atr_cache[symbol] = (time.time(), atr)
+            return atr
+        except Exception as e:
+            logger.warning(f"⚠️ [ATR] {symbol} exception: {e}")
+            return cached[1] if cached else None
+
+    def get_symbol_live_orders(self, symbol: str) -> Optional[List[Dict[str, Any]]]:
+        """All non-terminal orders for a symbol, INCLUDING 'held' bracket legs (status=open omits them).
+        Returns None on API failure so callers never mistake an error for 'no orders'."""
+        try:
+            resp = session.get(f"{ALPACA_REST_URL}/orders", headers=HEADERS, timeout=5,
+                               params={"status": "all", "symbols": symbol, "limit": 100, "nested": "false"})
+            if resp.status_code == 200:
+                return [o for o in resp.json() if o.get("status") in LIVE_ORDER_STATUSES]
+            logger.warning(f"⚠️ [Orders] {symbol} HTTP {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"⚠️ [Orders] {symbol} exception: {e}")
+        return None
+
+    @staticmethod
+    def _is_atr_stop(o: Dict[str, Any]) -> bool:
+        return (o.get("side") == "sell" and o.get("type") == "stop"
+                and (o.get("order_class") or "simple") == "simple")
+
+    def ensure_atr_protection(self, allow_close: bool):
+        """Maintains one GTC stop order per long position at max(existing stop, peak - ATR_MULT*ATR).
+        - Cancels legacy bracket legs (TP limit / held stop) so quantity is free for the ATR stop.
+        - Never lowers a stop. Falls back to the legacy % stop if ATR is unavailable and no stop exists.
+        - Software backstop: closes the position if price is already through the stop (when allowed)."""
+        if self.simulation_mode or not self.positions:
+            return
+        state_changed = False
+        verbose = time.time() - self.last_atr_log >= 300.0
+        summary = []
+
+        for symbol, pos in list(self.positions.items()):
+            try:
+                if pos.get("side", "long") != "long":
+                    continue
+                qty = int(abs(float(pos.get("qty", 0))))
+                entry = float(pos.get("avg_entry_price", 0.0))
+                cur = float(pos.get("current_price", 0.0) or 0.0)
+                if qty <= 0 or entry <= 0:
+                    continue
+
+                peak = max(self.atr_peaks.get(symbol, entry), cur if cur > 0 else entry)
+                if peak != self.atr_peaks.get(symbol):
+                    self.atr_peaks[symbol] = peak
+                    state_changed = True
+
+                orders = self.get_symbol_live_orders(symbol)
+                if orders is None:
+                    continue  # API problem: do nothing rather than act on bad data
+
+                sells = [o for o in orders if o.get("side") == "sell"]
+                atr_stops = [o for o in sells if self._is_atr_stop(o)]
+                my_stop = atr_stops[0] if atr_stops else None
+                foreign = [o for o in sells if o is not my_stop]
+
+                # Migration / cleanup: legacy bracket legs or duplicate stops hold the quantity.
+                if foreign:
+                    for o in foreign:
+                        if o.get("status") != "pending_cancel":
+                            r = session.delete(f"{ALPACA_REST_URL}/orders/{o['id']}", headers=HEADERS, timeout=5)
+                            logger.info(f"🧹 [ATR Migrate] {symbol} cancel {o.get('order_class')}/{o.get('type')} "
+                                        f"{o.get('status')} order {o['id'][:8]} → HTTP {r.status_code}")
+                    time.sleep(1.5)
+                    orders = self.get_symbol_live_orders(symbol)
+                    if orders is None:
+                        continue
+                    sells = [o for o in orders if o.get("side") == "sell"]
+                    if any(not self._is_atr_stop(o) for o in sells):
+                        logger.warning(f"⚠️ [ATR Migrate] {symbol} legacy orders still live; retrying next cycle.")
+                        continue
+                    atr_stops = [o for o in sells if self._is_atr_stop(o)]
+                    my_stop = atr_stops[0] if atr_stops else None
+
+                exch_stop = float(my_stop.get("stop_price") or 0.0) if my_stop else 0.0
+                atr = self.get_atr(symbol)
+                if atr:
+                    target = peak - ATR_MULT * atr
+                elif exch_stop > 0:
+                    target = exch_stop
+                else:
+                    target = entry * (1.0 - get_symbol_risk(symbol)[0])
+                    logger.warning(f"⚠️ [ATR] {symbol} ATR unavailable → fallback % stop ${target:.2f}")
+                stop = math.floor(max(target, exch_stop) * 100.0) / 100.0
+
+                summary.append(f"{symbol}: px ${cur:.2f} peak ${peak:.2f} ATR {atr or 0:.3f} "
+                               f"stop ${stop:.2f} ({(stop / cur - 1) * 100 if cur > 0 else 0:+.2f}%)")
+
+                # Software backstop: price already at/through the stop.
+                if cur > 0 and cur <= stop:
+                    if allow_close:
+                        logger.warning(f"🛑 [ATR Stop] {symbol} px ${cur:.2f} <= stop ${stop:.2f} → closing")
+                        self.close_position(symbol, f"ATR_STOP_SOFT_{(cur / entry - 1) * 100:.1f}PCT")
+                    continue
+                # Exchange rejects sell stops at/above market; leave the software backstop in charge.
+                if cur > 0 and stop >= cur * 0.999:
+                    continue
+
+                need_new = my_stop is None or int(float(my_stop.get("qty", 0))) != qty
+                if my_stop is not None and need_new:
+                    session.delete(f"{ALPACA_REST_URL}/orders/{my_stop['id']}", headers=HEADERS, timeout=5)
+                    time.sleep(1.0)
+
+                cid = f"{ATR_STOP_CLIENT_PREFIX}{symbol}-{int(time.time() * 1000)}"
+                if need_new:
+                    body = {"symbol": symbol, "qty": str(qty), "side": "sell", "type": "stop",
+                            "stop_price": f"{stop:.2f}", "time_in_force": "gtc", "client_order_id": cid}
+                    r = session.post(f"{ALPACA_REST_URL}/orders", headers=HEADERS, json=body, timeout=8)
+                    if r.status_code in (200, 201):
+                        logger.info(f"🛡️ [ATR Stop Placed] {symbol} {qty}sh stop ${stop:.2f} "
+                                    f"(peak ${peak:.2f} - {ATR_MULT:g}xATR {atr or 0:.3f})")
+                    else:
+                        logger.error(f"❌ [ATR Stop Place Failed] {symbol}: HTTP {r.status_code} - {r.text}")
+                elif stop >= exch_stop * (1.0 + STOP_RAISE_MIN_PCT):
+                    r = session.patch(f"{ALPACA_REST_URL}/orders/{my_stop['id']}", headers=HEADERS,
+                                      json={"stop_price": f"{stop:.2f}", "client_order_id": cid}, timeout=8)
+                    if r.status_code in (200, 201):
+                        logger.info(f"⬆️ [ATR Stop Raised] {symbol} ${exch_stop:.2f} → ${stop:.2f}")
+                    else:
+                        logger.error(f"❌ [ATR Stop Raise Failed] {symbol}: HTTP {r.status_code} - {r.text}")
+            except Exception as e:
+                logger.error(f"❌ [ATR Protection] {symbol} exception: {e}", exc_info=True)
+
+        if state_changed:
+            self._save_state()
+        if verbose and summary:
+            logger.info("🛡️ [ATR Stops] " + " | ".join(summary))
+            self.last_atr_log = time.time()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Slippage measurement
+    # ══════════════════════════════════════════════════════════════════════
+    def record_order_ref(self, order: Dict[str, Any], symbol: str, side: str, kind: str,
+                         quote: Optional[Dict[str, Any]] = None):
+        """Stores the quote seen at submission so the fill can later be compared against it."""
+        try:
+            oid = order.get("id")
+            if not oid:
+                return
+            q = quote if quote is not None else get_quotes_cache().get(symbol, {})
+            bid, ask = float(q.get("bidPrice") or 0.0), float(q.get("askPrice") or 0.0)
+            ts = float(q.get("timestamp") or 0.0)
+            age_ms = time.time() * 1000.0 - ts if ts > 0 else -1.0
+            valid = bid > 0 and ask > 0 and ask >= bid and 0 <= age_ms <= QUOTE_MAX_AGE_MS
+            self.pending_fills[oid] = {
+                "symbol": symbol, "side": side, "kind": kind,
+                "bid": bid if valid else 0.0, "ask": ask if valid else 0.0,
+                "quote_age_ms": round(age_ms), "submitted_ts": time.time(),
+            }
+            self._save_state()
+        except Exception as e:
+            logger.debug(f"record_order_ref failed: {e}")
+
+    def _record_close_ref(self, resp, symbol: str, reason: str):
+        try:
+            if resp.status_code == 200 and resp.text:
+                self.record_order_ref(resp.json(), symbol, "sell", f"exit_{reason.split('_')[0].lower()}")
+        except Exception:
+            pass
+
+    def reconcile_fills(self):
+        """Every 60s: match filled orders against stored references and append to slippage_log.csv.
+        Sign convention: positive bp = cost (paid more on buys / received less on sells)."""
+        if self.simulation_mode or time.time() - self.last_fill_check < 60.0:
+            return
+        self.last_fill_check = time.time()
+        try:
+            after = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            resp = session.get(f"{ALPACA_REST_URL}/orders", headers=HEADERS, timeout=8,
+                               params={"status": "closed", "after": after, "limit": 500,
+                                       "direction": "asc", "nested": "false"})
+            if resp.status_code != 200:
+                return
+            orders = resp.json()
+            done = set(self.processed_fill_ids)
+
+            if not self._fills_seeded:  # first run: don't back-log historical fills
+                self.processed_fill_ids.extend(o["id"] for o in orders if o["id"] not in done)
+                self._fills_seeded = True
+                self._save_state()
+                logger.info(f"📏 [Slippage] Initialised; {len(orders)} historical orders marked as seen.")
+                return
+
+            rows = []
+            for o in orders:
+                oid = o["id"]
+                if oid in done:
+                    continue
+                status = o.get("status")
+                if status != "filled":
+                    if status in ("canceled", "expired", "rejected", "replaced"):
+                        self.pending_fills.pop(oid, None)
+                        self.processed_fill_ids.append(oid)
+                    continue
+                fill = float(o.get("filled_avg_price") or 0.0)
+                side = o.get("side", "")
+                ref = self.pending_fills.pop(oid, None)
+                otype = o.get("type", "")
+                if ref:
+                    kind, bid, ask = ref["kind"], ref["bid"], ref["ask"]
+                    mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+                    touch = (ask if side == "buy" else bid)
+                    ref_type = "quote" if mid > 0 else "quote_unavailable"
+                    q_age = ref.get("quote_age_ms", -1)
+                elif otype in ("stop", "stop_limit") and o.get("stop_price"):
+                    is_atr = (o.get("order_class") or "simple") == "simple"
+                    kind = "exit_stop_atr" if is_atr else "exit_stop_bracket"
+                    mid, touch, ref_type, q_age = 0.0, float(o["stop_price"]), "stop_trigger", -1
+                    bid = ask = 0.0
+                elif otype == "limit" and (o.get("order_class") or "") in ("bracket", "oco"):
+                    kind = "exit_tp_bracket"
+                    mid, touch, ref_type, q_age = 0.0, float(o.get("limit_price") or 0.0), "limit_price", -1
+                    bid = ask = 0.0
+                else:
+                    self.processed_fill_ids.append(oid)
+                    continue
+
+                sign = 1.0 if side == "buy" else -1.0
+                bp = lambda r: round(sign * (fill - r) / r * 1e4, 2) if r and r > 0 and fill > 0 else ""
+                try:
+                    lat = (pd.Timestamp(o["filled_at"]) - pd.Timestamp(o["submitted_at"])).total_seconds()
+                except Exception:
+                    lat = ""
+                rows.append({
+                    "logged_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "filled_at": o.get("filled_at"), "symbol": o.get("symbol"), "side": side,
+                    "kind": kind, "order_type": otype, "qty": o.get("filled_qty"),
+                    "fill_price": fill, "ref_type": ref_type,
+                    "ref_bid": bid or "", "ref_ask": ask or "", "ref_mid": round(mid, 4) if mid else "",
+                    "ref_touch": touch or "",
+                    "slip_bp_vs_mid": bp(mid), "slip_bp_vs_touch": bp(touch),
+                    "spread_bp": round((ask - bid) / mid * 1e4, 2) if mid else "",
+                    "quote_age_ms": q_age, "latency_s": lat, "order_id": oid,
+                })
+                self.processed_fill_ids.append(oid)
+
+            # drop stale references (orders that never resolved within 3 days)
+            cutoff = time.time() - 3 * 86400
+            for k in [k for k, v in self.pending_fills.items() if v.get("submitted_ts", 0) < cutoff]:
+                self.pending_fills.pop(k, None)
+
+            if rows:
+                new_file = not os.path.exists(SLIPPAGE_CSV)
+                with open(SLIPPAGE_CSV, "a", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                    if new_file:
+                        w.writeheader()
+                    w.writerows(rows)
+                for r in rows:
+                    logger.info(f"📏 [Slippage] {r['symbol']} {r['side']} {r['kind']} fill ${r['fill_price']:.2f} | "
+                                f"vs mid {r['slip_bp_vs_mid']}bp | vs {r['ref_type']} {r['slip_bp_vs_touch']}bp")
+            self._save_state()
+        except Exception as e:
+            logger.error(f"❌ [Slippage] reconcile exception: {e}")
+
     def run_cycle(self):
         """Single loop execution cycle"""
+        # 0. Slippage bookkeeping (cheap, every 60s, also off-hours)
+        self.reconcile_fills()
+
         # 1. Check Clock
         is_open = self.check_market_clock()
         if not is_open:
@@ -743,6 +1134,10 @@ class AlpacaJevTrader:
         logger.info("🟢 [Daemon Started] Entering continuous trading loop...")
         self.sync_account()
         self.sync_positions()
+        if EXIT_MODE == "atr":
+            # Migrate existing positions to ATR stops immediately (works while market is closed:
+            # GTC stop orders are accepted and become active at the next open). No closes here.
+            self.ensure_atr_protection(allow_close=False)
 
         while True:
             try:
