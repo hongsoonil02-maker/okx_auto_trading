@@ -898,9 +898,18 @@ class AlpacaJevTrader:
                     continue  # API problem: do nothing rather than act on bad data
 
                 sells = [o for o in orders if o.get("side") == "sell"]
+
+                # [CRITICAL FIX] If a market sell order is already in-flight (e.g. from close_position liquidation),
+                # do NOT cancel it and do NOT try to update stops. Let the liquidation order complete!
+                market_sells = [o for o in sells if o.get("type") == "market"]
+                if market_sells:
+                    logger.info(f"⏳ [ATR Stop] {symbol} has active market exit order {market_sells[0]['id'][:8]} in progress; skipping stop update.")
+                    continue
+
                 atr_stops = [o for o in sells if self._is_atr_stop(o)]
                 my_stop = atr_stops[0] if atr_stops else None
-                foreign = [o for o in sells if o is not my_stop]
+                # Migration / cleanup: ONLY cancel legacy bracket legs (limit TP) or duplicate stops. NEVER cancel market orders!
+                foreign = [o for o in sells if o is not my_stop and o.get("type") != "market"]
 
                 # Migration / cleanup: legacy bracket legs or duplicate stops hold the quantity.
                 if foreign:
@@ -914,7 +923,7 @@ class AlpacaJevTrader:
                     if orders is None:
                         continue
                     sells = [o for o in orders if o.get("side") == "sell"]
-                    if any(not self._is_atr_stop(o) for o in sells):
+                    if any(not self._is_atr_stop(o) and o.get("type") != "market" for o in sells):
                         logger.warning(f"⚠️ [ATR Migrate] {symbol} legacy orders still live; retrying next cycle.")
                         continue
                     atr_stops = [o for o in sells if self._is_atr_stop(o)]

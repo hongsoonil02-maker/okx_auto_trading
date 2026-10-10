@@ -24,12 +24,14 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
     # [Venture V3 업데이트 - User Directive] Jev AI의 초고속 판단력을 활용한 양방향 초단타 스캘핑 모드
     ATR_TRAIL_ARM_PNL = 0.10   # 10% 수익 발생 시 트레일링 즉시 발동 (스캘핑 특화)
     ATR_TRAIL_K = 1.5          # 고점 대비 ATR 1.5배 하락 시 칼익절 (매우 타이트하게)
-    FLIP_ON_TRAILING_CLOSE = True # 초단타 스캘핑 핵심: 익절/손절 시 즉각 반대 방향으로 스위칭(양방향 자유자재)
+    # [개선] 15m 알트 잦은 턴오버 및 양방향 휩소 방지를 위해 플립 비활성화
+    FLIP_ON_TRAILING_CLOSE = False
     
-    # [Venture V3 업데이트] 1h의 둔한 움직임 폐기, 15m 초단타로 복귀
+    # [Venture V3 업데이트] 15m 초단타
     TIMEFRAME = "15m"
     TIMEFRAME_MINUTES = 15
-    CHOP_ADX_BLOCK_THRESHOLD = 15.0 # 횡보장 차단 기준 대폭 완화 (횡보장에서도 단타 진입)
+    # [개선] 횡보장(ADX<22) 노이즈 진입 및 수수료 누수 차단 (기존 15.0 -> 22.0 상향)
+    CHOP_ADX_BLOCK_THRESHOLD = 22.0
     
     STOCK_KEYWORDS = []
     BLACKLIST = ['KR200', 'SKHYNIX', 'SAMSUNG', 'MU', 'SHAZ', 'ISRG', 'ROBO', 'RAM', 'DRAM', 'GME',

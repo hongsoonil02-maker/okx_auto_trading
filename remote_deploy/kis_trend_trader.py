@@ -14,7 +14,7 @@ import time
 import json
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -68,8 +68,9 @@ else:
 KIS_URL = os.getenv("KIS_URL", "https://openapi.koreainvestment.com:9443")
 
 # ── TRACKED UNIVERSE ──
-# KOSPI/KOSDAQ 대표 주도 대형주 10종목
+# KOSPI/KOSDAQ 주도 섹터 톱픽 22종목 (반도체, 방산, 전력, 바이오, K-푸드, 조선, 자동차, 밸류업)
 UNIVERSE = {
+    # 기존 대형 우량주
     "005930": {"name": "삼성전자", "yf": "005930.KS"},
     "000660": {"name": "SK하이닉스", "yf": "000660.KS"},
     "373220": {"name": "LG에너지솔루션", "yf": "373220.KS"},
@@ -80,6 +81,19 @@ UNIVERSE = {
     "035420": {"name": "NAVER", "yf": "035420.KS"},
     "035720": {"name": "카카오", "yf": "035720.KS"},
     "042700": {"name": "한미반도체", "yf": "042700.KS"},
+    # [Step 2] 시장 주도 섹터 핵심 대장주 12종 추가 편입
+    "012450": {"name": "한화에어로스페이스", "yf": "012450.KS"}, # K-방산/우주항공 1위
+    "064350": {"name": "현대로템", "yf": "064350.KS"},          # 방산/철도 랠리 대장주
+    "267260": {"name": "HD현대일렉트릭", "yf": "267260.KS"},    # AI 변압기/전력인프라 대장주
+    "298040": {"name": "효성중공업", "yf": "298040.KS"},        # 초고압 변압기 대장주
+    "196170": {"name": "알테오젠", "yf": "196170.KQ"},          # 코스닥 바이오 1위 기술수출 대장주
+    "003230": {"name": "삼양식품", "yf": "003230.KS"},          # K-푸드/불닭 글로벌 수출 대장주
+    "009540": {"name": "HD한국조선해양", "yf": "009540.KS"},    # 조선 슈퍼사이클 대장주
+    "034020": {"name": "두산에너빌리티", "yf": "034020.KS"},    # 원전/SMR 수주 대장주
+    "141080": {"name": "리가켐바이오", "yf": "141080.KQ"},      # ADC 차세대 항암 플랫폼 대장주
+    "259960": {"name": "크래프톤", "yf": "259960.KS"},          # 실적 서프라이즈 게임 대장주
+    "000810": {"name": "삼성화재", "yf": "000810.KS"},          # 밸류업 금융/보험 최우량주
+    "105560": {"name": "KB금융", "yf": "105560.KS"},            # 밸류업 은행 1위 대장주
 }
 
 EXCLUDED_SYMBOLS = {"007630", "259290"}  # 상폐/거래불가 종목
@@ -93,6 +107,20 @@ POLL_INTERVAL_SEC = 30        # 정규장 중 30초 주기 모니터링
 POSITIONS_FILE = os.path.join(CURRENT_DIR, "kis_positions.json")
 TOKEN_FILE = os.path.join(CURRENT_DIR, "kis_token.json")
 
+# KRX 정규장 휴장일 (2026-2027 공휴일 및 연말 휴장일)
+KRX_HOLIDAYS = {
+    # 2026
+    "2026-01-01", "2026-02-16", "2026-02-17", "2026-02-18", "2026-03-01", "2026-03-02",
+    "2026-05-01", "2026-05-05", "2026-05-24", "2026-05-25", "2026-06-06", "2026-08-15",
+    "2026-08-17", "2026-09-24", "2026-09-25", "2026-09-26", "2026-10-03", "2026-10-05",
+    "2026-10-09", "2026-12-25", "2026-12-31",
+    # 2027
+    "2027-01-01", "2027-02-05", "2027-02-08", "2027-02-09", "2027-03-01", "2027-05-01",
+    "2027-05-05", "2027-05-13", "2027-06-06", "2027-08-15", "2027-08-16", "2027-09-14",
+    "2027-09-15", "2027-09-16", "2027-10-03", "2027-10-09", "2027-10-11", "2027-12-25",
+    "2027-12-31",
+}
+
 
 class KisTrendTrader:
     def __init__(self):
@@ -101,6 +129,12 @@ class KisTrendTrader:
         self.account_info = {"equity": 0.0, "cash": 0.0}
         self.positions: Dict[str, dict] = {}
         self.daily_indicators: Dict[str, dict] = {}
+        self.market_regime: Dict[str, Any] = {
+            "is_bullish": True,
+            "kospi_close": 0.0,
+            "kospi_sma60": 0.0,
+            "kospi_ret60": 0.0
+        }
         self.last_indicator_update: str = ""
         self.last_market_status_log: float = 0.0
 
@@ -118,11 +152,20 @@ class KisTrendTrader:
             logger.info(f"   📂 Restored {len(self.positions)} active positions: {list(self.positions.keys())}")
         logger.info("=" * 75)
 
-    def save_positions(self):
-        """포지션 정보를 JSON 파일로 영속화"""
+        # 초기 기동 시 시장 국면 및 계좌 상태 즉시 사전 분석
         try:
-            with open(POSITIONS_FILE, "w", encoding="utf-8") as f:
+            self.fetch_daily_indicators()
+            self.fetch_account_balance()
+        except Exception as e:
+            logger.warning(f"⚠️ Initial warmup warning: {e}")
+
+    def save_positions(self):
+        """포지션 정보를 JSON 파일로 원자적(Atomic) 영속화"""
+        try:
+            tmp_pos = f"{POSITIONS_FILE}.tmp.{os.getpid()}"
+            with open(tmp_pos, "w", encoding="utf-8") as f:
                 json.dump(self.positions, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_pos, POSITIONS_FILE)
         except Exception as e:
             logger.error(f"❌ Failed to save positions: {e}")
 
@@ -177,8 +220,10 @@ class KisTrendTrader:
                 expires_in = int(data.get("expires_in", 86400))
                 self.token_expired_at = now + expires_in - 600  # 10분 마진
                 
-                with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+                tmp_token = f"{TOKEN_FILE}.tmp.{os.getpid()}"
+                with open(tmp_token, "w", encoding="utf-8") as f:
                     json.dump({"access_token": self.access_token, "expires_at": self.token_expired_at}, f)
+                os.replace(tmp_token, TOKEN_FILE)
                 logger.info("🔐 [KIS API] Successfully issued new Access Token.")
                 return True
             else:
@@ -199,27 +244,71 @@ class KisTrendTrader:
             "tr_id": tr_id
         }
 
-    def check_market_clock(self) -> bool:
-        """KST 기준 정규장 시간 (09:05 ~ 15:15) 확인. 개장 직후 5분 갭 변동성 안정화 대기"""
+    def check_market_clock(self) -> Tuple[bool, str]:
+        """KST 기준 정규장 시간 (09:20 ~ 15:15) 및 KRX 휴장일 확인.
+        개장 직후 20분간(09:00~09:20)은 호가 스프레드 및 시초가 갭 변동성 안정화 대기"""
         kst_now = datetime.now(timezone(timedelta(hours=9)))
         
-        # 주말 체크
+        # 1. 주말 체크
         if kst_now.weekday() >= 5:
-            return False
+            return False, f"Weekend ({kst_now.strftime('%A')})"
+
+        # 2. KRX 공휴일/휴장일 체크 (한글날, 대체공휴일 등)
+        today_str = kst_now.strftime("%Y-%m-%d")
+        if today_str in KRX_HOLIDAYS:
+            return False, f"KRX Holiday ({today_str})"
             
         current_time = kst_now.time()
-        open_time = datetime.strptime("09:05", "%H:%M").time()
+        open_time = datetime.strptime("09:20", "%H:%M").time()  # 09:20 시작으로 개장 5분 시장가 슬리피지 누수 차단
         close_time = datetime.strptime("15:15", "%H:%M").time()
         
-        return (open_time <= current_time <= close_time)
+        if open_time <= current_time <= close_time:
+            return True, "Market Open"
+        elif current_time < open_time:
+            return False, f"Pre-market (09:20 개장 대기)"
+        else:
+            return False, f"Market Closed (15:15 종료)"
 
     def fetch_daily_indicators(self):
-        """일 1회 유니버스 전 종목의 60일 일봉을 수집하여 지표 산출"""
+        """일 1회 KOSPI 시장 국면 판별 및 유니버스 전 종목의 지표/RS 상대강도 산출"""
         today_str = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
         if self.last_indicator_update == today_str and self.daily_indicators:
             return
 
-        logger.info(f"📊 [Indicator Update] Updating Daily Indicators for Universe ({today_str})...")
+        logger.info(f"📊 [Indicator Update] Updating Market Regime & Universe Indicators ({today_str})...")
+
+        # ── [Step 1] KOSPI Market Regime Check (^KS11) ──
+        try:
+            df_kospi = yf.download("^KS11", period="4mo", interval="1d", progress=False)
+            if not df_kospi.empty and len(df_kospi) >= 60:
+                if isinstance(df_kospi.columns, pd.MultiIndex):
+                    df_kospi.columns = [c[0].lower() for c in df_kospi.columns]
+                else:
+                    df_kospi.columns = [c.lower() for c in df_kospi.columns]
+                df_kospi = df_kospi.dropna()
+                now_kst = datetime.now(timezone(timedelta(hours=9)))
+                if df_kospi.index[-1].date() >= now_kst.date():
+                    df_kospi = df_kospi.iloc[:-1]
+                k_close = float(df_kospi["close"].iloc[-1])
+                k_sma60 = float(df_kospi["close"].rolling(60).mean().iloc[-1])
+                k_ret60 = float((k_close / df_kospi["close"].iloc[-60] - 1.0) * 100.0)
+                is_bullish = bool(k_close >= k_sma60)
+                self.market_regime = {
+                    "is_bullish": is_bullish,
+                    "kospi_close": k_close,
+                    "kospi_sma60": k_sma60,
+                    "kospi_ret60": k_ret60
+                }
+                regime_badge = "🟢 BULL MARKET (상승 추세 - 신규 매수 허용)" if is_bullish else "🔴 BEAR MARKET (하락 추세 - 신규 매수 전면 차단 / 현금 보존)"
+                logger.info(
+                    f"🏛️ [KOSPI Market Regime] {regime_badge} | "
+                    f"지수: {k_close:,.2f} | 60일선: {k_sma60:,.2f} | 60일수익률: {k_ret60:+.2f}%"
+                )
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch KOSPI regime: {e}")
+
+        kospi_ret60 = self.market_regime.get("kospi_ret60", 0.0)
+
         for sym, meta in UNIVERSE.items():
             yf_ticker = meta["yf"]
             try:
@@ -236,6 +325,16 @@ class KisTrendTrader:
 
                 df = df.dropna()
                 
+                # 완성봉만 사용: 마지막 행이 오늘(KST) 날짜면 장중 미완성 봉이므로 제외, 장전이면 어제 완성봉 유지
+                now_kst = datetime.now(timezone(timedelta(hours=9)))
+                last_bar_date = df.index[-1].date()
+                if last_bar_date >= now_kst.date():
+                    df = df.iloc[:-1]
+
+                if len(df) < 20:
+                    logger.warning(f"⚠️ [{sym}] insufficient completed bars: {len(df)}")
+                    continue
+
                 # TR & ATR14
                 tr = np.maximum(
                     df["high"] - df["low"],
@@ -250,9 +349,13 @@ class KisTrendTrader:
                 sma20 = float(df["close"].rolling(20).mean().iloc[-1])
                 sma60 = float(df["close"].rolling(60).mean().iloc[-1]) if len(df) >= 60 else sma20
                 
-                # 전일 기준 20일 최고가 & 10일 최저가 (오늘 봉 제외)
-                donchian_high20 = float(df["high"].iloc[:-1].tail(20).max())
-                donchian_low10 = float(df["low"].iloc[:-1].tail(10).min())
+                # 직전 완성봉 기준 20일 최고가 & 10일 최저가
+                donchian_high20 = float(df["high"].tail(20).max())
+                donchian_low10 = float(df["low"].tail(10).min())
+
+                # [Step 2] 60일 수익률 및 Relative Strength (RS vs KOSPI) 산출
+                ret60 = float((df["close"].iloc[-1] / df["close"].iloc[-60] - 1.0) * 100.0) if len(df) >= 60 else 0.0
+                rs_score = ret60 - kospi_ret60
                 
                 self.daily_indicators[sym] = {
                     "donchian_high20": donchian_high20,
@@ -260,17 +363,32 @@ class KisTrendTrader:
                     "sma20": sma20,
                     "sma60": sma60,
                     "atr14": atr14,
+                    "ret60": ret60,
+                    "rs_score": rs_score,
                     "last_close": float(df["close"].iloc[-1])
                 }
                 logger.info(
                     f"   ✓ {meta['name']}({sym}) | 20일고가: ₩{donchian_high20:,.0f} | "
-                    f"20선: ₩{sma20:,.0f} | 60선: ₩{sma60:,.0f} | ATR: ₩{atr14:,.0f}"
+                    f"60선: ₩{sma60:,.0f} | ATR: ₩{atr14:,.0f} | 60일수익률: {ret60:+.1f}% | RS: {rs_score:+.1f}%"
                 )
             except Exception as e:
                 logger.error(f"❌ Failed to calculate indicators for {sym}: {e}")
 
         self.last_indicator_update = today_str
         logger.info(f"✅ Daily Indicators updated successfully for {len(self.daily_indicators)} stocks.")
+
+        # [동적 ATR 보완] 보유 포지션의 ATR을 최신 변동성으로 동기화 (진입 시점 고정 결함 해소)
+        pos_atr_updated = False
+        for sym, pos in self.positions.items():
+            if sym in self.daily_indicators:
+                latest_atr = self.daily_indicators[sym].get("atr14", 0.0)
+                old_atr = pos.get("atr", 0.0)
+                if latest_atr > 0 and abs(old_atr - latest_atr) > 1.0:
+                    pos["atr"] = latest_atr
+                    pos_atr_updated = True
+                    logger.info(f"🔄 [ATR Dynamically Updated] {UNIVERSE.get(sym, {}).get('name', sym)}({sym}): ₩{old_atr:,.0f} ➜ ₩{latest_atr:,.0f}")
+        if pos_atr_updated:
+            self.save_positions()
 
     def fetch_account_balance(self):
         """계좌 총평가액(Equity) 및 보유 종목 실시간 동기화"""
@@ -355,7 +473,8 @@ class KisTrendTrader:
             logger.error(f"❌ Balance fetch exception: {e}")
 
     def fetch_available_cash(self, symbol: str = "005930") -> float:
-        """inquire-psbl-order (TTTC8908R) 호출을 통한 실제 주문가능현금(ord_psbl_cash) 엄격 확인"""
+        """inquire-psbl-order (TTTC8908R) 호출을 통한 실제 주문가능현금 확인
+        (매도대금 재사용이 포함된 미수 없는 순수 매수가능금액 nrcvb_buy_amt 우선 적용)"""
         if not self.issue_token():
             return 0.0
 
@@ -375,8 +494,11 @@ class KisTrendTrader:
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("rt_cd") == "0" and "output" in data:
-                    cash = float(data["output"].get("ord_psbl_cash", 0))
+                    out = data["output"]
+                    # [개선] 매도대금 재사용(D+2 정산 전)이 포함된 미수 없는 순수 매수가능금액(nrcvb_buy_amt) 우선 활용
+                    cash = float(out.get("nrcvb_buy_amt") or out.get("max_buy_amt") or out.get("ord_psbl_cash", 0))
                     self.account_info["cash"] = cash
+                    logger.info(f"💵 [Buying Power Checked] 주문가능총액: ₩{cash:,.0f} (순수현금: ₩{float(out.get('ord_psbl_cash', 0)):,.0f}, 재사용: ₩{float(out.get('ruse_psbl_amt', 0)):,.0f})")
                     return cash
         except Exception as e:
             logger.error(f"❌ Failed to fetch true buying cash: {e}")
@@ -445,7 +567,10 @@ class KisTrendTrader:
             if current_price <= 0:
                 continue
 
-            entry_price = float(pos["entry_price"])
+            entry_price = float(pos.get("entry_price") or pos.get("avg_price", 0.0))
+            if entry_price <= 0:
+                continue
+            pos["entry_price"] = entry_price
             peak_price = max(float(pos.get("peak_price", entry_price)), current_price)
             pos["peak_price"] = peak_price
             
@@ -480,15 +605,102 @@ class KisTrendTrader:
                     self.positions.pop(sym, None)
                     self.save_positions()
 
+    def rebalance_underallocated_positions(self):
+        """[Step 1] 비중 미달 보유 포지션 리밸런싱 / 비중 보충 (Top-up)
+        예: 한미반도체(042700) 등 과거 예수금 계산 오류로 1주만 매수된 포지션을
+        목표 비중(30%, 약 145만 원)까지 D+2 가용현금으로 추가 매수"""
+        if not self.market_regime.get("is_bullish", True):
+            return
+
+        equity = float(self.account_info.get("equity", 0.0))
+        if equity <= 0:
+            return
+
+        target_size = equity * MAX_POSITION_PCT  # 포지션당 목표 금액 (약 30%)
+
+        for sym, pos in list(self.positions.items()):
+            if sym in EXCLUDED_SYMBOLS:
+                continue
+
+            current_price = self.get_current_price(sym)
+            if current_price <= 0:
+                continue
+
+            current_qty = int(pos.get("qty", 0))
+            current_val = current_qty * current_price
+
+            # 목표 비중의 65% 미만으로 크게 미달된 포지션인 경우
+            if current_val < (target_size * 0.65):
+                old_entry = float(pos.get("entry_price", current_price))
+                ind = self.daily_indicators.get(sym, {})
+                sma60 = ind.get("sma60", 0.0)
+
+                # [피라미딩 안전판 1] 하락/손실 중인 종목에 대한 역추세 물타기 전면 차단 (오직 수익 중인 승자에만 추가)
+                if current_price < old_entry:
+                    logger.info(
+                        f"🛡️ [Top-Up Guard] {UNIVERSE.get(sym, {}).get('name', sym)}({sym}): "
+                        f"현재가(₩{current_price:,.0f})가 평단가(₩{old_entry:,.0f}) 이하로 손실 중이므로 비중 보충 스킵 (역추세 물타기 방지)"
+                    )
+                    continue
+
+                # [피라미딩 안전판 2] 60일선 하회 종목 추가 매수 차단
+                if sma60 > 0 and current_price < sma60:
+                    logger.info(
+                        f"🛡️ [Top-Up Guard] {UNIVERSE.get(sym, {}).get('name', sym)}({sym}): "
+                        f"현재가(₩{current_price:,.0f})가 60일선(₩{sma60:,.0f}) 아래에 있어 비중 보충 스킵"
+                    )
+                    continue
+
+                available_cash = self.fetch_available_cash(sym)
+                if available_cash < 500_000:
+                    logger.info(
+                        f"ℹ️ [Top-Up Skip] {UNIVERSE.get(sym, {}).get('name', sym)}({sym}): "
+                        f"가용현금 부족 (₩{available_cash:,.0f} < ₩500,000)"
+                    )
+                    continue
+
+                deficit_amt = min(target_size - current_val, available_cash * 0.85)
+                add_qty = int(deficit_amt / current_price)
+
+                if add_qty >= 1:
+                    logger.info(
+                        f"⚖️ [Position Top-Up] {UNIVERSE.get(sym, {}).get('name', sym)}({sym}) 비중 보충 매수: "
+                        f"현재 {current_qty}주(₩{current_val:,.0f}, {current_val/equity*100:.1f}%) -> "
+                        f"+{add_qty}주 추가 주문 (목표 ₩{target_size:,.0f})"
+                    )
+                    success = self.submit_kis_order(sym, "buy", add_qty, price=0.0)
+                    if success:
+                        old_qty = current_qty
+                        old_entry = float(pos.get("entry_price", current_price))
+                        new_qty = old_qty + add_qty
+                        new_avg = ((old_qty * old_entry) + (add_qty * current_price)) / new_qty
+
+                        pos["qty"] = new_qty
+                        pos["entry_price"] = new_avg
+                        self.save_positions()
+                        logger.info(
+                            f"✅ [Top-Up Complete] {UNIVERSE.get(sym, {}).get('name', sym)}({sym}) "
+                            f"보유수량: {new_qty}주 | 갱신 평단: ₩{new_avg:,.0f}"
+                        )
+                        time.sleep(1)
+
     def evaluate_entry_opportunities(self):
-        """돈키언 채널 20일 신고가 돌파 + 60일선 정배열 추세 스캔"""
+        """[Step 1 & Step 2] KOSPI 장세 필터 + RS 모멘텀 순위 기반 돈키언 20일 신고가 돌파 진입"""
+        # 1. KOSPI 시장 필터 (60일선 하회 시 전면 매수 금지, 100% 현금 방어)
+        if not self.market_regime.get("is_bullish", True):
+            logger.info("🛡️ [Regime Guard] KOSPI 지수가 60일선 아래(하락장)에 있습니다. 신규 진입을 전면 차단하고 100% 현금을 보존합니다.")
+            return
+
+        # 2. 비중 미달 포지션 보충 우선 실행 (Step 1 Top-up)
+        self.rebalance_underallocated_positions()
+
         active_count = len(self.positions)
         if active_count >= MAX_CONCURRENT_POSITIONS:
             return
 
         # 주문가능현금 실시간 확인
         available_cash = self.fetch_available_cash()
-        if available_cash < 500_000: # 최소 50만 원 미만이면 신규 진입 불가
+        if available_cash < 500_000:  # 최소 50만 원 미만이면 신규 진입 불가
             return
 
         equity = float(self.account_info.get("equity", 10_000_000))
@@ -511,18 +723,21 @@ class KisTrendTrader:
             sma60 = ind["sma60"]
             sma20 = ind["sma20"]
 
-            # 진입 조건: 20일 신고가 돌파 + 60일선 위 + 20일선 > 60일선 정배열
+            # 진입 조건: 20일 신고가 돌파 + 60일선 위 + 20일선 >= 60일선 정배열
             is_breakout = (current_price > donchian_high)
             is_trend_aligned = (current_price > sma60) and (sma20 >= sma60)
 
             if is_breakout and is_trend_aligned:
-                momentum_score = (current_price - sma60) / sma60
-                candidates.append((sym, meta["name"], current_price, momentum_score, ind["atr14"]))
+                rs_score = ind.get("rs_score", 0.0)
+                momentum_dist = (current_price - sma60) / sma60
+                # 종합 주도주 랭킹 점수: RS 상대강도(70%) + 60선 이격도(30%)
+                total_score = (rs_score * 0.7) + (momentum_dist * 100.0 * 0.3)
+                candidates.append((sym, meta["name"], current_price, total_score, rs_score, ind["atr14"]))
 
-        # 모멘텀 순 정렬
+        # [Step 2] 상대강도(RS) & 모멘텀 최상위 주도주 우선 정렬
         candidates.sort(key=lambda x: x[3], reverse=True)
 
-        for sym, name, price, score, atr in candidates:
+        for sym, name, price, total_score, rs_score, atr in candidates:
             if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
                 break
 
@@ -530,7 +745,10 @@ class KisTrendTrader:
             if qty < 1:
                 continue
 
-            logger.info(f"🎯 [Trend Breakout Detected] {name}({sym}) | 돌파가: ₩{price:,.0f} | 60선괴리: +{score*100:.1f}% | 수량: {qty}주")
+            logger.info(
+                f"🎯 [Leader Breakout Detected] {name}({sym}) | 돌파가: ₩{price:,.0f} | "
+                f"RS(시장초과): {rs_score:+.1f}% | 종합점수: {total_score:.1f} | 진입수량: {qty}주"
+            )
             success = self.submit_kis_order(sym, "buy", qty, price=0.0)
             if success:
                 self.positions[sym] = {
@@ -546,11 +764,12 @@ class KisTrendTrader:
                 target_size = min(equity * MAX_POSITION_PCT, available_cash * 0.85)
 
     def run_cycle(self):
-        if not self.check_market_clock():
+        is_open, status_msg = self.check_market_clock()
+        if not is_open:
             now = time.time()
             if now - self.last_market_status_log > 600:
                 kst = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
-                logger.info(f"🌙 [Market Closed] Current KST: {kst} | 정규장(09:05~15:15) 대기 중...")
+                logger.info(f"🌙 [{status_msg}] Current KST: {kst} | 정규장(09:20~15:15) 대기 중...")
                 self.last_market_status_log = now
             time.sleep(60)
             return

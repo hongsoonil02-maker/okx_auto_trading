@@ -530,12 +530,14 @@ class BaseStrategyBrain:
         self._entry_log = [t for t in self._entry_log if now - t < 86400]
         if self.BLOCK_WEEKEND and datetime.utcnow().weekday() >= 5:
             return False
-        # [Fix] 현재 보유 포지션이 0개이면 즉시 진입 허용 (완전 무포지션 고착 방지)
-        active_cnt = len(getattr(self, 'auto_active_pos', {}))
-        if active_cnt == 0:
-            return True
-        if sum(1 for t in self._entry_log if now - t < 3600) >= self.MAX_ENTRIES_PER_HOUR:
+        # [Fix] 포지션 0개여도 시간당 폭풍 진입 방지 (최근 1시간 진입 한도 우선 적용)
+        recent_1h = sum(1 for t in self._entry_log if now - t < 3600)
+        if recent_1h >= self.MAX_ENTRIES_PER_HOUR:
             return False
+        # 일일 상한 체크 (포지션이 0개이고 최근 1시간 진입이 없으면 최소 1개는 허용하여 고착 방지)
+        active_cnt = len(getattr(self, 'auto_active_pos', {}))
+        if active_cnt == 0 and recent_1h == 0:
+            return True
         return len(self._entry_log) < self.MAX_ENTRIES_PER_DAY
 
     async def _liquidity_ok(self, symbol: str, side, notional: float) -> bool:
@@ -1787,7 +1789,14 @@ class BaseStrategyBrain:
                             dca['stop_pct'] = self._stop_distance_pct(df)  # [Fix] 진입 시점 ATR 스탑 고정
                             return
 
-                if is_long_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not long_blocked:
+                # [청산 직후 쿨다운 체크 - 동일 심볼 연속 재진입으로 인한 수수료 출혈 차단 (최소 4봉)]
+                is_post_close_cooldown = False
+                if dca.get('last_close_t'):
+                    close_cooldown_ms = 4 * self.TIMEFRAME_MINUTES * 60 * 1000
+                    if (t_curr - dca['last_close_t']) < close_cooldown_ms:
+                        is_post_close_cooldown = True
+
+                if is_long_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not is_post_close_cooldown and not long_blocked:
                     self.logger.info(f"🟢 [Scoring System 신규 진입] {symbol} (Score: {long_score})")
                     entered = await self.execute_auto_entry(symbol, SideType.BUY, entry_type="new", base_score=long_score)
                     if entered:
@@ -1798,7 +1807,7 @@ class BaseStrategyBrain:
                         dca['first_entry_t'] = t_curr
                         dca['side'] = 'long'
                         dca['stop_pct'] = self._stop_distance_pct(df)
-                elif is_short_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not short_blocked:
+                elif is_short_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not is_post_close_cooldown and not short_blocked:
                     # [Fix] HTF 추세 필터: Jev 비활성화 시에만 1h EMA50 체크 (Jev 활성화 시 Jev가 1번 판단권자)
                     htf = await self._check_htf_trend(symbol)
                     if not jev_active and htf['is_uptrend']:
