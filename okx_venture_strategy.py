@@ -33,23 +33,8 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
     # [개선] 횡보장(ADX<22) 노이즈 진입 및 수수료 누수 차단 (기존 15.0 -> 22.0 상향)
     CHOP_ADX_BLOCK_THRESHOLD = 22.0
     
-    STOCK_KEYWORDS = []
-    BLACKLIST = ['KR200', 'SKHYNIX', 'SAMSUNG', 'MU', 'SHAZ', 'ISRG', 'ROBO', 'RAM', 'DRAM', 'GME',
-                 'GPS', 'SNXX', 'POL',  # GPS(-64.7%), SNXX(-38.3%), POL(-21.6%) 반복 손실 차단
-                 'LIT', 'CHIP', 'BOME', 'FIL',  # [8/26 백테스트] 90일 누적 출혈 상위 알트 차단
-                 'CAP', 'HYPE']  # [8/26] 5일간 48회 매수 반복 손실 — 무한 재진입 차단 / [9/28] 28연패 차단
-    # 주식/상품 토큰 전부 제외 (주식 전용 봇과 중복 거래 방지)
-    MAJORS_AND_STOCKS = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'LINK', 'DOT', 'BNB', 'TRX', 'SUI',
-                         'TSLA', 'NVDA', 'AAPL', 'AMZN', 'MSFT', 'META', 'GOOG', 'GOOGL', 'COIN',
-                         'SPCX', 'OPENAI', 'ANTHROPIC', 'RDDT', 'MU', 'SNDK', 'SOXL', 'SOXS', 'XAU', 'CL',
-                         # [Fix] 주식/ETF 토큰 추가 — 크립토와 다른 가격 패턴, 숏 구조적 불리
-                         'SKHY', 'KORU', 'CBRS', 'AEON',
-                         'PLTR', 'AMD', 'INTC', 'QCOM', 'BABA', 'UBER', 'ABNB', 'SNAP',
-                         'MSTR', 'HOOD', 'RIVN', 'NIO', 'PYPL', 'SQ', 'SHOP',
-                         'SPY', 'QQQ', 'IWM', 'DIA', 'GLD', 'SLV', 'XAG',
-                         'SAMSUNG', 'MRVL', 'AAOI', 'ARM', 'AVGO', 'CRWD', 'DELL', 'NFLX', 'SOFTBANK', 'TSM',
-                         ]
-    # [백테스트 검증] Venture 15m에서 재진입 PF 1.15→1.20 (180일, N=231)
+    # [사용자 지침] 유동성 최상위 엄선 5대 알트코인 정예 유니버스 (잡코인 배제)
+    TARGET_ALTS = ['DOGE', 'SUI', 'PEPE', 'NEAR', 'AVAX']
     REENTRY_ENABLED = True
 
     def _symbol_matches(self, symbol: str, ticker_data: dict, markets: dict) -> bool:
@@ -57,14 +42,8 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
             return False
         if 'USDT' not in symbol:
             return False
-        # [Fix] ccxt 심볼은 'BTC/USDT:USDT' 형태라 '-' split만으론 base 추출 불가
-        # → '/' split 추가 (기존엔 제외 목록이 작동하지 않아 ETH/주식토큰도 거래했음)
         base_coin = symbol.split('-')[0].split('/')[0]
-        if base_coin in self.MAJORS_AND_STOCKS:
-            return False
-        if any(b in symbol for b in self.BLACKLIST):
-            return False
-        return True
+        return base_coin in self.TARGET_ALTS
 
 
 
