@@ -240,11 +240,12 @@ class AlpacaCameronPullbackTrader30M:
             logger.error(f"❌ Failed to get market clock: {e}")
         return {"is_open": False}
 
-    def calculate_dynamic_position_size(self, setup: Dict[str, Any], trigger_price: float) -> int:
+    def calculate_dynamic_position_size(self, setup: Dict[str, Any], trigger_price: float, buying_power: Optional[float] = None) -> int:
         """
         Dynamic Half-Kelly Position Sizing:
         - Baseline: p=0.64 (30M win rate), b=3.0 (R:R) -> Half-Kelly: 16% ~ 20%
         - Scales based on pullback volume contraction & retracement depth
+        - Hard clamped to available buying power (95% safety margin)
         """
         vol_ratio = setup.get("vol_ratio", 1.0)
         retrace_ratio = setup.get("retrace_ratio", 40.0)
@@ -257,6 +258,9 @@ class AlpacaCameronPullbackTrader30M:
 
         kelly_pct = max(0.16, min(MAX_PORTFOLIO_PCT, MAX_PORTFOLIO_PCT * conviction))
         target_allocation = self.account_equity * kelly_pct
+        if buying_power is not None and buying_power > 0:
+            target_allocation = min(target_allocation, buying_power * 0.95)
+
         qty = math.floor(target_allocation / trigger_price)
         logger.info(f"   📊 [Dynamic Kelly Sizing] Target: {kelly_pct*100:.1f}% (~${target_allocation:,.2f}) -> {qty} shares")
         return qty
@@ -409,7 +413,7 @@ class AlpacaCameronPullbackTrader30M:
 
         return is_triggered, setup_info
 
-    def execute_bracket_order(self, symbol: str, setup: Dict[str, Any]) -> bool:
+    def execute_bracket_order(self, symbol: str, setup: Dict[str, Any], buying_power: Optional[float] = None) -> bool:
         """
         Executes an Alpaca Native Bracket Order:
         - Market/Marketable Limit Buy
@@ -426,7 +430,7 @@ class AlpacaCameronPullbackTrader30M:
         if take_profit <= min_tp:
             take_profit = round(base_ref + max(setup.get("risk_per_share", 0.05) * RISK_REWARD_RATIO, 0.05), 2)
 
-        qty = self.calculate_dynamic_position_size(setup, trigger_price)
+        qty = self.calculate_dynamic_position_size(setup, trigger_price, buying_power=buying_power)
         if qty <= 0:
             logger.warning(f"⚠️ [Order Skipped] Calculated quantity for {symbol} is 0.")
             return False
@@ -561,8 +565,19 @@ class AlpacaCameronPullbackTrader30M:
 
         own_positions = [s for s in self.own_entries if s in pos_symbols]
 
-        # EOD Market Close: 15:50 ~ 15:59 EST 당일 보유분 일괄 종가 청산
+        # EOD Market Close: 15:50 ~ 15:59 EST 당일 보유분 일괄 종가 청산 및 대기 주문 취소
         if now_est.hour == 15 and now_est.minute >= 50:
+            # 1. 미체결 대기 주문 취소
+            for o in open_orders:
+                cid = o.get("client_order_id", "")
+                if cid.startswith(f"{ORDER_TAG}-"):
+                    oid = o.get("id")
+                    try:
+                        session.delete(f"{ALPACA_REST_URL}/orders/{oid}", headers=HEADERS, timeout=5)
+                        logger.info(f"🔔 [EOD Window] Cancelled pending entry order {cid}")
+                    except Exception:
+                        pass
+            # 2. 보유 포지션 전량 청산
             if own_positions:
                 logger.info(f"🔔 [EOD Window] 15:50 EST 도달 - 당사 보유 종목 {own_positions} 일괄 종가 청산 진행")
                 for s in list(own_positions):
@@ -595,13 +610,26 @@ class AlpacaCameronPullbackTrader30M:
             logger.info(f"⏳ Past cutoff time ({CUTOFF_HOUR_EST}:{CUTOFF_MIN_EST:02d} EST). No new small-cap entries permitted.")
             return
 
+        # Cross-instance active symbols check (1H vs 30M mutual exclusion)
+        other_instance_symbols = set()
+        other_state_file = STATE_FILE.replace("30m", "1h") if "30m" in STATE_FILE else STATE_FILE.replace("1h", "30m")
+        try:
+            if os.path.exists(other_state_file):
+                with open(other_state_file, "r", encoding="utf-8") as f:
+                    other_data = json.load(f)
+                    other_instance_symbols = set(other_data.get("own_entries", {}).keys())
+        except Exception:
+            pass
+
         # Scan watchlist for First Pullback Setups
         for symbol in self.watchlist:
             # 1. 이미 보유 중
-            # 2. 접수 대기 중
-            # 3. 내부 추적 중
-            # 4. 최근 청산 후 쿨다운 기간(15분) 내
+            # 2. 다른 타임프레임 인스턴스(1H/30M)에서 이미 진입/추적 중
+            # 3. 접수 대기 중
+            # 4. 내부 추적 중
+            # 5. 최근 청산 후 쿨다운 기간(15분) 내
             if (symbol in self.own_entries or 
+                symbol in other_instance_symbols or
                 symbol in pos_symbols or 
                 symbol in pending_symbols or 
                 (now_t - self.cooldowns.get(symbol, 0) < COOLDOWN_SEC)):
@@ -620,7 +648,7 @@ class AlpacaCameronPullbackTrader30M:
                     continue
 
                 logger.info(f"🔥 [SETUP CONFIRMED] {symbol} | Bar: {bar_time} | Retrace: {setup['retrace_ratio']}% | Risk: {setup['risk_pct']}%")
-                success = self.execute_bracket_order(symbol, setup)
+                success = self.execute_bracket_order(symbol, setup, buying_power=acc.get("buying_power"))
                 if success:
                     break
 
