@@ -115,9 +115,10 @@ class UniversalJevGate:
         try:
             session = await self._get_session()
             url = "https://openrouter.ai/api/v1/chat/completions" if self.api_key.startswith("sk-or-") else "https://api.typesafe.ai/v1/systemone"
+            model_target = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-001") if self.api_key.startswith("sk-or-") else PINNED_MODEL_VERSION
 
             payload = {
-                "model": PINNED_MODEL_VERSION if not self.api_key.startswith("sk-or-") else "meta-llama/llama-3.2-3b-instruct",
+                "model": model_target,
                 "messages": [
                     {"role": "system", "content": "You are a quantitative sub-second trading risk validator. Respond strictly in valid JSON format: {\"approved\": bool, \"confidence\": float (0.0~1.0), \"risk_level\": \"LOW\"|\"MEDIUM\"|\"HIGH\", \"reason\": string}"},
                     {"role": "user", "content": prompt}
@@ -126,7 +127,8 @@ class UniversalJevGate:
                 "max_tokens": 120
             }
 
-            async with session.post(url, json=payload) as resp:
+            timeout_sec = (self.timeout_ms or int(os.getenv("JEV_TIMEOUT_MS", "2500"))) / 1000.0
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
                 elapsed_ms = (time.perf_counter() - start_t) * 1000.0
                 if resp.status == 200:
                     data = await resp.json()
@@ -238,12 +240,16 @@ class UniversalJevGate:
                 f"Approve only if continuation probability >= 65%."
             )
         elif asset_class == "US_STOCKS":
+            surge = context.get('surge_pct') or context.get('gap_pct', 0)
+            rvol = context.get('vol_ratio') or context.get('rvol', 1.0)
+            retrace = context.get('retrace_pct') or context.get('retrace_ratio', 0)
             return (
                 f"Asset: US Equities ({symbol}) | Setup: {setup_name}\n"
-                f"Gap: {context.get('gap_pct', 0):.2f}% | Relative Vol: {context.get('rvol', 1.0):.2f}x\n"
-                f"Catalyst/News: {context.get('headline', 'None reported')} | Sector: {context.get('sector', 'General')}\n"
-                f"Question: Is this gap driven by legitimate catalyst, or a dilution offering / pump-and-dump trap?\n"
-                f"Approve only if clean continuation without offering risk."
+                f"Impulse Surge: {surge:.2f}% | Retracement: {retrace:.1f}%\n"
+                f"Relative Vol / Contraction: {rvol:.2f}x\n"
+                f"Catalyst/Context: {context.get('headline', 'Technical Momentum Pullback')} | Sector: {context.get('sector', 'SmallCap Momentum')}\n"
+                f"Question: Is this setup a legitimate momentum continuation, or a fake liquidity grab / dilution pump-and-dump trap?\n"
+                f"Approve only if clean continuation probability >= 60%."
             )
         else: # KR_STOCKS
             return (
