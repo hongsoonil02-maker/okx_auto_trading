@@ -11,4 +11,8 @@ __pycache__/
 *.log*
 remote_deploy/kis_token.json
 remote_deploy/kis_positions.json
+remote_deploy/*positions*.json*
+remote_deploy/*equity_history*.json
+remote_deploy/*regime_state*.json
+*.csv
 

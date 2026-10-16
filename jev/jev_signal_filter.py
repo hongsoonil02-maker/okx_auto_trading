@@ -344,11 +344,12 @@ class JevSignalFilter:
         pnl_pct = ((current_price - entry_price) / entry_price) * leverage if side_u in ("LONG", "BUY") else ((entry_price - current_price) / entry_price) * leverage
 
         # 1. 초고속 LOB Imbalance 평가 (네트워크 지연 0ms)
-        # 극단적인 역방향 호가벽 쏠림 감지 시 즉시 탈출
-        if side_u in ("LONG", "BUY") and lob.imbalance <= -0.45:
-            return True, f"LOB_ADVERSE_IMBALANCE_SELL (imb: {lob.imbalance:+.2f})"
-        elif side_u in ("SHORT", "SELL") and lob.imbalance >= +0.45:
-            return True, f"LOB_ADVERSE_IMBALANCE_BUY (imb: {lob.imbalance:+.2f})"
+        # 극단적인 역방향 호가벽 쏠림 감지 시 즉시 탈출 (노이즈 방어 위해 -0.45 -> -0.65로 완화)
+        adverse_imb_threshold = float(os.getenv("JEV_ADVERSE_IMB_THRESHOLD", "0.65"))
+        if side_u in ("LONG", "BUY") and lob.imbalance <= -adverse_imb_threshold:
+            return True, f"LOB_ADVERSE_IMBALANCE_SELL (imb: {lob.imbalance:+.2f} <= -{adverse_imb_threshold:.2f})"
+        elif side_u in ("SHORT", "SELL") and lob.imbalance >= +adverse_imb_threshold:
+            return True, f"LOB_ADVERSE_IMBALANCE_BUY (imb: {lob.imbalance:+.2f} >= +{adverse_imb_threshold:.2f})"
 
         # 2. 20배 초단타 스캘핑 칼익절 (ROE +10% 이상 도달 후 수급 둔화 시 확정)
         if pnl_pct >= 0.10:

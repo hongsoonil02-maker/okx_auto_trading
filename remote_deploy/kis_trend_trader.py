@@ -39,8 +39,10 @@ stream_handler.setFormatter(formatter)
 file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=3, encoding="utf-8")
 file_handler.setFormatter(formatter)
 
-logger.addHandler(stream_handler)
 logger.addHandler(file_handler)
+# systemd가 stdout을 같은 로그 파일로 append하므로 콘솔 핸들러는 대화형 실행 시에만 추가 (중복 방지)
+if sys.stdout.isatty():
+    logger.addHandler(stream_handler)
 
 # ── ROBUST HTTP SESSION ──
 session = requests.Session()
@@ -259,13 +261,13 @@ class KisTrendTrader:
             return False, f"KRX Holiday ({today_str})"
             
         current_time = kst_now.time()
-        open_time = datetime.strptime("09:20", "%H:%M").time()  # 09:20 시작으로 개장 5분 시장가 슬리피지 누수 차단
+        open_time = datetime.strptime("09:05", "%H:%M").time()  # 09:05 시작으로 개장 5분 변동성 슬리피지 누수 차단
         close_time = datetime.strptime("15:15", "%H:%M").time()
         
         if open_time <= current_time <= close_time:
             return True, "Market Open"
         elif current_time < open_time:
-            return False, f"Pre-market (09:20 개장 대기)"
+            return False, f"Pre-market (09:05 개장 대기)"
         else:
             return False, f"Market Closed (15:15 종료)"
 
@@ -421,7 +423,8 @@ class KisTrendTrader:
                 output2 = data.get("output2", [])
                 if output2:
                     equity = float(output2[0].get("tot_evlu_amt", 0))
-                    self.account_info["equity"] = equity
+                    true_cash = self.fetch_available_cash()
+                    self.account_info["equity"] = max(equity, true_cash)
 
                 output1 = data.get("output1", [])
                 active_pdnos = set()
@@ -486,8 +489,8 @@ class KisTrendTrader:
             "PDNO": symbol,
             "ORD_UNPR": "0",
             "ORD_DVSN": "01",
-            "CMA_EVLU_AMT_ICLD_YN": "N",
-            "OVRS_ICLD_YN": "N"
+            "CMA_EVLU_AMT_ICLD_YN": "Y",
+            "OVRS_ICLD_YN": "Y"
         }
         try:
             resp = session.get(url, headers=headers, params=params, timeout=4)
@@ -495,10 +498,11 @@ class KisTrendTrader:
                 data = resp.json()
                 if data.get("rt_cd") == "0" and "output" in data:
                     out = data["output"]
-                    # [개선] 매도대금 재사용(D+2 정산 전)이 포함된 미수 없는 순수 매수가능금액(nrcvb_buy_amt) 우선 활용
-                    cash = float(out.get("nrcvb_buy_amt") or out.get("max_buy_amt") or out.get("ord_psbl_cash", 0))
+                    # [개선] 통합증거금/외화대용 주문가능금액(max_buy_amt/nrcvb_buy_amt) 우선 활용
+                    cash = float(out.get("max_buy_amt") or out.get("nrcvb_buy_amt") or out.get("ord_psbl_cash", 0))
                     self.account_info["cash"] = cash
-                    logger.info(f"💵 [Buying Power Checked] 주문가능총액: ₩{cash:,.0f} (순수현금: ₩{float(out.get('ord_psbl_cash', 0)):,.0f}, 재사용: ₩{float(out.get('ruse_psbl_amt', 0)):,.0f})")
+                    self.account_info["equity"] = max(self.account_info.get("equity", 0.0), cash)
+                    logger.info(f"💵 [Buying Power Checked] 주문가능총액: ₩{cash:,.0f} (순수현금: ₩{float(out.get('ord_psbl_cash', 0)):,.0f})")
                     return cash
         except Exception as e:
             logger.error(f"❌ Failed to fetch true buying cash: {e}")

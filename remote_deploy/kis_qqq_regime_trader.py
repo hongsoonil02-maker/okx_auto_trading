@@ -63,9 +63,13 @@ TARGET_WEIGHTS = {"QQQ": 1.0 - TQQQ_WEIGHT, "TQQQ": TQQQ_WEIGHT}
 REBALANCE_TOLERANCE = 0.20          # 목표 대비 ±20% 벗어날 때만 매매 (불필요한 수수료 억제)
 # 50% QQQ Regime ETF + 50% JEV Alpha 개별주 황금비 분할
 ALLOCATION_RATIO = float(os.getenv("KIS_REGIME_ALLOCATION", "0.50")) # 전체 계좌 자산 중 ETF 봇 할당 비중 (기본 50%)
-INVEST_BUFFER = 0.97 * ALLOCATION_RATIO                              # 할당 비중의 97%만 투자 (수수료/여유금)
-DECISION_START_ET = (15, 30)
-DECISION_END_ET = (15, 50)
+INVEST_BUFFER = 0.97                                                 # ETF 슬리브 자산의 97%만 투자 (3% 수수료/여유금)
+SL_LIMIT_OFFSET = 0.995                                              # EOD 청산 매도 시 체결우선 지정가 (-0.5%)
+# [주야간 100% 풀가동 방안 1] 개장 초반(10:00~10:30 ET) 진입 후 장마감 전(15:40~15:55 ET) 전량 청산하여 한국 장 개장 시 원화 100% 복구
+DECISION_START_ET = (10, 0)
+DECISION_END_ET = (10, 30)
+EOD_CLOSE_START_ET = (15, 40)
+EOD_CLOSE_END_ET = (15, 55)
 RETRY_INTERVAL_SEC = 300            # 결정 창 내 미체결 시 5분 후 취소·재주문
 POLL_INTERVAL_SEC = 60
 
@@ -182,6 +186,23 @@ class KisQqqRegimeTrader:
             return "CLOSED"
         s, e = DECISION_START_ET[0] * 60 + DECISION_START_ET[1], DECISION_END_ET[0] * 60 + DECISION_END_ET[1]
         return "DECISION" if s <= m <= e else "OPEN"
+
+    def close_all_positions(self):
+        """[주야간 풀가동] 장 마감 전 미국 ETF 전량 청산 (한국 장 개장 시 원화 예수금 100% 복구)"""
+        self.cancel_open_orders()
+        self.reconcile()
+        if not self.holdings:
+            return
+        logger.info(f"🌅 [EOD Liquidation] 주야간 풀가동 원칙에 따라 장마감 전 전량 매도 -> 원화 예수금 복구")
+        prices = {s: self.get_price(s) for s in self.holdings}
+        for sym, h in list(self.holdings.items()):
+            px = prices.get(sym) or h.get("avg", 0.0)
+            if px > 0 and h["qty"] > 0:
+                limit_px = round(px * SL_LIMIT_OFFSET, 2)
+                logger.info(f"📤 [EOD Exit] {sym} x {h['qty']} @ ${limit_px:.2f} (체결우선 -0.5% 지정가, 현재가 ${px:.2f})")
+                self.order(sym, "sell", h["qty"], limit_px)
+        self.state["last_eod_attempt_ts"] = time.time()
+        self.save_state()
 
     # ── 신호 ──
     def refresh_sma(self):
@@ -347,8 +368,9 @@ class KisQqqRegimeTrader:
         self.reconcile()
         prices = {s: self.get_price(s) for s in set(list(TARGET_WEIGHTS) + self.state["legacy_liquidate"])}
         power = self.buying_power()
+        power_for_regime = power * ALLOCATION_RATIO
         holdings_value = sum(h["qty"] * (prices.get(s) or h["avg"]) for s, h in self.holdings.items())
-        investable = (power + holdings_value) * INVEST_BUFFER
+        investable = (power_for_regime + holdings_value) * INVEST_BUFFER
 
         # 1. 레거시 종목 청산 (레짐 무관)
         for sym in list(self.state["legacy_liquidate"]):

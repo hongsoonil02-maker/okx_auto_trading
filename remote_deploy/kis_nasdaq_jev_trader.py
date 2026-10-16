@@ -28,7 +28,13 @@ from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(CURRENT_DIR, ".."))
 load_dotenv(os.path.join(CURRENT_DIR, "..", ".env"))
+
+try:
+    from jev.universal_jev_gate import UniversalJevGate
+except ImportError:
+    UniversalJevGate = None
 
 # ── LOGGING SETUP ──
 LOG_FILE = os.path.join(CURRENT_DIR, "kis_nasdaq_jev_trader.log")
@@ -75,6 +81,10 @@ MAX_POSITION_PCT = 0.30            # 30% per position out of the JEV pool (~$750
 LOOP_INTERVAL_SEC = 10             # 10s poll cycle during regular market hours
 POST_LOSS_COOLDOWN_SEC = 1800.0    # 30m lockout post loss
 NORMAL_COOLDOWN_SEC = 300.0        # 5m cooldown post win
+PENDING_TIMEOUT_SEC = 90           # 미체결 주문 취소·재시도까지 대기
+RECONCILE_INTERVAL_SEC = 30        # 원장 대조 주기
+SL_LIMIT_OFFSET = 0.995            # 손절 매도: 현재가 -0.5% (체결 우선 제한가)
+TP_LIMIT_OFFSET = 0.998            # 익절/트레일링 매도: 현재가 -0.2%
 
 NY = ZoneInfo("America/New_York")
 US_MARKET_HOLIDAYS = {
@@ -96,6 +106,7 @@ class KisNasdaqJevTrader:
         self.token_expired_at = 0.0
         self.positions: Dict[str, dict] = {} # sym -> {qty, avg_entry, peak_price, entry_time}
         self.trade_cooldowns: Dict[str, float] = {}
+        self.jev_gate = UniversalJevGate(timeout_ms=2500) if UniversalJevGate else None
         self.total_account_equity: float = 5000.0
         self.jev_pool_size: float = 2500.0
         self.load_positions()
@@ -106,7 +117,7 @@ class KisNasdaqJevTrader:
         logger.info(f"   Capital Allocation: {ALLOCATION_RATIO*100:.0f}% of total account")
         logger.info("   Risk Profile (NVDA/AAPL): SL -1.2% | TP +2.8% | Trail +1.5%")
         logger.info("   Risk Profile (TSLA):      SL -2.2% | TP +4.5% | Trail +2.5%")
-        logger.info(f"   JEV Gating Endpoint: {JEV_URL}")
+        logger.info(f"   JEV Gating Engine: {'Local UniversalJevGate (coinbot)' if self.jev_gate else JEV_URL}")
         logger.info("=" * 75)
 
     def load_positions(self):
@@ -198,6 +209,7 @@ class KisNasdaqJevTrader:
             return
         # 1. 해외주식 주식 평가액 조회 (TTTS3012R)
         tot_evlu_usd = 0.0
+        usd_cash = 0.0
         try:
             r = session.get(f"{KIS_URL}/uapi/overseas-stock/v1/trading/inquire-balance",
                             headers=self.headers("TTTS3012R"),
@@ -206,6 +218,7 @@ class KisNasdaqJevTrader:
             if r.status_code == 200:
                 out2 = r.json().get("output2", {})
                 tot_evlu_usd = float(out2.get("tot_evlu_pfls_amt", 0.0))
+                usd_cash = float(out2.get("frcr_dnca_amt", 0.0) or 0.0)
         except Exception as e:
             logger.warning(f"⚠️ Account sync error (Overseas): {e}")
 
@@ -233,23 +246,40 @@ class KisNasdaqJevTrader:
             pass
 
         krw_in_usd = krw_cash / fx_rate if krw_cash > 0 else 0.0
+        self.available_cash_usd = usd_cash + krw_in_usd
         total_combined_usd = tot_evlu_usd + krw_in_usd
         if total_combined_usd > 0:
             self.total_account_equity = total_combined_usd
             self.jev_pool_size = self.total_account_equity * ALLOCATION_RATIO
             logger.info(f"💼 [Account Sync] Total Equity: ${self.total_account_equity:,.2f} "
-                        f"(주식 ${tot_evlu_usd:,.2f} + 원화 ${krw_in_usd:,.2f} [₩{krw_cash:,.0f}]) "
+                        f"(주식 ${tot_evlu_usd:,.2f} + 가용현금 ${self.available_cash_usd:,.2f} [₩{krw_cash:,.0f}]) "
                         f"| JEV Pool (50%): ${self.jev_pool_size:,.2f}")
 
     def query_jev_decision(self, sym: str, side: str = "buy") -> Tuple[bool, float, str]:
-        """Queries the Bun Sidecar Microstructure LOB Daemon"""
+        """Queries local UniversalJevGate (standalone) or remote Bun Sidecar"""
+        if self.jev_gate:
+            try:
+                import asyncio
+                loop = asyncio.new_event_loop()
+                dec = loop.run_until_complete(
+                    self.jev_gate.verify_entry(
+                        asset_class="US_STOCKS",
+                        symbol=sym,
+                        setup_name="KIS_JEV_LOB",
+                        context={"side": side}
+                    )
+                )
+                loop.close()
+                return dec.approved, dec.confidence, dec.reason
+            except Exception as e:
+                logger.warning(f"⚠️ UniversalJevGate error for {sym}: {e}")
+
         try:
-            r = session.post(f"{JEV_URL}/predict", json={"symbol": sym, "side": side}, timeout=3)
+            r = session.post(f"{JEV_URL}/predict", json={"symbol": sym, "side": side}, timeout=2)
             if r.status_code == 200:
                 d = r.json()
                 return d.get("approved", False), float(d.get("score", 0.5)), d.get("reason", "")
-        except Exception as e:
-            # Fallback if connection fails
+        except Exception:
             pass
         return False, 0.5, "CONNECTION_ERROR"
 
@@ -274,9 +304,112 @@ class KisNasdaqJevTrader:
             logger.error(f"❌ [Order Exception] {sym}: {e}")
         return None
 
+    def cancel_order(self, sym: str, odno: str, qty: int) -> bool:
+        if not odno or not self.issue_token():
+            return False
+        body = {"CANO": KIS_CANO, "ACNT_PRDT_CD": KIS_PRDT_ABRV, "OVRS_EXCG_CD": "NASD", "PDNO": sym,
+                "ORG_ODNO": str(odno), "RVSE_CNCL_DVSN_CD": "02", "ORD_QTY": str(qty),
+                "OVRS_ORD_UNPR": "0", "ORD_SVR_DVSN_CD": "0"}
+        try:
+            r = session.post(f"{KIS_URL}/uapi/overseas-stock/v1/trading/order-rvsecncl",
+                             headers=self.headers("TTTT1004U"), json=body, timeout=10)
+            d = r.json()
+            if d.get("rt_cd") == "0":
+                logger.info(f"🚫 [Cancelled] {sym} ODNO {odno}")
+                return True
+            logger.info(f"ℹ️ [Cancel skipped] {sym} ODNO {odno} ({d.get('msg1')}) — 이미 체결됐을 가능성")
+        except Exception as e:
+            logger.warning(f"⚠️ cancel exception {sym}: {e}")
+        return False
+
+    def fetch_ledger(self) -> Optional[Dict[str, dict]]:
+        """원장(TTTS3012R) 기준 보유 종목. 조회 실패 시 None (빈 dict와 구분)."""
+        if not self.issue_token():
+            return None
+        try:
+            r = session.get(f"{KIS_URL}/uapi/overseas-stock/v1/trading/inquire-balance",
+                            headers=self.headers("TTTS3012R"),
+                            params={"CANO": KIS_CANO, "ACNT_PRDT_CD": KIS_PRDT_ABRV, "OVRS_EXCG_CD": "NASD",
+                                    "TR_CRCY_CD": "USD", "CTX_AREA_FK200": "", "CTX_AREA_NK200": ""}, timeout=8)
+            if r.status_code == 200 and r.json().get("rt_cd") == "0":
+                held: Dict[str, dict] = {}
+                for row in r.json().get("output1", []):
+                    sym = (row.get("ovrs_pdno") or "").strip().upper()
+                    try:
+                        qty = int(float(row.get("ovrs_cblc_qty", 0)))
+                        avg = float(row.get("pchs_avg_pric", 0.0))
+                    except (ValueError, TypeError):
+                        continue
+                    if sym and qty > 0:
+                        held[sym] = {"qty": qty, "avg": avg}
+                return held
+        except Exception as e:
+            logger.warning(f"⚠️ ledger fetch error: {e}")
+        return None
+
+    def reconcile_positions(self):
+        """원장 대조: 미체결 확인/취소, 수량·평단 동기화, 유령 포지션 정리, 외부 보유분 편입"""
+        held = self.fetch_ledger()
+        if held is None:
+            return
+        now = time.time()
+        changed = False
+        for sym, pos in list(self.positions.items()):
+            # 1) 진입 체결 대기 중
+            if pos.get("pending_entry"):
+                h = held.get(sym)
+                if h:
+                    logger.info(f"✅ [Fill Confirmed] {sym} {h['qty']}주 @ ${h['avg']:.2f} (실체결가 반영)")
+                    pos.update(qty=h["qty"], avg_entry=h["avg"],
+                               peak_price=max(pos.get("peak_price", h["avg"]), h["avg"]))
+                    pos.pop("pending_entry", None)
+                    changed = True
+                elif now - pos.get("entry_time", 0) > PENDING_TIMEOUT_SEC:
+                    self.cancel_order(sym, pos.get("odno", ""), pos["qty"])
+                    logger.warning(f"⏱️ [Entry Timeout] {sym} 미체결 {PENDING_TIMEOUT_SEC}s 초과 — 취소 후 추적 해제")
+                    del self.positions[sym]
+                    changed = True
+                continue
+            # 2) 청산 체결 대기 중
+            if pos.get("pending_exit"):
+                if sym not in held:
+                    logger.info(f"✅ [Exit Filled] {sym} 원장 확인 — 포지션 정리")
+                    cd = POST_LOSS_COOLDOWN_SEC if pos.get("last_pnl_pct", 0) < 0 else NORMAL_COOLDOWN_SEC
+                    self.trade_cooldowns[sym] = now + cd
+                    del self.positions[sym]
+                    changed = True
+                elif now - pos.get("exit_order_ts", 0) > PENDING_TIMEOUT_SEC:
+                    self.cancel_order(sym, pos.get("exit_odno", ""), pos["qty"])
+                    pos.pop("pending_exit", None)
+                    logger.warning(f"⏱️ [Exit Timeout] {sym} 미체결 — 취소, 다음 사이클 새 가격으로 재주문")
+                    changed = True
+                continue
+            # 3) 일반 포지션: 원장과 동기화
+            h = held.get(sym)
+            if not h:
+                logger.warning(f"⚠️ [Reconcile] {sym} 원장에 없음(외부 매도/수동 청산) — 추적 해제")
+                del self.positions[sym]
+                changed = True
+            elif h["qty"] != pos["qty"] or abs(h["avg"] - pos["avg_entry"]) > 0.01:
+                logger.info(f"🔄 [Reconcile] {sym} 원장 동기화: {pos['qty']}주@${pos['avg_entry']:.2f} → {h['qty']}주@${h['avg']:.2f}")
+                pos["qty"] = h["qty"]
+                pos["avg_entry"] = h["avg"]
+                changed = True
+        # 4) 유니버스 내 미추적 보유분 편입
+        for sym in SYMBOLS_UNIVERSE:
+            if sym in held and sym not in self.positions:
+                logger.info(f"📥 [Reconcile] {sym} 원장 보유 편입: {held[sym]['qty']}주 @ ${held[sym]['avg']:.2f}")
+                self.positions[sym] = {"qty": held[sym]["qty"], "avg_entry": held[sym]["avg"],
+                                       "peak_price": held[sym]["avg"], "entry_time": now}
+                changed = True
+        if changed:
+            self.save_positions()
+
     def manage_exits(self):
         """Monitors positions for Take Profit, Stop Loss, and Trailing Stops"""
         for sym, pos in list(self.positions.items()):
+            if pos.get("pending_entry") or pos.get("pending_exit"):
+                continue  # 체결 대기 중 — reconcile이 처리
             qty = pos["qty"]
             avg_entry = pos["avg_entry"]
             peak = pos["peak_price"]
@@ -306,17 +439,26 @@ class KisNasdaqJevTrader:
                 exit_reason = f"TRAILING_STOP_{pnl_pct*100:.2f}%"
 
             if exit_reason:
-                logger.info(f"🚨 [Exit Triggered] {sym} | Reason: {exit_reason} | Current: ${curr_px:.2f} (Entry: ${avg_entry:.2f})")
-                odno = self.order(sym, "sell", qty, curr_px)
+                # 손절은 체결 우선(-0.5% 제한가), 익절/트레일링은 -0.2% 제한가
+                offset = SL_LIMIT_OFFSET if pnl_pct < 0 else TP_LIMIT_OFFSET
+                limit_px = round(curr_px * offset, 2)
+                logger.info(f"🚨 [Exit Triggered] {sym} | Reason: {exit_reason} | Current: ${curr_px:.2f} → 제한가 ${limit_px:.2f} (Entry: ${avg_entry:.2f})")
+                odno = self.order(sym, "sell", qty, limit_px)
                 if odno:
-                    # Apply Cooldown
-                    cd = POST_LOSS_COOLDOWN_SEC if pnl_pct < 0 else NORMAL_COOLDOWN_SEC
-                    self.trade_cooldowns[sym] = time.time() + cd
-                    del self.positions[sym]
+                    # 체결 확인은 reconcile이 수행 (미체결 시 90초 후 취소·재주문)
+                    pos["pending_exit"] = True
+                    pos["exit_odno"] = odno
+                    pos["exit_order_ts"] = time.time()
+                    pos["last_pnl_pct"] = pnl_pct
                     self.save_positions()
 
     def scan_and_enter(self):
         """Evaluates entry signals and executes approved Jev trades within capital pool"""
+        now_ny = datetime.now(NY)
+        # 15:30 ET 이후 신규 진입 차단 (장마감 전 EOD 청산 대비)
+        if (now_ny.hour == 15 and now_ny.minute >= 30) or (now_ny.hour >= 16):
+            return
+
         if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
             return
 
@@ -336,26 +478,35 @@ class KisNasdaqJevTrader:
             logger.info(f"🔎 [Jev Scan] {sym} | Approved: {approved} | Score: {score:.3f} | Reason: {reason}")
 
             if approved:
-                # Sizing: 30% of Jev Pool
-                target_alloc = self.jev_pool_size * MAX_POSITION_PCT
+                # Sizing: 30% of Jev Pool, capped by actual available cash (98% buffer for commissions)
+                max_cash_alloc = getattr(self, "available_cash_usd", 0.0) * 0.98
+                target_alloc = min(self.jev_pool_size * MAX_POSITION_PCT, max_cash_alloc)
                 qty = int(target_alloc / curr_px)
                 if qty < 1:
-                    logger.info(f"ℹ️ [{sym}] Qty is 0 (Price ${curr_px:.2f} > Alloc ${target_alloc:.2f}); skipping.")
+                    logger.info(f"ℹ️ [{sym}] Qty is 0 (Price ${curr_px:.2f} > Alloc ${target_alloc:.2f} / Cash ${max_cash_alloc:.2f}); 5m cooldown.")
+                    self.trade_cooldowns[sym] = now + 300.0
+                    self.save_positions()
                     continue
 
                 logger.info(f"🎯 [Jev Execution] Approved! Sizing {qty} shares of {sym} (~${qty * curr_px:.2f})")
                 odno = self.order(sym, "buy", qty, curr_px)
                 if odno:
+                    # 체결 확정 전 펜딩 상태 — 실수량/실체결가는 reconcile이 원장에서 반영
                     self.positions[sym] = {
                         "qty": qty,
                         "avg_entry": curr_px,
                         "peak_price": curr_px,
                         "entry_time": time.time(),
-                        "odno": odno
+                        "odno": odno,
+                        "pending_entry": True
                     }
                     self.save_positions()
                     if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
                         break
+                else:
+                    logger.warning(f"⚠️ [{sym}] Order rejected by broker — 5m cooldown applied to avoid API spam.")
+                    self.trade_cooldowns[sym] = now + 300.0
+                    self.save_positions()
 
     def run_cycle(self):
         if not self.is_market_open():
@@ -364,6 +515,10 @@ class KisNasdaqJevTrader:
             return
 
         self.sync_account()
+        now = time.time()
+        if now - getattr(self, "_last_reconcile", 0.0) >= RECONCILE_INTERVAL_SEC:
+            self._last_reconcile = now
+            self.reconcile_positions()
         self.manage_exits()
         self.scan_and_enter()
         time.sleep(LOOP_INTERVAL_SEC)

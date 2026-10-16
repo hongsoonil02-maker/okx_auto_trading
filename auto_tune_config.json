@@ -3,9 +3,9 @@
   "blocked_hours_kst_okx": [],
   "blacklisted_symbols": {
     "OKX": [
-      "AAVE/USDT:USDT",
       "ENA/USDT:USDT",
-      "RAY/USDT:USDT",
+      "LINK/USDT:USDT",
+      "PONS/USDT:USDT",
       "WLD/USDT:USDT"
     ]
   },
