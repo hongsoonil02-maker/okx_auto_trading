@@ -81,7 +81,7 @@ class BotConfig:
     @property
     def okx_hard_sl_pct(self) -> float:
         # [Walk-Forward OOS] fallback도 마진 -8% 손절 최적값과 일치
-        return float(self._okx_params().get("HARD_SL_PCT", 0.08))
+        return float(self._okx_params().get("HARD_SL_PCT", 0.02))
 
     @property
     def okx_position_pct(self) -> float:
@@ -105,7 +105,7 @@ class BotConfig:
 
     @property
     def okx_max_dca(self) -> int:
-        return int(self._okx_params().get("MAX_DCA", 8))
+        return int(self._okx_params().get("MAX_DCA", 0))
 
     @property
     def okx_dca_gap_pct(self) -> float:

@@ -65,15 +65,15 @@ HEADERS = {
 # Universe & Pairing
 SYMBOLS_UNIVERSE = ["QQQ", "TQQQ", "SQQQ", "SOXL", "SOXS", "NVDA", "TSLA", "AAPL"]
 LEVERAGED_3X = {"TQQQ", "SQQQ", "SOXL", "SOXS"}
-MAX_CONCURRENT_POSITIONS = 4
+MAX_CONCURRENT_POSITIONS = 2
 MAX_POSITION_PCT = 0.15     # 15% of equity per position (~$15,000 on $100k equity)
 LOOP_INTERVAL_SEC = 10      # Poll market every 10 seconds during open hours
 
 def get_symbol_risk(symbol: str) -> Tuple[float, float, float]:
     """Returns (stop_loss_pct, take_profit_pct, trailing_arm_pct) tailored to asset volatility"""
     if symbol in LEVERAGED_3X:
-        return 0.024, 0.042, 0.020  # 3x ETF: 2.4% SL, 4.2% TP, 2.0% Trail Arm
-    return 0.012, 0.028, 0.015       # 1x Equities: 1.2% SL, 2.8% TP, 1.5% Trail Arm
+        return 0.020, 0.050, 0.020  # 3x ETF: 2.0% SL, 5.0% TP, 2.0% Trail Arm (2.5x RR)
+    return 0.012, 0.035, 0.015       # 1x Equities: 1.2% SL, 3.5% TP, 1.5% Trail Arm (~3x RR)
 
 class AlpacaJevTrader:
     def __init__(self, simulation_mode: Optional[bool] = None):
@@ -328,6 +328,18 @@ class AlpacaJevTrader:
             q = quotes.get(symbol, {})
             imb = q.get("imbalance", 0.0)
 
+            # Breakeven Protection: If position surged +1.8%+, lock in stop at breakeven (+0.2%)
+            max_plpc = getattr(self, "_pos_max_pnl", {}).setdefault(symbol, unrealized_plpc)
+            if unrealized_plpc > max_plpc:
+                self._pos_max_pnl[symbol] = unrealized_plpc
+                max_plpc = unrealized_plpc
+
+            if max_plpc >= 0.018 and unrealized_plpc <= 0.002:
+                logger.info(f"🛡️ [Breakeven Lock] {symbol} {side.upper()} reached +{max_plpc*100:.1f}%, now pulling back (+{unrealized_plpc*100:.2f}%). Closing to protect capital.")
+                self.close_position(symbol, "BREAKEVEN_PROTECT")
+                self._pos_max_pnl.pop(symbol, None)
+                continue
+
             # Check if trailing take profit should trigger
             if unrealized_plpc >= sym_tp:
                 logger.info(f"🎯 [Take Profit Trigger] {symbol} {side.upper()} reached +{unrealized_plpc*100:.2f}% (Target: {sym_tp*100:.1f}%)")
@@ -376,7 +388,7 @@ class AlpacaJevTrader:
         quotes = get_quotes_cache()
 
         # Step 1: Scan QQQ benchmark for macro regime
-        qqq_bars = self.fetch_bars("QQQ", timeframe="1Min", limit=55)
+        qqq_bars = self.fetch_bars("QQQ", timeframe="15Min", limit=55)
         qqq_tech = self.calculate_technical_signals(qqq_bars)
         qqq_quote = quotes.get("QQQ", {})
         qqq_imb = qqq_quote.get("imbalance", 0.0)
@@ -389,14 +401,15 @@ class AlpacaJevTrader:
 
         candidate_symbols = []
         if is_bullish:
-            # Bullish: Prioritize Tech Leaders and TQQQ (Backtest validated best Sharpe)
-            candidate_symbols = [("TQQQ", "buy"), ("NVDA", "buy"), ("AAPL", "buy"), ("SOXL", "buy"), ("TSLA", "buy"), ("QQQ", "buy")]
+            # Bullish Regime: Focus on high-momentum leaders & TQQQ
+            candidate_symbols = [("TQQQ", "buy"), ("NVDA", "buy"), ("SOXL", "buy"), ("AAPL", "buy")]
         elif is_bearish:
-            # Bearish: Prioritize Inverse ETFs
+            # Bearish Regime: Inverse hedge ETFs
             candidate_symbols = [("SQQQ", "buy"), ("SOXS", "buy")]
         else:
-            # Neutral macro: selectively scan top resilient tech equities
-            candidate_symbols = [("AAPL", "buy"), ("NVDA", "buy"), ("TQQQ", "buy"), ("QQQ", "buy")]
+            # Neutral / Choppy Macro: Strictly preserve 100% CASH! No trades in chop!
+            logger.info("⏸️ [Regime Gate: NEUTRAL/CHOP] QQQ lacks clear trend. Holding 100% Cash dry powder.")
+            return
 
         for sym, side in candidate_symbols:
             if current_active >= MAX_CONCURRENT_POSITIONS:
@@ -407,7 +420,7 @@ class AlpacaJevTrader:
                 continue
 
             # Fetch symbol bars
-            df = self.fetch_bars(sym, timeframe="1Min", limit=30)
+            df = self.fetch_bars(sym, timeframe="15Min", limit=40)
             tech = self.calculate_technical_signals(df)
 
             # Require technical alignment or strong LOB push

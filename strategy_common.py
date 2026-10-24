@@ -182,7 +182,7 @@ class BaseStrategyBrain:
     HARD_STOP_COOLDOWN_HOURS = int(os.getenv("OKX_HARD_STOP_COOLDOWN_HOURS", "24"))  # [Fix] 12→24h: 손절 후 재진입 왕복 차단
     # 신규 진입 차단: Master가 max_active_subpositions 초과 시 신호를 거부하므로
     # 각 전략 뇌도 로컬에서 동일 제한을 사전 체크 (중복 신호 억제)
-    MAX_DCA_ENTRIES = int(os.getenv("OKX_MAX_DCA_ENTRIES", "8"))
+    MAX_DCA_ENTRIES = int(os.getenv("OKX_MAX_DCA_ENTRIES", "0"))
     POSITION_PORTION = float(os.getenv("OKX_POSITION_PORTION", "0.20"))
     SCALE_OUT_EXITS = True
     MAX_OPEN_POSITIONS = int(os.getenv("OKX_BOT_MAX_POSITIONS", "15"))

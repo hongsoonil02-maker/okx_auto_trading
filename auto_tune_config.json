@@ -14,12 +14,13 @@
     ]
   },
   "okx_params": {
-    "TRAILING_PCT": 0.02,
-    "HARD_SL_PCT": 0.3,
+    "TRAILING_PCT": 0.025,
+    "HARD_SL_PCT": 0.02,
     "ORB_LOOKBACK": 6,
     "POSITION_PCT": 0.05,
     "OKX_MIN_RANGE_PCT": 0.6,
     "OKX_ENTRY_BUFFER_PCT": 0.0004,
-    "OKX_MIN_MOMENTUM_PCT": 0.0003
+    "OKX_MIN_MOMENTUM_PCT": 0.0003,
+    "MAX_DCA": 0
   }
 }
