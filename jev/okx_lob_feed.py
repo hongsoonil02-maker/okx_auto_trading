@@ -36,6 +36,12 @@ class LOBEntry:
     micro_price: float = 0.0
 
     @property
+    def mid_price(self) -> float:
+        if self.best_bid > 0 and self.best_ask > 0:
+            return (self.best_bid + self.best_ask) / 2.0
+        return self.micro_price or self.best_bid or self.best_ask
+
+    @property
     def is_stale(self) -> bool:
         """Returns True if data is older than 3 seconds."""
         return (time.time() - self.timestamp) > 3.0

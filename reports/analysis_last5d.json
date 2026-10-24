@@ -1,377 +1,233 @@
 {
   "window": [
-    "2026-09-13",
-    "2026-09-18"
+    "2026-09-29",
+    "2026-10-06"
   ],
   "summary": {
     "bills": {
-      "trades": 24,
-      "wins": 9,
-      "losses": 15,
-      "win_rate": 37.5,
-      "total_net_pnl": -92.67,
-      "total_fee": -13.03,
-      "profit_factor": 0.72,
-      "avg_win": 26.89,
-      "avg_loss": -22.31,
-      "payoff": 1.21,
-      "expectancy": -3.86,
-      "avg_roe_pct": -0.9,
-      "mdd_usdt": -246.87,
+      "trades": 14,
+      "wins": 7,
+      "losses": 7,
+      "win_rate": 50.0,
+      "total_net_pnl": 40.47,
+      "total_fee": -21.85,
+      "profit_factor": 2.86,
+      "avg_win": 8.89,
+      "avg_loss": -3.11,
+      "payoff": 2.86,
+      "expectancy": 2.89,
+      "avg_roe_pct": 0.3,
+      "mdd_usdt": -7.75,
       "mdd_pct_of_start": null,
-      "avg_hold_h": 9.6,
-      "median_hold_h": 7.1,
-      "avg_win_hold_h": 11.4,
-      "avg_loss_hold_h": 8.5,
-      "avg_dca_entries": 8.54,
+      "avg_hold_h": 0.4,
+      "median_hold_h": 0.1,
+      "avg_win_hold_h": 0.3,
+      "avg_loss_hold_h": 0.5,
+      "avg_dca_entries": 13.71,
       "liquidations": 0,
-      "taker_ratio": 1.0
+      "taker_ratio": 0.98
     },
     "jsonl": {
-      "trades": 22,
-      "wins": 9,
-      "losses": 13,
-      "win_rate": 40.9,
-      "total_net_pnl": -95.19,
-      "total_fee": -21.52,
-      "profit_factor": 0.76,
-      "avg_win": 33.85,
-      "avg_loss": -30.76,
-      "payoff": 1.1,
-      "expectancy": -4.33,
-      "avg_roe_pct": 1.5,
-      "mdd_usdt": -310.65,
+      "trades": 14,
+      "wins": 7,
+      "losses": 7,
+      "win_rate": 50.0,
+      "total_net_pnl": -8623.81,
+      "total_fee": -23.21,
+      "profit_factor": 0.01,
+      "avg_win": 9.96,
+      "avg_loss": -1241.93,
+      "payoff": 0.01,
+      "expectancy": -615.99,
+      "avg_roe_pct": -37.7,
+      "mdd_usdt": -5.13,
       "mdd_pct_of_start": null,
-      "avg_hold_h": 51.8,
-      "median_hold_h": 7.1,
-      "avg_win_hold_h": 64.9,
-      "avg_loss_hold_h": 42.8,
-      "avg_dca_entries": 1.82,
+      "avg_hold_h": 76.0,
+      "median_hold_h": 0.2,
+      "avg_win_hold_h": 0.3,
+      "avg_loss_hold_h": 151.6,
+      "avg_dca_entries": 1.14,
       "liquidations": 0,
       "taker_ratio": 1.0
     }
   },
   "by_side": {
     "long": {
-      "n": 17,
-      "win_rate": 35.3,
-      "net_pnl": -100.14,
-      "avg_pnl": -5.89,
-      "pf": 0.69,
-      "avg_hold_h": 8.9
+      "n": 8,
+      "win_rate": 25.0,
+      "net_pnl": -6.98,
+      "avg_pnl": -0.87,
+      "pf": 0.4,
+      "avg_hold_h": 0.5
     },
     "short": {
-      "n": 7,
-      "win_rate": 42.9,
-      "net_pnl": 7.48,
-      "avg_pnl": 1.07,
-      "pf": 1.94,
-      "avg_hold_h": 11.4
+      "n": 6,
+      "win_rate": 83.3,
+      "net_pnl": 47.45,
+      "avg_pnl": 7.91,
+      "pf": 5.66,
+      "avg_hold_h": 0.4
     }
   },
   "by_sector": {
-    "alt": {
-      "n": 20,
-      "win_rate": 35.0,
-      "net_pnl": -101.92,
-      "avg_pnl": -5.1,
-      "pf": 0.69,
-      "avg_hold_h": 10.0
-    },
     "major": {
-      "n": 2,
-      "win_rate": 0.0,
-      "net_pnl": -2.94,
-      "avg_pnl": -1.47,
-      "pf": 0.0,
-      "avg_hold_h": 6.3
+      "n": 6,
+      "win_rate": 33.3,
+      "net_pnl": -1.45,
+      "avg_pnl": -0.24,
+      "pf": 0.62,
+      "avg_hold_h": 0.4
     },
-    "meme": {
-      "n": 2,
-      "win_rate": 100.0,
-      "net_pnl": 12.2,
-      "avg_pnl": 6.1,
-      "pf": 12199622560.01,
-      "avg_hold_h": 8.9
+    "alt": {
+      "n": 8,
+      "win_rate": 62.5,
+      "net_pnl": 41.92,
+      "avg_pnl": 5.24,
+      "pf": 3.34,
+      "avg_hold_h": 0.5
     }
   },
   "by_regime": {
     "trend_up": {
-      "n": 14,
-      "win_rate": 42.9,
-      "net_pnl": -69.87,
-      "avg_pnl": -4.99,
-      "pf": 0.76,
-      "avg_hold_h": 7.9
+      "n": 5,
+      "win_rate": 20.0,
+      "net_pnl": -1.14,
+      "avg_pnl": -0.23,
+      "pf": 0.7,
+      "avg_hold_h": 0.4
     },
     "trend_down": {
-      "n": 8,
-      "win_rate": 25.0,
-      "net_pnl": -24.82,
-      "avg_pnl": -3.1,
-      "pf": 0.33,
-      "avg_hold_h": 9.6
-    },
-    "chop": {
-      "n": 2,
-      "win_rate": 50.0,
-      "net_pnl": 2.02,
-      "avg_pnl": 1.01,
-      "pf": 2.66,
-      "avg_hold_h": 20.9
+      "n": 9,
+      "win_rate": 66.7,
+      "net_pnl": 41.6,
+      "avg_pnl": 4.62,
+      "pf": 3.32,
+      "avg_hold_h": 0.4
     }
   },
   "by_entry_hour_kst": {
-    "13": {
-      "n": 1,
-      "win_rate": 0.0,
-      "net_pnl": -119.3,
-      "avg_pnl": -119.3,
-      "pf": 0.0,
-      "avg_hold_h": 10.2
-    },
-    "17": {
-      "n": 4,
-      "win_rate": 25.0,
-      "net_pnl": -47.83,
-      "avg_pnl": -11.96,
-      "pf": 0.13,
-      "avg_hold_h": 3.1
-    },
-    "14": {
-      "n": 1,
-      "win_rate": 0.0,
-      "net_pnl": -25.48,
-      "avg_pnl": -25.48,
-      "pf": 0.0,
-      "avg_hold_h": 1.5
-    },
-    "23": {
-      "n": 2,
-      "win_rate": 0.0,
-      "net_pnl": -19.63,
-      "avg_pnl": -9.82,
-      "pf": 0.0,
-      "avg_hold_h": 6.6
-    },
     "10": {
-      "n": 2,
-      "win_rate": 0.0,
-      "net_pnl": -14.44,
-      "avg_pnl": -7.22,
-      "pf": 0.0,
-      "avg_hold_h": 16.7
-    },
-    "12": {
-      "n": 5,
-      "win_rate": 60.0,
-      "net_pnl": -12.86,
-      "avg_pnl": -2.57,
-      "pf": 0.86,
-      "avg_hold_h": 13.0
-    },
-    "4": {
-      "n": 2,
-      "win_rate": 0.0,
-      "net_pnl": -5.5,
-      "avg_pnl": -2.75,
-      "pf": 0.0,
-      "avg_hold_h": 14.6
+      "n": 1,
+      "win_rate": 100.0,
+      "net_pnl": 0.17,
+      "avg_pnl": 0.17,
+      "pf": 172167960.0,
+      "avg_hold_h": 0.1
     },
     "9": {
-      "n": 2,
-      "win_rate": 0.0,
-      "net_pnl": -2.94,
-      "avg_pnl": -1.47,
-      "pf": 0.0,
-      "avg_hold_h": 6.3
-    },
-    "11": {
-      "n": 1,
-      "win_rate": 100.0,
-      "net_pnl": 6.07,
-      "avg_pnl": 6.07,
-      "pf": 6070844496.0,
-      "avg_hold_h": 26.0
-    },
-    "21": {
-      "n": 2,
-      "win_rate": 100.0,
-      "net_pnl": 12.2,
-      "avg_pnl": 6.1,
-      "pf": 12199622560.01,
-      "avg_hold_h": 8.9
-    },
-    "18": {
-      "n": 2,
-      "win_rate": 100.0,
-      "net_pnl": 137.05,
-      "avg_pnl": 68.52,
-      "pf": 137049589696.0,
-      "avg_hold_h": 4.3
+      "n": 13,
+      "win_rate": 46.2,
+      "net_pnl": 40.29,
+      "avg_pnl": 3.1,
+      "pf": 2.85,
+      "avg_hold_h": 0.5
     }
   },
   "by_symbol": {
     "UNI/USDT:USDT": {
       "n": 1,
       "win_rate": 0.0,
-      "net_pnl": -119.3,
-      "avg_pnl": -119.3,
+      "net_pnl": -10.17,
+      "avg_pnl": -10.17,
       "pf": 0.0,
-      "avg_hold_h": 10.2
+      "avg_hold_h": 0.1
     },
-    "XLM/USDT:USDT": {
+    "USELESS/USDT:USDT": {
       "n": 1,
       "win_rate": 0.0,
-      "net_pnl": -74.27,
-      "avg_pnl": -74.27,
+      "net_pnl": -3.93,
+      "avg_pnl": -3.93,
       "pf": 0.0,
-      "avg_hold_h": 11.8
-    },
-    "IOST/USDT:USDT": {
-      "n": 1,
-      "win_rate": 0.0,
-      "net_pnl": -30.14,
-      "avg_pnl": -30.14,
-      "pf": 0.0,
-      "avg_hold_h": 2.1
-    },
-    "OP/USDT:USDT": {
-      "n": 1,
-      "win_rate": 0.0,
-      "net_pnl": -25.48,
-      "avg_pnl": -25.48,
-      "pf": 0.0,
-      "avg_hold_h": 1.5
-    },
-    "WLD/USDT:USDT": {
-      "n": 1,
-      "win_rate": 0.0,
-      "net_pnl": -12.13,
-      "avg_pnl": -12.13,
-      "pf": 0.0,
-      "avg_hold_h": 4.9
-    },
-    "API3/USDT:USDT": {
-      "n": 1,
-      "win_rate": 0.0,
-      "net_pnl": -8.41,
-      "avg_pnl": -8.41,
-      "pf": 0.0,
-      "avg_hold_h": 9.6
-    },
-    "AAVE/USDT:USDT": {
-      "n": 1,
-      "win_rate": 0.0,
-      "net_pnl": -7.5,
-      "avg_pnl": -7.5,
-      "pf": 0.0,
-      "avg_hold_h": 8.3
-    },
-    "OKB/USDT:USDT": {
-      "n": 1,
-      "win_rate": 0.0,
-      "net_pnl": -6.04,
-      "avg_pnl": -6.04,
-      "pf": 0.0,
-      "avg_hold_h": 23.9
-    },
-    "ENA/USDT:USDT": {
-      "n": 2,
-      "win_rate": 0.0,
-      "net_pnl": -5.02,
-      "avg_pnl": -2.51,
-      "pf": 0.0,
-      "avg_hold_h": 7.1
-    },
-    "SOL/USDT:USDT": {
-      "n": 1,
-      "win_rate": 0.0,
-      "net_pnl": -2.07,
-      "avg_pnl": -2.07,
-      "pf": 0.0,
-      "avg_hold_h": 9.2
+      "avg_hold_h": 0.7
     },
     "BZ/USDT:USDT": {
       "n": 1,
       "win_rate": 0.0,
-      "net_pnl": -1.69,
-      "avg_pnl": -1.69,
+      "net_pnl": -3.82,
+      "avg_pnl": -3.82,
       "pf": 0.0,
-      "avg_hold_h": 21.9
+      "avg_hold_h": 0.7
     },
     "BTC/USDT:USDT": {
+      "n": 2,
+      "win_rate": 50.0,
+      "net_pnl": -1.54,
+      "avg_pnl": -0.77,
+      "pf": 0.1,
+      "avg_hold_h": 0.1
+    },
+    "ETH/USDT:USDT": {
       "n": 1,
       "win_rate": 0.0,
-      "net_pnl": -0.88,
-      "avg_pnl": -0.88,
+      "net_pnl": -0.95,
+      "avg_pnl": -0.95,
       "pf": 0.0,
-      "avg_hold_h": 3.4
+      "avg_hold_h": 0.1
+    },
+    "SOL/USDT:USDT": {
+      "n": 1,
+      "win_rate": 0.0,
+      "net_pnl": -0.72,
+      "avg_pnl": -0.72,
+      "pf": 0.0,
+      "avg_hold_h": 0.1
+    },
+    "XRP/USDT:USDT": {
+      "n": 1,
+      "win_rate": 0.0,
+      "net_pnl": -0.44,
+      "avg_pnl": -0.44,
+      "pf": 0.0,
+      "avg_hold_h": 1.8
+    },
+    "OKB/USDT:USDT": {
+      "n": 1,
+      "win_rate": 100.0,
+      "net_pnl": 1.91,
+      "avg_pnl": 1.91,
+      "pf": 1908317950.0,
+      "avg_hold_h": 0.3
+    },
+    "AVAX/USDT:USDT": {
+      "n": 1,
+      "win_rate": 100.0,
+      "net_pnl": 2.19,
+      "avg_pnl": 2.19,
+      "pf": 2191135650.0,
+      "avg_hold_h": 0.1
     },
     "SUI/USDT:USDT": {
       "n": 1,
       "win_rate": 100.0,
-      "net_pnl": 3.24,
-      "avg_pnl": 3.24,
-      "pf": 3239668656.0,
-      "avg_hold_h": 35.1
+      "net_pnl": 2.68,
+      "avg_pnl": 2.68,
+      "pf": 2677497600.0,
+      "avg_hold_h": 0.1
     },
-    "TRUMP/USDT:USDT": {
+    "INJ/USDT:USDT": {
       "n": 1,
       "win_rate": 100.0,
-      "net_pnl": 4.18,
-      "avg_pnl": 4.18,
-      "pf": 4176930080.0,
-      "avg_hold_h": 12.6
+      "net_pnl": 7.14,
+      "avg_pnl": 7.14,
+      "pf": 7140515650.0,
+      "avg_hold_h": 0.2
     },
-    "HYPE/USDT:USDT": {
+    "BCH/USDT:USDT": {
       "n": 1,
       "win_rate": 100.0,
-      "net_pnl": 6.07,
-      "avg_pnl": 6.07,
-      "pf": 6070844496.0,
-      "avg_hold_h": 26.0
+      "net_pnl": 7.68,
+      "avg_pnl": 7.68,
+      "pf": 7683868000.0,
+      "avg_hold_h": 0.8
     },
-    "PUMP/USDT:USDT": {
+    "SEI/USDT:USDT": {
       "n": 1,
       "win_rate": 100.0,
-      "net_pnl": 8.02,
-      "avg_pnl": 8.02,
-      "pf": 8022692480.01,
-      "avg_hold_h": 5.2
-    },
-    "CNPY/USDT:USDT": {
-      "n": 3,
-      "win_rate": 66.7,
-      "net_pnl": 11.72,
-      "avg_pnl": 3.91,
-      "pf": 1.64,
-      "avg_hold_h": 5.2
-    },
-    "USELESS/USDT:USDT": {
-      "n": 2,
-      "win_rate": 50.0,
-      "net_pnl": 29.98,
-      "avg_pnl": 14.99,
-      "pf": 2.27,
-      "avg_hold_h": 2.9
-    },
-    "DGAI/USDT:USDT": {
-      "n": 1,
-      "win_rate": 100.0,
-      "net_pnl": 59.22,
-      "avg_pnl": 59.22,
-      "pf": 59216731360.0,
-      "avg_hold_h": 4.0
-    },
-    "ZEC/USDT:USDT": {
-      "n": 1,
-      "win_rate": 100.0,
-      "net_pnl": 77.83,
-      "avg_pnl": 77.83,
-      "pf": 77832858336.0,
-      "avg_hold_h": 4.7
+      "net_pnl": 40.43,
+      "avg_pnl": 40.43,
+      "pf": 40431279000.01,
+      "avg_hold_h": 1.0
     }
   },
-  "loss_concentration_top5_pct": 81.5
+  "loss_concentration_top5_pct": 94.7
 }

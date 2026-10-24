@@ -43,7 +43,10 @@ const CONFIDENCE_THRESHOLD = Number(process.env.JEV_CONFIDENCE_THRESHOLD || 0.60
 const QUOTE_INSIDE_TICKS = Number(process.env.QUOTE_INSIDE_TICKS || 1);
 const IS_SIMULATION = (process.env.JEV_SIMULATION_MODE || "false").toLowerCase() === "true";
 
-const TRACKED_SYMBOLS = ["QQQ", "NVDA", "TSLA", "AAPL", "TQQQ", "SQQQ", "SOXL", "SOXS"];
+const TRACKED_SYMBOLS = [
+  "QQQ", "NVDA", "TSLA", "AAPL", "TQQQ", "SQQQ", "SOXL", "SOXS",
+  "MSTR", "PLTR", "AMD", "COIN", "AVGO", "META"
+];
 
 const streamer = new AlpacaDataStreamer(ALPACA_KEY, ALPACA_SECRET, TRACKED_SYMBOLS);
 const jevClient = new TypesafeJevClient(OPENROUTER_KEY, OPENROUTER_MODEL);

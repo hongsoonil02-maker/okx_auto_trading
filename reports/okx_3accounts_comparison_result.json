@@ -1,0 +1,52 @@
+{
+  "timestamp": "2026-10-01T10:15:09.066194",
+  "period_days": 90,
+  "dontworry_major": {
+    "mode": "major",
+    "initial_equity": 3000.0,
+    "final_equity": 1072.9605638159755,
+    "total_return_pct": -64.2346478728008,
+    "total_trades": 301,
+    "wins": 108,
+    "losses": 193,
+    "win_rate": 35.880398671096344,
+    "profit_factor": 0.8436677948773611,
+    "avg_win": 96.2919239887202,
+    "avg_loss": -63.86822397391607,
+    "payoff_ratio": 1.5076655964012093,
+    "mdd_pct": 77.59474447066967,
+    "sharpe_ratio": 0.25205541063957454
+  },
+  "freedom01_venture": {
+    "mode": "venture",
+    "initial_equity": 3000.0,
+    "final_equity": 910.038793337651,
+    "total_return_pct": -69.66537355541163,
+    "total_trades": 781,
+    "wins": 284,
+    "losses": 497,
+    "win_rate": 36.36363636363637,
+    "profit_factor": 0.5678618316963627,
+    "avg_win": 9.670299771597314,
+    "avg_loss": -9.731038917094535,
+    "payoff_ratio": 0.9937582054686349,
+    "mdd_pct": 70.47723305976749,
+    "sharpe_ratio": -3.481381034907988
+  },
+  "main_dual": {
+    "mode": "dual",
+    "initial_equity": 3000.0,
+    "final_equity": 913.9272520658682,
+    "total_return_pct": -69.53575826447106,
+    "total_trades": 907,
+    "wins": 324,
+    "losses": 583,
+    "win_rate": 35.72216097023153,
+    "profit_factor": 0.7208074019786295,
+    "avg_win": 16.622631491811504,
+    "avg_loss": -12.816132678012108,
+    "payoff_ratio": 1.297008380720807,
+    "mdd_pct": 71.92745320558222,
+    "sharpe_ratio": -1.0741957128635253
+  }
+}

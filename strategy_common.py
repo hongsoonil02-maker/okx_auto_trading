@@ -21,8 +21,8 @@ from dotenv import load_dotenv
 import pandas as pd
 import ccxt.async_support as ccxt_async
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+BASE_DIR = os.environ.get("QUANT_BASE_DIR", os.getcwd())
+load_dotenv(os.path.join(BASE_DIR, ".env"), override=False)
 
 try:
     from webhook_spec import WebhookPayload, ActionType, SideType, sign_payload, WEBHOOK_SIGNATURE_HEADER
@@ -201,13 +201,14 @@ class BaseStrategyBrain:
     # Major 30m: PF 0.76→1.22 (흑자 전환) / Venture 15m: PF 1.23→1.13 (악화)
     # → 메이저처럼 박스권 성격 심볼에만 활성화
     FLIP_ON_TRAILING_CLOSE = False
+    FLIP_MIN_MAX_PNL = float(os.getenv("OKX_FLIP_MIN_MAX_PNL", "0.15"))  # 플립 전환에 필요한 최소 최고수익률 (+15% 이상 경험 포지션만 역방향 전환, 횡보/본전컷 차단)
     # [Fix] DCA 추가 진입 최소 간격 (캔들 수) — 매 캔들 물타기는 수수료 출혈
     DCA_MIN_CANDLES = 4
     # [검증] 물타기/피라미딩 백테스트(6~8월): 현행 조합 최악(-3.7K, MDD 83.7%) vs 둘다없음 최고(+18.1K, 48%)
     # DCA는 평균손실 -199→-274 확대, 피라미딩+20%가드는 승자 절단 → 기본 비활성 (env로 재활성 가능)
     # [Fix] 중복 선언 제거: SCALE_OUT_STEPS는 env 값 하나로 통일
     SCALE_OUT_STEPS = int(os.getenv("OKX_SCALE_OUT_STEPS", "3"))
-    PYRAMIDING_ENABLED = os.getenv("OKX_PYRAMIDING", "false").lower() == "true"
+    PYRAMIDING_ENABLED = os.getenv("OKX_PYRAMIDING", "true").lower() == "true"
     # ── 켈리 공식 포지션 사이징 ──
     # portion = Half-Kelly × f* / 평균손실률, f* = p - (1-p)/b
     KELLY_FRACTION = 0.50          # Half-Kelly (적극적 자본배치)
@@ -227,7 +228,6 @@ class BaseStrategyBrain:
     # ── [Fix #1] 횡보장(Chop) 차단 필터 ──
     # BTC 1h ADX가 임계값 미만이면 신규 자본 투입(진입/DCA/불타기/재진입/플립) 전면 차단.
     # 08-21 꼭지 후 횡보장에서 롱 바이어스 + 물타기 + 재진입 휩소로 -27% 손실 → 재발 방지.
-    # 청산/스탑/익절은 계속 동작 (기존 포지션 관리 유지).
     CHOP_FILTER_ENABLED = os.getenv("OKX_CHOP_FILTER", "true").lower() == "true"
     CHOP_ADX_THRESHOLD = float(os.getenv("OKX_CHOP_ADX", "20"))
     CHOP_ADX_BLOCK_THRESHOLD = float(os.getenv("OKX_CHOP_ADX_BLOCK", "20.0"))
@@ -530,8 +530,14 @@ class BaseStrategyBrain:
         self._entry_log = [t for t in self._entry_log if now - t < 86400]
         if self.BLOCK_WEEKEND and datetime.utcnow().weekday() >= 5:
             return False
-        if sum(1 for t in self._entry_log if now - t < 3600) >= self.MAX_ENTRIES_PER_HOUR:
+        # [Fix] 포지션 0개여도 시간당 폭풍 진입 방지 (최근 1시간 진입 한도 우선 적용)
+        recent_1h = sum(1 for t in self._entry_log if now - t < 3600)
+        if recent_1h >= self.MAX_ENTRIES_PER_HOUR:
             return False
+        # 일일 상한 체크 (포지션이 0개이고 최근 1시간 진입이 없으면 최소 1개는 허용하여 고착 방지)
+        active_cnt = len(getattr(self, 'auto_active_pos', {}))
+        if active_cnt == 0 and recent_1h == 0:
+            return True
         return len(self._entry_log) < self.MAX_ENTRIES_PER_DAY
 
     async def _liquidity_ok(self, symbol: str, side, notional: float) -> bool:
@@ -1312,6 +1318,15 @@ class BaseStrategyBrain:
                 close_long_sig = st_d_long == -1 or curr['c'] < st_v_long
                 force_close_long = False
 
+                # [Jev AI Supreme Scalp Exit] 실시간 호가 수급 기반 조기 탈출 및 칼익절
+                if hasattr(self, 'jev_filter') and self.jev_filter and self.jev_filter.is_enabled:
+                    jev_exit, jev_reason = await self.jev_filter.evaluate_exit(
+                        symbol, "LONG", avg_price_long, px_now, leverage=leverage_long
+                    )
+                    if jev_exit:
+                        self.logger.info(f"⚡ [Jev AI 조기청산] 롱 {symbol} — {jev_reason}")
+                        force_close_long = True
+
                 # [Alpha ①] ATR Chandelier 트레일링: 수익 구간에서 고점 − k×ATR 이탈 시 청산
                 # (철칙 2: 변동성 클수록 ATR이 커져 선이 넓어지는 대신, 가격 이탈 즉시 반응)
                 if self.ATR_TRAILING_ENABLED:
@@ -1403,7 +1418,8 @@ class BaseStrategyBrain:
                         dca['pyramid_count'] = 2
                         dca['last_entry_t'] = t_curr
 
-                if dca.get('pyramid_count', 0) >= 1 and pnl_pct_long < 0.20:
+                if dca.get('pyramid_count', 0) >= 1 and pnl_pct_long < 0.05:
+                    self.logger.info(f"🛡️ [Pyramid Stop] 롱 불타기 후 이익 보존 방어 청산: {symbol} (ROE: {pnl_pct_long*100:+.2f}%)")
                     force_close_long = True
 
                 if dca['exit_count'] > 0 and px_now < avg_price_long:
@@ -1428,6 +1444,15 @@ class BaseStrategyBrain:
                 st_d_short = curr['st_d_tight'] if is_profit else curr['st_d_loose']
                 close_short_sig = st_d_short == 1 or curr['c'] > st_v_short
                 force_close_short = False
+
+                # [Jev AI Supreme Scalp Exit] 실시간 호가 수급 기반 조기 탈출 및 칼익절
+                if hasattr(self, 'jev_filter') and self.jev_filter and self.jev_filter.is_enabled:
+                    jev_exit, jev_reason = await self.jev_filter.evaluate_exit(
+                        symbol, "SHORT", avg_price_short, px_now, leverage=leverage_short
+                    )
+                    if jev_exit:
+                        self.logger.info(f"⚡ [Jev AI 조기청산] 숏 {symbol} — {jev_reason}")
+                        force_close_short = True
 
                 # [Alpha ①] ATR Chandelier 트레일링 (숏): 저점 + k×ATR 상향 돌파 시 청산
                 if self.ATR_TRAILING_ENABLED:
@@ -1513,7 +1538,8 @@ class BaseStrategyBrain:
                         dca['pyramid_count'] = 2
                         dca['last_entry_t'] = t_curr
 
-                if dca.get('pyramid_count', 0) >= 1 and pnl_pct_short < 0.20:
+                if dca.get('pyramid_count', 0) >= 1 and pnl_pct_short < 0.05:
+                    self.logger.info(f"🛡️ [Pyramid Stop] 숏 불타기 후 이익 보존 방어 청산: {symbol} (ROE: {pnl_pct_short*100:+.2f}%)")
                     force_close_short = True
 
                 if dca['exit_count'] > 0 and px_now > avg_price_short:
@@ -1532,12 +1558,41 @@ class BaseStrategyBrain:
                     else:
                         self.logger.info(f"💨 [Breakeven Stop] 롱 전량 방어 청산: {symbol}")
                     await self.send_webhook(SideType.CLOSE_LONG, symbol, 0)
-                    # [Flip] 트레일링/방어 청산 시 즉시 숏 진입 (하드스탑 제외)
+                    # [Flip] 트레일링/방어 청산 시 즉시 숏 진입 (하드스탑 제외, trend_up 상승장 역추세 숏 차단, 횡보장 휩쏘 차단)
                     flipped = False
-                    if self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_long and not long_blocked and not dca.get('mr_mode') and self.SHORTS_ENABLED:
+                    is_bull_season = getattr(self, "SEASON_MODE_STATE", "normal") == "trend_up"
+                    is_chop_season = getattr(self, "SEASON_MODE_STATE", "normal") in ("chop", "crash")
+                    is_chop_adx = getattr(self, "_deploy_scale", 1.0) <= 0.0
+                    is_chop_flip_blocked = is_chop_season or is_chop_adx
+                    symbol_valid = True
+                    if hasattr(self, '_symbol_matches'):
+                        try:
+                            symbol_valid = self._symbol_matches(symbol, None, getattr(self.exchange, 'markets', {}))
+                        except Exception:
+                            symbol_valid = True
+                    min_flip_pnl = getattr(self, 'FLIP_MIN_MAX_PNL', 0.15)
+                    can_flip = (
+                        self.FLIP_ON_TRAILING_CLOSE
+                        and not is_hard_stop_long
+                        and not long_blocked
+                        and not dca.get('mr_mode')
+                        and self.SHORTS_ENABLED
+                        and not is_bull_season
+                        and not is_chop_flip_blocked
+                        and symbol_valid
+                        and (dca.get('max_pnl_pct', 0.0) >= min_flip_pnl)
+                    )
+                    if can_flip:
                         self.logger.info(f"🔄 [FLIP] 롱 청산 → 숏 반대진입: {symbol} (최고수익: {dca['max_pnl_pct']*100:.0f}%)")
                         await self.execute_auto_entry(symbol, SideType.SELL, entry_type="flip")
                         flipped = True
+                    elif self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_long:
+                        if is_chop_flip_blocked:
+                            self.logger.info(f"🛡️ [FLIP 차단] 횡보장(Chop) 모드로 인한 플립 스위칭 비활성화: {symbol}")
+                        elif dca.get('max_pnl_pct', 0.0) < min_flip_pnl:
+                            self.logger.info(f"🛡️ [FLIP 차단] 최고 수익 미달({dca.get('max_pnl_pct', 0.0)*100:.1f}% < {min_flip_pnl*100:.0f}%): {symbol}")
+                        elif not symbol_valid:
+                            self.logger.info(f"🛡️ [FLIP 차단] 해당 전략 전용 심볼 아님: {symbol}")
                     dca['exit_count'] = self.SCALE_OUT_STEPS
                     dca['entry_count'] = 0
                     dca['pyramid_count'] = 0
@@ -1598,12 +1653,42 @@ class BaseStrategyBrain:
                     else:
                         self.logger.info(f"💨 [Breakeven Stop] 숏 전량 방어 청산: {symbol}")
                     await self.send_webhook(SideType.CLOSE_SHORT, symbol, 0)
-                    # [Flip] 트레일링/방어 청산 시 즉시 롱 진입 (하드스탑 제외, Jev 활성화 시 레짐 바이패스)
+                    # [Flip] 트레일링/방어 청산 시 즉시 롱 진입 (하드스탑 제외, Jev 활성화 시 레짐 바이패스, trend_down 하락장 역추세 롱 차단, 횡보장 휩쏘 차단)
                     flipped = False
-                    if self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_short and not dca.get('mr_mode') and (self._long_regime_ok or jev_active) and not short_blocked and (dual_gate or jev_active):
+                    is_bear_season = getattr(self, "SEASON_MODE_STATE", "normal") == "trend_down"
+                    is_chop_season = getattr(self, "SEASON_MODE_STATE", "normal") in ("chop", "crash")
+                    is_chop_adx = getattr(self, "_deploy_scale", 1.0) <= 0.0
+                    is_chop_flip_blocked = is_chop_season or is_chop_adx
+                    symbol_valid = True
+                    if hasattr(self, '_symbol_matches'):
+                        try:
+                            symbol_valid = self._symbol_matches(symbol, None, getattr(self.exchange, 'markets', {}))
+                        except Exception:
+                            symbol_valid = True
+                    min_flip_pnl = getattr(self, 'FLIP_MIN_MAX_PNL', 0.15)
+                    can_flip = (
+                        self.FLIP_ON_TRAILING_CLOSE
+                        and not is_hard_stop_short
+                        and not dca.get('mr_mode')
+                        and (self._long_regime_ok or jev_active)
+                        and not short_blocked
+                        and (dual_gate or jev_active)
+                        and not is_bear_season
+                        and not is_chop_flip_blocked
+                        and symbol_valid
+                        and (dca.get('max_pnl_pct', 0.0) >= min_flip_pnl)
+                    )
+                    if can_flip:
                         self.logger.info(f"🔄 [FLIP] 숏 청산 → 롱 반대진입: {symbol} (최고수익: {dca['max_pnl_pct']*100:.0f}%)")
                         await self.execute_auto_entry(symbol, SideType.BUY, entry_type="flip")
                         flipped = True
+                    elif self.FLIP_ON_TRAILING_CLOSE and not is_hard_stop_short:
+                        if is_chop_flip_blocked:
+                            self.logger.info(f"🛡️ [FLIP 차단] 횡보장(Chop) 모드로 인한 플립 스위칭 비활성화: {symbol}")
+                        elif dca.get('max_pnl_pct', 0.0) < min_flip_pnl:
+                            self.logger.info(f"🛡️ [FLIP 차단] 최고 수익 미달({dca.get('max_pnl_pct', 0.0)*100:.1f}% < {min_flip_pnl*100:.0f}%): {symbol}")
+                        elif not symbol_valid:
+                            self.logger.info(f"🛡️ [FLIP 차단] 해당 전략 전용 심볼 아님: {symbol}")
                     dca['exit_count'] = self.SCALE_OUT_STEPS
                     dca['entry_count'] = 0
                     dca['pyramid_count'] = 0
@@ -1704,7 +1789,14 @@ class BaseStrategyBrain:
                             dca['stop_pct'] = self._stop_distance_pct(df)  # [Fix] 진입 시점 ATR 스탑 고정
                             return
 
-                if is_long_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not long_blocked:
+                # [청산 직후 쿨다운 체크 - 동일 심볼 연속 재진입으로 인한 수수료 출혈 차단 (최소 4봉)]
+                is_post_close_cooldown = False
+                if dca.get('last_close_t'):
+                    close_cooldown_ms = 4 * self.TIMEFRAME_MINUTES * 60 * 1000
+                    if (t_curr - dca['last_close_t']) < close_cooldown_ms:
+                        is_post_close_cooldown = True
+
+                if is_long_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not is_post_close_cooldown and not long_blocked:
                     self.logger.info(f"🟢 [Scoring System 신규 진입] {symbol} (Score: {long_score})")
                     entered = await self.execute_auto_entry(symbol, SideType.BUY, entry_type="new", base_score=long_score)
                     if entered:
@@ -1715,7 +1807,7 @@ class BaseStrategyBrain:
                         dca['first_entry_t'] = t_curr
                         dca['side'] = 'long'
                         dca['stop_pct'] = self._stop_distance_pct(df)
-                elif is_short_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not short_blocked:
+                elif is_short_sig and dca.get('last_entry_t') != t_curr and not is_in_cooldown and not is_post_close_cooldown and not short_blocked:
                     # [Fix] HTF 추세 필터: Jev 비활성화 시에만 1h EMA50 체크 (Jev 활성화 시 Jev가 1번 판단권자)
                     htf = await self._check_htf_trend(symbol)
                     if not jev_active and htf['is_uptrend']:
@@ -1921,23 +2013,42 @@ class BaseStrategyBrain:
                 jev_score = None
                 is_sim = False
 
-                # [Jev AI Gate & Pricing] 초단타 호가창 예측 평가
+                # [Jev AI Gate & Hard Risk Veto] 초단타 호가창 예측 평가 및 주문 직전 하드 룰 거부 검증
                 if hasattr(self, 'jev_filter') and self.jev_filter and is_fresh_capital:
                     try:
                         proposed_side_str = "BUY" if side == SideType.BUY else "SELL"
                         market_prec = market_info.get('precision', {}) if isinstance(market_info, dict) else {}
                         tick_size = float(market_prec.get('price', 0.1) or 0.1)
+                        calc_sl_price = price * (1.0 - stop_pct) if side == SideType.BUY else price * (1.0 + stop_pct)
+                        curr_active_symbols = set(sym for sym, _side in getattr(self, 'auto_active_pos', {}).keys())
+                        current_pos_count = len(curr_active_symbols)
+                        max_parallel_val = int(os.getenv("MAX_PARALLEL_SYMBOLS", "4"))
+
                         jev_res = await self.jev_filter.evaluate_signal(
                             symbol=symbol,
                             proposed_side=proposed_side_str,
                             tick_size=tick_size,
-                            context_note=f"Strategy={self.STRATEGY_NAME}, Type={entry_type}, Lev={leverage}x"
+                            context_note=f"Strategy={self.STRATEGY_NAME}, Type={entry_type}, Lev={leverage}x",
+                            order_qty=amount,
+                            contract_size=float(contract_size),
+                            account_equity=float(total_usdt),
+                            stop_loss_price=calc_sl_price,
+                            leverage=leverage,
+                            max_parallel_symbols=max_parallel_val,
+                            current_open_positions=current_pos_count,
+                            available_margin_usdt=float(effective_free),
                         )
                         if not jev_res.approved:
-                            self.logger.info(
-                                f"🚫 [Jev AI Gate] 진입 차단: {side.value} {symbol} "
-                                f"(점수: {jev_res.jev_score:.3f}, 사유: {jev_res.reason})"
-                            )
+                            if getattr(jev_res, 'veto_reason', None):
+                                self.logger.error(
+                                    f"🚨 [Hard Risk Veto 거부] Jev 승인 기각됨: {side.value} {symbol} | "
+                                    f"사유: {jev_res.veto_reason}"
+                                )
+                            else:
+                                self.logger.info(
+                                    f"🚫 [Jev AI Gate] 진입 차단: {side.value} {symbol} "
+                                    f"(점수: {jev_res.jev_score:.3f}, 사유: {jev_res.reason})"
+                                )
                             return
 
                         order_type = jev_res.order_type
@@ -1945,7 +2056,7 @@ class BaseStrategyBrain:
                         jev_score = jev_res.jev_score
                         is_sim = jev_res.is_simulation
                         self.logger.info(
-                            f"🤖 [Jev AI 승인] {side.value} {symbol} | 점수: {jev_score:.3f} | "
+                            f"🤖 [Jev AI 승인 & Veto 통과] {side.value} {symbol} | 점수: {jev_score:.3f} | "
                             f"방식: {order_type} @ {target_price} | 지연: {jev_res.latency_ms:.1f}ms | Sim: {is_sim}"
                         )
                     except Exception as ex_jev:
@@ -2026,6 +2137,7 @@ class BaseStrategyBrain:
         jev_active = bool(hasattr(self, 'jev_filter') and self.jev_filter and self.jev_filter.is_enabled)
         if jev_active:
             self._deploy_scale = 1.0
+            self._chop_block = False
             return
 
         if not self.CHOP_FILTER_ENABLED:
@@ -2103,6 +2215,7 @@ class BaseStrategyBrain:
             self._circuit_open = False
             return
         try:
+            self._load_cb_state()
             balance = await self.exchange.fetch_balance()
             equity = float(balance.get('USDT', {}).get('total', 0) or balance.get('total', {}).get('USDT', 0) or 0)
             if equity <= 0:
@@ -2125,7 +2238,7 @@ class BaseStrategyBrain:
                 self._short_regime_ok = False
                 return
 
-            # [Health CB] 전략 건강도: 최근 HEALTH_CB_LOOKBACK건 라운드트립 PF/승률 저조 → 24h 신규 진입 정지.
+            # [Health CB] 전략 건강도: 최근 HEALTH_CB_LOOKBACK건 라운드트립 PF/승률 저조 → 2h 신규 진입 정지.
             # 자산 기준 CB와 독립. 재발동 판정은 직전 발동 이후 청산된 새 표본만 사용(영구 잠김 방지).
             # 08-30 밤에 발동했다면 08-31 하루 28건 -469 USDT를 막을 수 있었음.
             now_ts = time.time()
@@ -2140,12 +2253,12 @@ class BaseStrategyBrain:
                     wr = sum(1 for x in rt if x > 0) / len(rt)
                     if pf < self.HEALTH_CB_MIN_PF or wr < self.HEALTH_CB_MIN_WR:
                         self._cb_state["tripped"] = True
-                        self._cb_state["cooldown_until"] = now_ts + 86400
+                        self._cb_state["cooldown_until"] = now_ts + (2 * 3600)
                         self._cb_state["health_last_trip_ts"] = now_ts
                         self._save_cb_state()
                         self._circuit_open = True
                         self.logger.warning(
-                            f"🩺 [Health CB] 최근 {len(rt)}건 PF {pf:.2f} / 승률 {wr*100:.0f}% — 24h 신규 진입 정지"
+                            f"🩺 [Health CB] 최근 {len(rt)}건 PF {pf:.2f} / 승률 {wr*100:.0f}% — 2h 신규 진입 정지"
                         )
                         try:
                             from utils_telegram import send_telegram_alert
@@ -2226,7 +2339,7 @@ class BaseStrategyBrain:
             if not self._circuit_open and chg_pct <= self.CIRCUIT_BREAKER_ROE:
                 self._circuit_open = True
                 self._cb_state["tripped"] = True
-                cooldown_hours = getattr(self, "CIRCUIT_BREAKER_COOLDOWN_HOURS", 48)
+                cooldown_hours = getattr(self, "CIRCUIT_BREAKER_COOLDOWN_HOURS", 2)
                 self._cb_state["cooldown_until"] = now_ts + (cooldown_hours * 3600)
                 self._save_cb_state()
                 self.logger.warning(
@@ -2508,13 +2621,7 @@ class BaseStrategyBrain:
                 self._entry_budget_logged = False
                 symbols = await self.get_target_symbols()
                 if not symbols:
-                    if _config_check_counter % 10 == 1:
-                        self.logger.warning(
-                            f"💓 [HEARTBEAT] 사이클 #{_config_check_counter} | "
-                            f"대상 심볼 0개 — 심볼 로드 실패 또는 필터 조건 미충족"
-                        )
-                    await asyncio.sleep(60)
-                    continue
+                    symbols = []
 
                 positions = await self.exchange.fetch_positions()
                 self.auto_active_pos = {}
@@ -2547,6 +2654,21 @@ class BaseStrategyBrain:
                     except (ValueError, TypeError):
                         pass
 
+                # [보안 패치 2: 고아 포지션 원천 차단]
+                # 계좌에 실제 보유 중인 모든 활성 포지션 심볼은 거래대금 순위/필터 통과 여부와 무관하게
+                # 감시 목록에 무조건 강제 병합하여 익절/손절/트레일링스탑을 끝까지 추적
+                active_symbols = [sym for (sym, _) in self.auto_active_pos.keys() if sym]
+                all_symbols = list(dict.fromkeys(symbols + active_symbols))
+
+                if not all_symbols:
+                    if _config_check_counter % 10 == 1:
+                        self.logger.warning(
+                            f"💓 [HEARTBEAT] 사이클 #{_config_check_counter} | "
+                            f"대상 심볼 0개 — 심볼 로드 실패 또는 필터 조건 미충족"
+                        )
+                    await asyncio.sleep(60)
+                    continue
+
                 # 시장 레짐 필터 갱신 (사이클당 1회, 단일 fetch)
                 await self._update_regime()
                 # [Fix #1/#2] 횡보장 필터 & 서킷 브레이커 갱신 (사이클당 1회)
@@ -2565,7 +2687,7 @@ class BaseStrategyBrain:
                     except Exception:
                         pass
 
-                for symbol in symbols:
+                for symbol in all_symbols:
                     await self.check_auto_logic(symbol)
                     await asyncio.sleep(0.1)
 
@@ -2578,8 +2700,8 @@ class BaseStrategyBrain:
                     pos_count = len(set(sym for sym, _ in self.auto_active_pos.keys()))
                     self.logger.info(
                         f"📊 [DEBUG] 사이클 #{_config_check_counter} | "
-                        f"심볼 수: {len(symbols)} | 포지션: {pos_count}/{self.MAX_OPEN_POSITIONS} | "
-                        f"상위 심볼: {symbols[:3]}"
+                        f"심볼 수: {len(all_symbols)} (타겟: {len(symbols)}, 활성보유: {len(active_symbols)}) | 포지션: {pos_count}/{self.MAX_OPEN_POSITIONS} | "
+                        f"상위 심볼: {all_symbols[:3]}"
                     )
 
             except Exception as e:

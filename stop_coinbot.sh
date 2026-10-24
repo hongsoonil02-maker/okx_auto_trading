@@ -8,11 +8,11 @@ echo "[$(date)] coinbot 중지 시작 (systemd 기반)"
 systemctl --user stop okx_major_strategy okx_venture_strategy master_bot_orchestrator bot_c_okx_swap 2>/dev/null || true
 systemctl --user disable okx_major_strategy okx_venture_strategy master_bot_orchestrator bot_c_okx_swap 2>/dev/null || true
 
-# 2) 잔여 프로세스 강제 종료
-pkill -9 -f 'master_bot_orchestrator.py' >/dev/null 2>&1 || true
-pkill -9 -f 'bot_c_okx_swap.py' >/dev/null 2>&1 || true
-pkill -9 -f 'okx_major_strategy.py' >/dev/null 2>&1 || true
-pkill -9 -f 'okx_venture_strategy.py' >/dev/null 2>&1 || true
+# 2) 잔여 프로세스 강제 종료 (이 폴더의 프로세스만 — 서브계정 보호)
+pkill -9 -f "$DIR/master_bot_orchestrator.py" >/dev/null 2>&1 || true
+pkill -9 -f "$DIR/bot_c_okx_swap.py" >/dev/null 2>&1 || true
+pkill -9 -f "$DIR/okx_major_strategy.py" >/dev/null 2>&1 || true
+pkill -9 -f "$DIR/okx_venture_strategy.py" >/dev/null 2>&1 || true
 
 for port in 8000 8001 8005 8009 8013; do
   fuser -k -9 "${port}/tcp" >/dev/null 2>&1 || true

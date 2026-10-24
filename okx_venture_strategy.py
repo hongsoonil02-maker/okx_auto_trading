@@ -21,32 +21,20 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
     # [Fix] 마진 -10%/-7% 고정 스탑 제거 (3x에서 가격 -2.3% = 알트 30m 1 ATR 안 → 실거래 알트 28건 승률 7%).
     # 스탑은 BaseStrategyBrain ATR 스탑(OKX_ATR_STOP_K) 사용, HARD_STOP은 env 최후 방어선만 유지.
     HARD_STOP_LOSS_PCT = float(os.getenv("OKX_HARD_STOP_LOSS", "-0.30"))
-    # [토너먼트 1위 반영] Chandelier_Max_Runner: ARM=0.35, K=3.5 (백테스트 1위: +35.3%, PF 3.92)
-    ATR_TRAIL_ARM_PNL = 0.35
+    # [Venture V3 업데이트 - User Directive] Jev AI의 초고속 판단력을 활용한 양방향 초단타 스캘핑 모드
+    ATR_TRAIL_ARM_PNL = 0.10   # 10% 수익 발생 시 트레일링 즉시 발동 (스캘핑 특화)
+    ATR_TRAIL_K = 1.5          # 고점 대비 ATR 1.5배 하락 시 칼익절 (매우 타이트하게)
+    # [개선] 15m 알트 잦은 턴오버 및 양방향 휩소 방지를 위해 플립 비활성화
+    FLIP_ON_TRAILING_CLOSE = False
     
-    # [백테스트 검증 최적화] 30m 승격 + ADX >= 20 횡보 휩쏘 차단
-    # 백테스트 성과: 수익률 +125.3%, PF 1.88, MDD 35.9% (15m 노필터 대비 2.3배 초과수익)
-    TIMEFRAME = "30m"
-    TIMEFRAME_MINUTES = 30
-    CHOP_ADX_BLOCK_THRESHOLD = 20.0
+    # [Venture V3 업데이트] 15m 초단타
+    TIMEFRAME = "15m"
+    TIMEFRAME_MINUTES = 15
+    # [개선] 횡보장(ADX<22) 노이즈 진입 및 수수료 누수 차단 (기존 15.0 -> 22.0 상향)
+    CHOP_ADX_BLOCK_THRESHOLD = 22.0
     
-    STOCK_KEYWORDS = []
-    BLACKLIST = ['KR200', 'SKHYNIX', 'SAMSUNG', 'MU', 'SHAZ', 'ISRG', 'ROBO', 'RAM', 'DRAM', 'GME',
-                 'GPS', 'SNXX', 'POL',  # GPS(-64.7%), SNXX(-38.3%), POL(-21.6%) 반복 손실 차단
-                 'LIT', 'CHIP', 'BOME', 'FIL',  # [8/26 백테스트] 90일 누적 출혈 상위 알트 차단
-                 'CAP']  # [8/26] 5일간 48회 매수 반복 손실 — 무한 재진입 차단
-    # 주식/상품 토큰 전부 제외 (주식 전용 봇과 중복 거래 방지)
-    MAJORS_AND_STOCKS = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'LINK', 'DOT', 'BNB', 'TRX',
-                         'TSLA', 'NVDA', 'AAPL', 'AMZN', 'MSFT', 'META', 'GOOG', 'GOOGL', 'COIN',
-                         'SPCX', 'OPENAI', 'ANTHROPIC', 'RDDT', 'MU', 'SNDK', 'SOXL', 'XAU', 'CL',
-                         # [Fix] 주식/ETF 토큰 추가 — 크립토와 다른 가격 패턴, 숏 구조적 불리
-                         'SKHY', 'KORU', 'CBRS', 'AEON',
-                         'PLTR', 'AMD', 'INTC', 'QCOM', 'BABA', 'UBER', 'ABNB', 'SNAP',
-                         'MSTR', 'HOOD', 'RIVN', 'NIO', 'PYPL', 'SQ', 'SHOP',
-                         'SPY', 'QQQ', 'IWM', 'DIA', 'GLD', 'SLV', 'XAG',
-                         'SAMSUNG',
-                         ]
-    # [백테스트 검증] Venture 15m에서 재진입 PF 1.15→1.20 (180일, N=231)
+    # [사용자 지침] 유동성 최상위 엄선 5대 알트코인 정예 유니버스 (잡코인 배제)
+    TARGET_ALTS = ['DOGE', 'SUI', 'PEPE', 'NEAR', 'AVAX']
     REENTRY_ENABLED = True
 
     def _symbol_matches(self, symbol: str, ticker_data: dict, markets: dict) -> bool:
@@ -54,14 +42,8 @@ class OKXVentureStrategyBrain(BaseStrategyBrain):
             return False
         if 'USDT' not in symbol:
             return False
-        # [Fix] ccxt 심볼은 'BTC/USDT:USDT' 형태라 '-' split만으론 base 추출 불가
-        # → '/' split 추가 (기존엔 제외 목록이 작동하지 않아 ETH/주식토큰도 거래했음)
         base_coin = symbol.split('-')[0].split('/')[0]
-        if base_coin in self.MAJORS_AND_STOCKS:
-            return False
-        if any(b in symbol for b in self.BLACKLIST):
-            return False
-        return True
+        return base_coin in self.TARGET_ALTS
 
 
 

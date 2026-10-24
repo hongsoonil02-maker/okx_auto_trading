@@ -1,0 +1,310 @@
+# -*- coding: utf-8 -*-
+"""
+run_cameron_30m_fast_sweep.py — Alpaca Cameron 30분봉 손익비(Risk:Reward) 초고속 단일 패스 스윕 백테스트
+- 대상 손익비: 1:1.5, 1:2.0, 1:2.5, 1:3.0, 1:3.5
+- 컷오프 비교: 14:30 ET (신규 최적화) vs 15:30 ET (기존)
+- 단일 패스로 캐시 파일(127일)을 딱 1회만 로드하여 1~2분 만에 완료
+"""
+
+import os
+import sys
+import pickle
+import numpy as np
+import pandas as pd
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(CURRENT_DIR, ".env"))
+CACHE = os.path.join(CURRENT_DIR, "state", "bt_cache")
+
+MIN_PRICE, MAX_PRICE = 2.0, 50.0
+MIN_GAP_PCT = 3.0
+WATCH_TOP = 5
+POS_PCT = 0.10
+MAX_POS = 3
+MIN_SL, MAX_SL = 0.01, 0.04
+SLIP = 0.001
+EQUITY0 = 100_000.0
+WINDOW = 40
+
+
+def evaluate(name, rr_target, cutoff_str, trades, curve):
+    eq = pd.Series({d: v for d, v in curve}).sort_index()
+    years = max((eq.index[-1] - eq.index[0]).days / 365.25, 0.01)
+    cagr = (eq.iloc[-1] / eq.iloc[0]) ** (1 / years) - 1
+    mdd = ((eq.cummax() - eq) / eq.cummax()).max()
+
+    if trades:
+        arr = np.array([t["pnl"] for t in trades])
+        reasons = [t["reason"] for t in trades]
+        gw = arr[arr > 0].sum()
+        gl = -arr[arr <= 0].sum()
+        pf = gw / gl if gl > 0 else float("inf")
+        wr = (arr > 0).mean() * 100
+        n = len(arr)
+        ret = (eq.iloc[-1] / EQUITY0 - 1) * 100
+        tp_cnt = reasons.count("TP")
+        sl_cnt = reasons.count("SL") + reasons.count("SL_AMBIG")
+        eod_cnt = reasons.count("EOD")
+        tp_pct = (tp_cnt / n) * 100
+        sl_pct = (sl_cnt / n) * 100
+        eod_pct = (eod_cnt / n) * 100
+        avg_win = arr[arr > 0].mean() if len(arr[arr > 0]) > 0 else 0
+        avg_loss = -arr[arr <= 0].mean() if len(arr[arr <= 0]) > 0 else 0
+        realized_rr = avg_win / avg_loss if avg_loss > 0 else 0
+    else:
+        pf = wr = ret = cagr = mdd = tp_pct = sl_pct = eod_pct = realized_rr = 0.0
+        n = tp_cnt = sl_cnt = eod_cnt = 0
+
+    return {
+        "cutoff": cutoff_str,
+        "rr": f"1:{rr_target:.1f}",
+        "trades": n,
+        "win_rate": round(wr, 1),
+        "pf": round(pf, 2),
+        "total_ret": round(ret, 2),
+        "cagr": round(cagr * 100, 1),
+        "mdd": round(mdd * 100, 2),
+        "tp_pct": round(tp_pct, 1),
+        "sl_pct": round(sl_pct, 1),
+        "eod_pct": round(eod_pct, 1),
+        "realized_rr": round(realized_rr, 2)
+    }
+
+
+def main():
+    import glob
+    daily_files = glob.glob(os.path.join(CACHE, "alpaca_daily_*.pkl"))
+    if not daily_files:
+        raise FileNotFoundError("No alpaca_daily_*.pkl found in cache")
+    daily_cache_path = sorted(daily_files)[-1]
+    print(f"📂 데일리 캐시 로드: {os.path.basename(daily_cache_path)}", flush=True)
+    with open(daily_cache_path, "rb") as f:
+        daily = pickle.load(f)
+
+    base = os.path.basename(daily_cache_path).replace("alpaca_daily_", "").replace(".pkl", "")
+    s_str, e_str = base.split("_")
+    start = datetime.strptime(s_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end = datetime.strptime(e_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+    universe = {}
+    for sym, df in daily.items():
+        last = df.iloc[-1]
+        dv = (df["close"] * df["volume"]).tail(20).median()
+        if MIN_PRICE <= last["close"] <= MAX_PRICE and dv >= 1_000_000:
+            universe[sym] = df
+
+    calendar = sorted({t.normalize() for df in universe.values() for t in df["time"]})
+    calendar = [d for d in calendar if d >= pd.Timestamp(start.date(), tz="UTC")]
+
+    print(f"=========================================================================================", flush=True)
+    print(f"📊 [Alpaca 30분봉 손익비(RR) 초고속 스윕 백테스트] 기간: {start.date()} ~ {end.date()} (6개월)", flush=True)
+    print(f"   유니버스: {len(universe)}개 종목 | 거래일: {len(calendar)}일", flush=True)
+    print(f"=========================================================================================", flush=True)
+
+    cutoffs = [(14, 30), (15, 30)]
+    rr_list = [1.5, 2.0, 2.5, 3.0, 3.5]
+
+    # 각 설정별 상태 초기화
+    configs = []
+    for c in cutoffs:
+        c_str = f"{c[0]:02d}:{c[1]:02d}"
+        for rr in rr_list:
+            configs.append({
+                "cutoff": c,
+                "cutoff_str": c_str,
+                "rr": rr,
+                "equity": EQUITY0,
+                "trades": [],
+                "curve": []
+            })
+
+    tf = "30Min"
+    t0 = datetime.now()
+
+    for idx, day in enumerate(calendar):
+        if (idx + 1) % 25 == 0 or idx == len(calendar) - 1:
+            elapsed = (datetime.now() - t0).total_seconds()
+            print(f"  ⏳ 진행률: {idx + 1}/{len(calendar)} 일 완료 ({elapsed:.1f}초 경과)", flush=True)
+
+        movers = []
+        for sym, df in universe.items():
+            row = df[df["time"].dt.normalize() == day]
+            if row.empty:
+                continue
+            i = row.index[0]
+            if i == 0:
+                continue
+            pc = df["close"].loc[i - 1]
+            px = row.iloc[0]["close"]
+            if pd.isna(pc) or pc <= 0:
+                continue
+            pct = (px / pc - 1) * 100
+            if pct >= MIN_GAP_PCT and MIN_PRICE <= px <= MAX_PRICE:
+                movers.append((pct, sym))
+        movers.sort(reverse=True)
+        watch = [s for _, s in movers[:WATCH_TOP]]
+
+        if not watch:
+            for cfg in configs:
+                cfg["curve"].append((day, cfg["equity"]))
+            continue
+
+        hcache = os.path.join(CACHE, f"alpaca_{tf}_{day.date()}.pkl")
+        if not os.path.exists(hcache):
+            for cfg in configs:
+                cfg["curve"].append((day, cfg["equity"]))
+            continue
+
+        with open(hcache, "rb") as f:
+            intraday = pickle.load(f)
+
+        # 1. 당일 워치리스트 종목들의 시그널 추출 (컷오프와 무관한 공통 계산)
+        # sym -> list of signal dicts
+        sym_signals = {}
+        for sym in watch:
+            df = intraday.get(sym)
+            if df is None or len(df) < 16:
+                continue
+            df = df.copy()
+            tp = (df["high"] + df["low"] + df["close"]) / 3
+            pv = (tp * df["volume"]).rolling(WINDOW).sum()
+            vv = df["volume"].rolling(WINDOW).sum().replace(0, 1)
+            df["vwap"] = pv / vv
+            df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+            day_idx = df.index[df["time"].dt.normalize() == day].tolist()
+
+            signals = []
+            for j in day_idx:
+                if j < 15:
+                    continue
+                bar_time = df.loc[j, "time"]
+                et = bar_time - pd.Timedelta(hours=4)  # EDT
+
+                prev, curr = df.loc[j - 1], df.loc[j]
+                if not (prev["close"] < prev["open"]):
+                    continue
+                if prev["close"] < prev["ema9"] * 0.99 or prev["low"] < prev["vwap"] * 0.985:
+                    continue
+
+                prior = df.loc[j - 6:j - 2]
+                if len(prior) < 5:
+                    continue
+                i_low, i_high = prior["low"].min(), prior["high"].max()
+                surge = i_high - i_low
+                if surge <= 0 or surge / i_low < 0.02:
+                    continue
+                if (i_high - prev["low"]) / surge > 0.50:
+                    continue
+
+                ivol = prior["volume"].mean()
+                if ivol > 0 and prev["volume"] > ivol * 1.1:
+                    continue
+
+                trig, sl = prev["high"], prev["low"]
+                risk = trig - sl
+                if risk <= 0:
+                    continue
+                rpct = risk / trig
+                if rpct > MAX_SL or rpct < MIN_SL:
+                    continue
+                if curr["high"] < trig:
+                    continue
+
+                entry = trig * (1 + SLIP)
+                future_bars = [df.loc[k] for k in day_idx if k > j]
+                eod_close = df.loc[day_idx[-1], "close"]
+
+                signals.append({
+                    "j": j,
+                    "et_hm": (et.hour, et.minute),
+                    "trig": trig,
+                    "sl": sl,
+                    "risk": risk,
+                    "entry": entry,
+                    "future_bars": future_bars,
+                    "eod_close": eod_close
+                })
+                break  # 종목당 1회 진입
+
+            if signals:
+                sym_signals[sym] = signals[0]
+
+        # 2. 각 설정별로 체결 및 청산 시뮬레이션
+        for cfg in configs:
+            cutoff = cfg["cutoff"]
+            rr = cfg["rr"]
+            day_pos = 0
+
+            for sym in watch:
+                if day_pos >= MAX_POS:
+                    break
+                sig = sym_signals.get(sym)
+                if not sig:
+                    continue
+                if sig["et_hm"] >= cutoff:
+                    continue
+
+                # 진입 확정
+                trig = sig["trig"]
+                sl = sig["sl"]
+                risk = sig["risk"]
+                entry = sig["entry"]
+                tp_price = trig + (risk * rr)
+                value = cfg["equity"] * POS_PCT
+
+                exit_p = reason = None
+                for b in sig["future_bars"]:
+                    hit_sl, hit_tp = b["low"] <= sl, b["high"] >= tp_price
+                    if hit_sl and hit_tp:
+                        exit_p, reason = sl * (1 - SLIP), "SL_AMBIG"
+                        break
+                    if hit_sl:
+                        exit_p, reason = sl * (1 - SLIP), "SL"
+                        break
+                    if hit_tp:
+                        exit_p, reason = tp_price * (1 - SLIP), "TP"
+                        break
+
+                if exit_p is None:
+                    exit_p = sig["eod_close"] * (1 - SLIP)
+                    reason = "EOD"
+
+                ret = exit_p / entry - 1
+                pnl = value * ret
+                cfg["equity"] += pnl
+                day_pos += 1
+                cfg["trades"].append(dict(day=str(day.date()), sym=sym, ret=ret * 100, pnl=pnl, reason=reason))
+
+            cfg["curve"].append((day, cfg["equity"]))
+
+    # 결과 평가 및 출력
+    results = []
+    print("\n" + "=" * 95, flush=True)
+    print(f"📊 [결과 요약표]", flush=True)
+    print("=" * 95, flush=True)
+    header = f"{'컷오프':^7} | {'RR':^6} | {'거래수':^5} | {'승률':^6} | {'PF':^5} | {'수익률':^8} | {'CAGR':^7} | {'MDD':^6} | {'TP도달율':^7} | {'실현RR':^6}"
+    print(header, flush=True)
+    print("-" * 95, flush=True)
+
+    for cfg in configs:
+        res = evaluate(f"{cfg['cutoff_str']}_{cfg['rr']}", cfg["rr"], cfg["cutoff_str"], cfg["trades"], cfg["curve"])
+        results.append(res)
+        row = (f"{res['cutoff']:^7} | {res['rr']:^6} | {res['trades']:>5} | {res['win_rate']:>5.1f}% | "
+               f"{res['pf']:>5.2f} | {res['total_ret']:>+7.2f}% | {res['cagr']:>6.1f}% | {res['mdd']:>5.2f}% | "
+               f"{res['tp_pct']:>6.1f}% | {res['realized_rr']:>6.2f}")
+        print(row, flush=True)
+
+    # CSV 저장
+    df_res = pd.DataFrame(results)
+    out_csv = os.path.join(CURRENT_DIR, "reports", "alpaca_30m_rr_sweep_results.csv")
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    df_res.to_csv(out_csv, index=False)
+    print("\n" + "=" * 95, flush=True)
+    print(f"✅ 결과 파일 저장 완료: {out_csv}", flush=True)
+    print("=" * 95, flush=True)
+
+
+if __name__ == "__main__":
+    main()
