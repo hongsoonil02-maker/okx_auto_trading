@@ -91,7 +91,7 @@ BULLISH_ETFS = {"TQQQ", "SOXL", "QQQ"}  # Kept for regime-shift unwind compatibi
 BEARISH_ETFS = {"SQQQ", "SOXS"}         # Kept for regime-shift unwind compatibility
 LEVERAGED_3X = {"TQQQ", "SQQQ", "SOXL", "SOXS"}
 
-MAX_CONCURRENT_POSITIONS = 3
+MAX_CONCURRENT_POSITIONS = 2
 MAX_POSITION_PCT = 0.30          # Increased to 30% per position (3 symbols * 30% = 90% usage)
 LOOP_INTERVAL_SEC = 10           # Poll market every 10 seconds during open hours
 POST_LOSS_COOLDOWN_SEC = 1800.0  # 30-minute lockout after stop-loss to eliminate churn
@@ -359,7 +359,7 @@ class AlpacaJevTrader:
         base_price = limit_price or q.get("askPrice") or q.get("bidPrice") or 0.0
 
         if base_price <= 0:
-            bars = self.fetch_bars(symbol, timeframe="1Min", limit=5)
+            bars = self.fetch_bars(symbol, timeframe="5Min", limit=15)
             if bars is not None and not bars.empty:
                 base_price = float(bars["close"].iloc[-1])
 
@@ -696,10 +696,9 @@ class AlpacaJevTrader:
             # Skip buying in bearish macro for Mega Tech Long-Only strategy
             candidate_symbols = []
         else:
-            # Neutral macro: selectively scan top resilient tech equities
-            candidate_symbols = [("AAPL", "buy"), ("NVDA", "buy")]
-            if TSLA_ENABLED:
-                candidate_symbols.append(("TSLA", "buy"))
+            # Neutral / Choppy Macro: Strictly preserve 100% CASH! No trades in chop!
+            logger.info("⏸️ [Regime Gate: NEUTRAL/CHOP] QQQ lacks clear trend. Holding 100% Cash dry powder.")
+            return
 
         # Snapshot current holdings for Mutual Exclusion
         has_bull_etf = any(s in self.positions for s in BULLISH_ETFS)
@@ -724,7 +723,7 @@ class AlpacaJevTrader:
                 continue
 
             # Fetch symbol bars
-            df = self.fetch_bars(sym, timeframe="1Min", limit=100)
+            df = self.fetch_bars(sym, timeframe="15Min", limit=60)
             tech = self.calculate_technical_signals(df)
 
             # Require technical alignment or strong LOB push
