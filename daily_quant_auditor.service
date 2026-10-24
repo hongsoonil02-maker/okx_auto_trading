@@ -1,0 +1,12 @@
+﻿[Unit]
+Description=100-Bagger Daily Quant Audit & Telegram Dispatch
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/hongsoonil02/quant_system
+ExecStart=/usr/bin/python3 /home/hongsoonil02/quant_system/daily_quant_auditor.py
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

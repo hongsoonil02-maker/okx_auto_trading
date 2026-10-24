@@ -1,0 +1,12 @@
+﻿[Unit]
+Description=100-Bagger Weekly Market Calibration & Auto-Tuning
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/hongsoonil02/quant_system
+ExecStart=/usr/bin/python3 /home/hongsoonil02/quant_system/weekly_param_tuner.py
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

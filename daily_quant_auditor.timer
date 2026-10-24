@@ -1,0 +1,9 @@
+﻿[Unit]
+Description=Run 100-Bagger Daily Quant Audit at 06:30 KST (21:30 UTC)
+
+[Timer]
+OnCalendar=*-*-* 21:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
