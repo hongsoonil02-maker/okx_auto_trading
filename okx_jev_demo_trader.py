@@ -74,14 +74,14 @@ OKX_BASE_URL = "https://www.okx.com"
 TARGET_SYMBOLS = ["BTC-USDT-SWAP", "SOL-USDT-SWAP", "DOGE-USDT-SWAP"]
 LEVERAGE = 3                      # Low 3x leverage
 MAX_CONCURRENT_POSITIONS = 2
-POSITION_MARGIN_PCT = 0.25        # 25% margin per position
-MAX_MARGIN_PER_TRADE = 1500.0
+POSITION_MARGIN_PCT = 0.15        # 15% margin per position (prevents oversized positions)
+MAX_MARGIN_PER_TRADE = 1000.0     # Max $1,000 margin per trade (prevents sizing explosion after wins)
 LOOP_INTERVAL_SEC = 10
 POST_LOSS_COOLDOWN_SEC = 1800.0   # 30-minute lockout after stop-loss
-NORMAL_COOLDOWN_SEC = 300.0       # 5-minute cooldown after win
+NORMAL_COOLDOWN_SEC = 3600.0      # 60-minute cooldown after win / TP / trailing exit (prevents bottom/top chasing)
 ENTRY_COOLDOWN_SEC = 180.0
 ORDER_FAIL_COOLDOWN_SEC = 300.0   # 5-minute cooldown after a rejected order (no 10s retry spam)
-JEV_VETO_COOLDOWN_SEC = 600.0     # 10-minute cooldown after a Jev veto (saves LLM calls)
+JEV_VETO_COOLDOWN_SEC = 1800.0    # 30-minute cooldown after a Jev veto (prevents immediate re-entry after warning)
 JEV_ERROR_COOLDOWN_SEC = 120.0    # 2-minute cooldown after a Jev API error (fail-closed)
 ACCOUNT_MODE_RECHECK_SEC = 300.0
 STATE_FILE = os.path.join(CURRENT_DIR, "state", "okx_jev_demo_state.json")
@@ -92,6 +92,7 @@ TP_PCT = 0.035                    # +3.5% Spot TP (at 3x lev = +10.5% ROE)
 TRAIL_ARM_PCT = 0.015             # Arm trailing at +1.5% spot gain
 TRAIL_DROP_PCT = 0.006            # Lock profit on 0.6% pullback from peak
 MIN_ATR_RATIO = 0.0030            # Minimum ATR/Price volatility (filters out sideways chop)
+MAX_EMA20_DIST_PCT = 1.2          # Max allowed distance from 5m EMA20 to prevent overextension chasing
 
 
 def _round_step(value: float, step: str, rounding=ROUND_DOWN) -> Decimal:
@@ -136,14 +137,14 @@ class OKXJevDemoTrader:
             logger.warning("⚠️ Universal Jev Gate unavailable -> technical signals only.")
 
         logger.info("=" * 70)
-        logger.info("🚀 [OKX Jev Demo Trader] Optimal Bidirectional Alpha Engine Active")
+        logger.info("🚀 [OKX Jev Demo Trader] Optimal Bidirectional Alpha Engine Active (v2.1 Guarded)")
         logger.info(f"   Target Universe: {', '.join(TARGET_SYMBOLS)}")
-        logger.info(f"   Strategy: Bidirectional Long & Short with ATR Chop Filter (confirmed candles)")
+        logger.info(f"   Strategy: Bidirectional Long & Short with ATR Chop Filter + 15m Trend & Overextension Guard")
         logger.info(f"   Safety Level: 100% Simulated (x-simulated-trading: 1)")
         logger.info(f"   Leverage: {LEVERAGE}x (Isolated Margin)")
-        logger.info(f"   Max Concurrent Positions: {MAX_CONCURRENT_POSITIONS}")
+        logger.info(f"   Max Concurrent Positions: {MAX_CONCURRENT_POSITIONS} | Margin: {POSITION_MARGIN_PCT*100:.0f}% (max ${MAX_MARGIN_PER_TRADE:,.0f})")
         logger.info(f"   Risk: SL -{SL_PCT*100:.1f}%, TP +{TP_PCT*100:.1f}% (exchange-attached), Trail +{TRAIL_ARM_PCT*100:.1f}%")
-        logger.info(f"   Post-Loss Lockout: {POST_LOSS_COOLDOWN_SEC/60:.0f}m cooldown")
+        logger.info(f"   Cooldowns: Post-Loss {POST_LOSS_COOLDOWN_SEC/60:.0f}m | Post-Win {NORMAL_COOLDOWN_SEC/60:.0f}m | Jev Veto {JEV_VETO_COOLDOWN_SEC/60:.0f}m")
         logger.info("=" * 70)
 
     # ── STATE ──
@@ -578,6 +579,29 @@ class OKXJevDemoTrader:
             if atr_ratio < MIN_ATR_RATIO:
                 logger.debug(f"⏳ [Chop Filter Active] {sym} ATR ratio {atr_ratio*100:.3f}% < {MIN_ATR_RATIO*100:.2f}%. Skipping chop.")
                 continue
+
+            # 2.1 Overextension Guard: Reject chasing when price is already detached from 5m EMA20
+            dist_ema20 = tech.get("dist_ema20_pct", 0.0)
+            if tech["signal"] == "SELL" and dist_ema20 < -MAX_EMA20_DIST_PCT:
+                logger.info(f"⏳ [Overextension Guard] {sym} SHORT skipped: Price is {dist_ema20:.2f}% below EMA20 (overextended sell/bounce trap).")
+                continue
+            if tech["signal"] == "BUY" and dist_ema20 > MAX_EMA20_DIST_PCT:
+                logger.info(f"⏳ [Overextension Guard] {sym} LONG skipped: Price is +{dist_ema20:.2f}% above EMA20 (overextended buy/pullback trap).")
+                continue
+
+            # 2.2 Higher Timeframe (15m) Trend & Support/Resistance Confirmation
+            bars_15m = self.fetch_bars(sym, bar="15m", limit=30)
+            if bars_15m is not None and len(bars_15m) >= 20:
+                tech_15m = self.calculate_technical_signals(bars_15m)
+                dist_15m = tech_15m.get("dist_ema20_pct", 0.0)
+                if macro_bearish and tech["signal"] == "SELL":
+                    if tech_15m.get("signal") == "BUY" or dist_15m < -2.2:
+                        logger.info(f"⏳ [15M Trend Guard] {sym} SHORT skipped: 15m signal is {tech_15m.get('signal')} or 15m oversold ({dist_15m:.2f}%).")
+                        continue
+                elif macro_bullish and tech["signal"] == "BUY":
+                    if tech_15m.get("signal") == "SELL" or dist_15m > 2.2:
+                        logger.info(f"⏳ [15M Trend Guard] {sym} LONG skipped: 15m signal is {tech_15m.get('signal')} or 15m overbought ({dist_15m:.2f}%).")
+                        continue
 
             # 3. Signal Decision: Long or Short
             if not ((macro_bullish and tech["signal"] == "BUY") or (macro_bearish and tech["signal"] == "SELL")):

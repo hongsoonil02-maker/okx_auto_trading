@@ -230,8 +230,45 @@ class UniversalJevGate:
 
         return JevGateDecision(approved=True, confidence=0.5, risk_level="LOW", reason="Hold fallback", action="HOLD", latency_ms=0.0)
 
+    def evaluate_sync(
+        self,
+        asset_class: str,
+        symbol: str,
+        side: str,
+        context_metrics: Dict[str, Any]
+    ) -> JevGateDecision:
+        """
+        Synchronous evaluation wrapper for verify_entry (compatible with sync bot loops)
+        """
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(
+                    lambda: asyncio.run(self.verify_entry(asset_class, symbol, side, context_metrics))
+                ).result()
+        else:
+            return loop.run_until_complete(
+                self.verify_entry(asset_class, symbol, side, context_metrics)
+            )
+
     def _build_prompt(self, asset_class: str, symbol: str, setup_name: str, context: Dict[str, Any]) -> str:
         if asset_class == "CRYPTO":
+            if "macro" in context or "dist_ema20_pct" in context:
+                return (
+                    f"Asset: Crypto Swap ({symbol}) | Direction: {setup_name}\n"
+                    f"Price: ${context.get('price', 0):,.4f} | Dist from EMA20: {context.get('dist_ema20_pct', 0):+.2f}%\n"
+                    f"Macro Trend: {context.get('macro', 'N/A')} | LOB Imbalance: {context.get('imbalance', 0):+.2f}\n"
+                    f"ATR Volatility: {context.get('atr_pct', 0):.2f}% | SL: -{context.get('sl_pct', 1.5):.1f}% | TP: +{context.get('tp_pct', 3.5):.1f}%\n"
+                    f"Recent Return ({context.get('lookback_bars', 12)} bars): {context.get('recent_return_pct', 0):+.2f}%\n"
+                    f"Question: Does this {setup_name} trade have high continuation probability, or is it an overextended trap / exhaustion near support/resistance?\n"
+                    f"Approve only if continuation probability >= 65%."
+                )
             return (
                 f"Asset: Crypto Swap ({symbol}) | Setup: {setup_name}\n"
                 f"Surge: {context.get('surge_pct', 0):.2f}% | Retracement: {context.get('retrace_pct', 0):.2f}%\n"
