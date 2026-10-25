@@ -44,10 +44,10 @@ file_handler = logging.FileHandler("okx_guardian_trend_trader.log", encoding="ut
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
-# Exchange credentials
-API_KEY = os.getenv("OKX_API_KEY", "")
-SECRET_KEY = os.getenv("OKX_SECRET_KEY", "")
-PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
+# Exchange credentials (Uses OKX Demo keys by default for simulated trading)
+API_KEY = os.getenv("OKX_DEMO_API_KEY") or os.getenv("OKX_API_KEY", "")
+SECRET_KEY = os.getenv("OKX_DEMO_SECRET") or os.getenv("OKX_SECRET_KEY", "")
+PASSPHRASE = os.getenv("OKX_DEMO_PASSPHRASE") or os.getenv("OKX_PASSPHRASE", "")
 IS_SIMULATED = os.getenv("OKX_SIMULATED", "true").lower() == "true"
 
 exchange = ccxt.okx({
@@ -55,13 +55,15 @@ exchange = ccxt.okx({
     'secret': SECRET_KEY,
     'password': PASSPHRASE,
     'enableRateLimit': True,
+    'headers': {
+        'x-simulated-trading': '1' if IS_SIMULATED else '0'
+    },
     'options': {
         'defaultType': 'swap',
+        'fetchCurrencies': False
     }
 })
-
-if IS_SIMULATED:
-    exchange.set_sandbox_mode(True)
+exchange.has['fetchCurrencies'] = False
 
 # ==========================================
 # 2. Indicator Math (Vanilla NumPy/Pandas)
@@ -124,10 +126,11 @@ class OKXGuardianTrendBot:
 
     def init_exchange(self):
         try:
+            exchange.load_markets()
             exchange.set_leverage(LEVERAGE, SYMBOL)
             logger.info(f"[{SYMBOL}] Leverage configured to {LEVERAGE}x isolated.")
         except Exception as e:
-            logger.warning(f"Leverage setup warning: {e}")
+            logger.warning(f"Leverage/Market setup warning: {e}")
 
     def fetch_ohlcv(self, limit=130) -> pd.DataFrame:
         ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=limit)
@@ -138,6 +141,8 @@ class OKXGuardianTrendBot:
     def get_equity(self) -> float:
         try:
             bal = exchange.fetch_balance()
+            if 'info' in bal and 'data' in bal['info'] and len(bal['info']['data']) > 0:
+                return float(bal['info']['data'][0].get('totalEq', 10000.0))
             return float(bal['total'].get('USDT', 10000.0))
         except Exception as e:
             logger.error(f"Balance fetch error: {e}")
@@ -203,7 +208,7 @@ class OKXGuardianTrendBot:
         # Safety Clamping: Max 20% equity as margin, max 3x notional
         max_notional = equity * MAX_MARGIN_PCT * LEVERAGE
         max_size = max_notional / current_price
-        final_size = round(min(desired_size, max_size), 4)
+        final_size = max(0.01, round(min(desired_size, max_size), 2))
 
         if final_size <= 0:
             logger.warning("Calculated size too small, entry skipped.")
