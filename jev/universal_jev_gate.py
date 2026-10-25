@@ -277,6 +277,16 @@ class UniversalJevGate:
                 f"Approve only if continuation probability >= 65%."
             )
         elif asset_class == "US_STOCKS":
+            if "macro" in context or "dist_ema20_pct" in context:
+                return (
+                    f"Asset: US Equities ({symbol}) | Setup: Trend Continuation ({setup_name})\n"
+                    f"Price: ${context.get('price', 0):,.2f} | Dist from EMA20: {context.get('dist_ema20_pct', 0):+.2f}%\n"
+                    f"Macro Trend: {context.get('macro', 'N/A')} | L1 Imbalance: {context.get('imbalance', 0):+.2f}\n"
+                    f"ATR Volatility: {context.get('atr_pct', 0):.2f}% | SL: -{context.get('sl_pct', 1.2):.1f}% | TP: +{context.get('tp_pct', 2.8):.1f}%\n"
+                    f"Recent Return ({context.get('lookback_bars', 15)} bars): {context.get('recent_return_pct', 0):+.2f}%\n"
+                    f"Question: Is this a high-probability momentum continuation, or an overextended buying trap near resistance?\n"
+                    f"Approve only if continuation probability >= 65%."
+                )
             surge = context.get('surge_pct') or context.get('gap_pct', 0)
             rvol = context.get('vol_ratio') or context.get('rvol', 1.0)
             retrace = context.get('retrace_pct') or context.get('retrace_ratio', 0)

@@ -104,14 +104,15 @@ LEVERAGED_ETFS = {"TQQQ", "SOXL"}
 
 MAX_CONCURRENT_POSITIONS = 3
 MAX_LEVERAGED_ETF_POSITIONS = 1   # TQQQ & SOXL are ~same bet; never hold both
-MAX_GROSS_EXPOSURE_PCT = float(os.getenv("ALPACA_GOLDEN_MAX_GROSS_EXPOSURE", "0.95"))
+MAX_GROSS_EXPOSURE_PCT = float(os.getenv("ALPACA_GOLDEN_MAX_GROSS_EXPOSURE", "0.90"))
 MIN_ORDER_NOTIONAL = 500.0
 LOOP_INTERVAL_SEC = 10            # Poll market every 10 seconds during open hours
 POST_LOSS_COOLDOWN_SEC = 1800.0   # 30-minute lockout after stop-loss
-NORMAL_COOLDOWN_SEC = 180.0       # 3-minute normal exit cooldown
+NORMAL_COOLDOWN_SEC = 900.0       # 15-minute normal exit cooldown
 ORDER_FAIL_COOLDOWN_SEC = 300.0   # 5-minute cooldown after a rejected order
-JEV_VETO_COOLDOWN_SEC = 600.0     # 10-minute cooldown after a Jev veto (saves LLM calls)
+JEV_VETO_COOLDOWN_SEC = 1800.0    # 30-minute cooldown after a Jev veto (saves LLM calls)
 JEV_ERROR_COOLDOWN_SEC = 120.0    # 2-minute cooldown after a Jev API error (fail-closed)
+MAX_EMA20_DIST_PCT = 1.5          # Skip buying if price is already detached >1.5% above 5m EMA20
 EOD_FLATTEN_MIN_BEFORE_CLOSE = 5.0
 NO_NEW_ENTRY_MIN_BEFORE_CLOSE = 15.0
 MAX_BAR_AGE_SEC = {"1Min": 600, "5Min": 1200}  # staleness guard
@@ -156,13 +157,13 @@ class AlpacaGoldenTrader:
             logger.warning("⚠️ Universal Jev Gate module not available -> technical signals only.")
 
         logger.info("=" * 70)
-        logger.info("🏆 [Alpaca Golden Trader] Optimal Alpha Boost Engine Active")
+        logger.info("🏆 [Alpaca Golden Trader] Optimal Alpha Boost Engine Active (v2.1 Guarded)")
         logger.info(f"   REST Endpoint: {ALPACA_BASE_URL} | Data feed: {ALPACA_DATA_FEED}")
         logger.info(f"   Target Universe (6): {', '.join(SYMBOLS_UNIVERSE)}")
-        logger.info(f"   Dynamic Sizing: 1st=45% | 2nd=30% | 3rd=20% (Max 3 Pos, gross cap {MAX_GROSS_EXPOSURE_PCT*100:.0f}%, max {MAX_LEVERAGED_ETF_POSITIONS} lev-ETF)")
-        logger.info(f"   1x Tech (NVDA): SL -1.2%, TP +2.8%, Trail +1.5%")
-        logger.info(f"   High Beta (TSLA/PLTR/MSTR/TQQQ/SOXL): SL -2.2%, TP +4.8%, Trail +2.5%")
-        logger.info(f"   Lockout Guard: {POST_LOSS_COOLDOWN_SEC/60:.0f}m cooldown post loss | EOD flatten T-{EOD_FLATTEN_MIN_BEFORE_CLOSE:.0f}m")
+        logger.info(f"   Balanced Sizing: 1st=32% | 2nd=30% | 3rd=28% (Max 3 Pos, gross cap {MAX_GROSS_EXPOSURE_PCT*100:.0f}%, max {MAX_LEVERAGED_ETF_POSITIONS} lev-ETF)")
+        logger.info(f"   1x Tech (NVDA): SL -1.2%, TP +2.8%, Trail +1.5% (drop 0.5%)")
+        logger.info(f"   High Beta (TSLA/PLTR/MSTR/TQQQ/SOXL): SL -2.2%, TP +4.8%, Trail +2.5% (drop 1.0%)")
+        logger.info(f"   Lockout Guard: {POST_LOSS_COOLDOWN_SEC/60:.0f}m post-loss | {NORMAL_COOLDOWN_SEC/60:.0f}m post-win | {JEV_VETO_COOLDOWN_SEC/60:.0f}m veto | EOD flatten T-{EOD_FLATTEN_MIN_BEFORE_CLOSE:.0f}m")
         logger.info("=" * 70)
 
     # ── STATE ──
@@ -419,14 +420,14 @@ class AlpacaGoldenTrader:
         }
 
     def get_dynamic_position_pct(self) -> float:
-        """Dynamic Capital Sizing: 1st=45%, 2nd=30%, 3rd=20%"""
+        """Balanced Capital Sizing: 1st=32%, 2nd=30%, 3rd=28% (prevents single-asset concentration)"""
         active = self.get_active_count()
         if active == 0:
-            return 0.45
+            return 0.32
         elif active == 1:
             return 0.30
         elif active == 2:
-            return 0.20
+            return 0.28
         return 0.0
 
     # ── ORDERS ──
@@ -436,21 +437,28 @@ class AlpacaGoldenTrader:
             logger.warning(f"⚠️ Invalid order qty for {symbol}: {qty}")
             return None
 
-        q = self.fetch_latest_quote(symbol)
-        base_price = q.get("askPrice") or q.get("midPrice") or 0.0
+        bars = self.fetch_bars(symbol, timeframe="1Min", limit=5)
+        bar_close = float(bars["close"].iloc[-1]) if (bars is not None and not bars.empty) else 0.0
 
-        if base_price <= 0:
-            bars = self.fetch_bars(symbol, timeframe="1Min", limit=5)
-            if bars is not None and not bars.empty:
-                base_price = float(bars["close"].iloc[-1])
+        q = self.fetch_latest_quote(symbol)
+        quote_ask = q.get("askPrice") or q.get("midPrice") or 0.0
+
+        # Discrepancy protection: if IEX ask is distorted (>1.2% discrepancy from 1Min bar close), clamp to bar close
+        if bar_close > 0 and quote_ask > 0 and abs(quote_ask - bar_close) / bar_close > 0.012:
+            logger.warning(f"⚠️ {symbol} IEX quote ask (${quote_ask:.2f}) deviates >1.2% from 1Min close (${bar_close:.2f}). Clamping base_price to bar close.")
+            base_price = bar_close
+        else:
+            base_price = quote_ask or bar_close
 
         if base_price <= 0:
             logger.error(f"❌ Cannot submit order for {symbol}: Unable to obtain base price.")
             return None
 
         sym_sl, sym_tp, sym_trail = get_symbol_risk(symbol)
+        # Ensure SL stop_price is strictly below market execution price to prevent HTTP 422 rejects
+        sl_base = min(base_price, bar_close) if bar_close > 0 else base_price
+        sl_price = round(sl_base * (1.0 - sym_sl) - 0.01, 2)
         tp_price = round(base_price * (1.0 + sym_tp), 2)
-        sl_price = round(base_price * (1.0 - sym_sl), 2)
 
         order_data = {
             "symbol": symbol,
@@ -510,18 +518,20 @@ class AlpacaGoldenTrader:
                     self.peak_prices[symbol] = curr_price
                     peak = curr_price
 
+                # Compute profit metrics
+                gain_from_entry = (curr_price - entry_price) / entry_price
+                peak_gain = (peak - entry_price) / entry_price
+
                 # Breakeven Defense: Lock gains after +1.5% peak if price pulls back near entry
                 if peak_gain >= 0.015 and gain_from_entry <= 0.002:
-                    logger.info(f"??? [Breakeven Defense] {symbol} peaked at +{peak_gain*100:.2f}%, locking breakeven exit (Gain: {gain_from_entry*100:+.2f}%)")
+                    logger.info(f"🛡️ [Breakeven Defense] {symbol} peaked at +{peak_gain*100:.2f}%, locking breakeven exit (Gain: {gain_from_entry*100:+.2f}%)")
                     self.close_position(symbol, f"BREAKEVEN_DEFENSE_{gain_from_entry*100:.2f}PCT")
                     continue
 
                 # Trailing stop: armed once peak profit exceeded sym_trail_arm
-                gain_from_entry = (curr_price - entry_price) / entry_price
-                peak_gain = (peak - entry_price) / entry_price
                 if peak_gain >= sym_trail_arm:
                     drop_from_peak = (peak - curr_price) / peak
-                    trail_drop_threshold = 0.010  # 1.0% drop from peak triggers lock-in
+                    trail_drop_threshold = 0.005 if symbol not in HIGH_BETA_SYMBOLS else 0.010
                     if drop_from_peak >= trail_drop_threshold:
                         logger.info(f"🎯 [Trailing Stop Exit] {symbol} locked in profit: Entry ${entry_price:.2f} -> Peak ${peak:.2f} -> Curr ${curr_price:.2f} (Gain: {gain_from_entry*100:+.2f}%)")
                         self.close_position(symbol, f"TRAILING_STOP_EXIT_{gain_from_entry*100:.2f}PCT")
@@ -635,6 +645,12 @@ class AlpacaGoldenTrader:
             df = self.fetch_bars(sym, timeframe="5Min", limit=60)
             tech = self.calculate_technical_signals(df)
             if tech["signal"] != "BUY":
+                continue
+
+            # Overextension Guard: skip buying if price is already detached >1.5% above 5m EMA20
+            dist_ema20 = tech.get("dist_ema20_pct", 0.0)
+            if dist_ema20 > MAX_EMA20_DIST_PCT:
+                logger.info(f"⏳ [Overextension Guard] {sym} BUY skipped: Price is +{dist_ema20:.2f}% above EMA20 (overextended buying trap).")
                 continue
 
             q = self.fetch_latest_quote(sym)
