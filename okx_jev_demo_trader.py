@@ -121,6 +121,7 @@ class OKXJevDemoTrader:
         self.peak_prices: Dict[str, float] = {}
         self.trade_cooldowns: Dict[str, float] = {}
         self.position_entry_times: Dict[str, float] = {}
+        self.position_params: Dict[str, Dict[str, float]] = {}
         self.inst_cache: Dict[str, Dict[str, str]] = {}
         self.trading_enabled = False
         self.last_mode_check = 0.0
@@ -137,13 +138,13 @@ class OKXJevDemoTrader:
             logger.warning("⚠️ Universal Jev Gate unavailable -> technical signals only.")
 
         logger.info("=" * 70)
-        logger.info("🚀 [OKX Jev Demo Trader] Optimal Bidirectional Alpha Engine Active (v2.1 Guarded)")
+        logger.info("🚀 [OKX Jev Demo Trader] Optimal Alpha Engine Active (v3.0 Dynamic ATR + MTF)")
         logger.info(f"   Target Universe: {', '.join(TARGET_SYMBOLS)}")
-        logger.info(f"   Strategy: Bidirectional Long & Short with ATR Chop Filter + 15m Trend & Overextension Guard")
+        logger.info(f"   Strategy: Bidirectional Long & Short with 15m MTF Gate + Dynamic ATR SL/TP")
         logger.info(f"   Safety Level: 100% Simulated (x-simulated-trading: 1)")
         logger.info(f"   Leverage: {LEVERAGE}x (Isolated Margin)")
         logger.info(f"   Max Concurrent Positions: {MAX_CONCURRENT_POSITIONS} | Margin: {POSITION_MARGIN_PCT*100:.0f}% (max ${MAX_MARGIN_PER_TRADE:,.0f})")
-        logger.info(f"   Risk: SL -{SL_PCT*100:.1f}%, TP +{TP_PCT*100:.1f}% (exchange-attached), Trail +{TRAIL_ARM_PCT*100:.1f}%")
+        logger.info(f"   Risk: Dynamic ATR SL (2.2*ATR: 1.8%~3.5%), TP (2.5*SL: 4.0%~8.0%), Trailing Ratchet")
         logger.info(f"   Cooldowns: Post-Loss {POST_LOSS_COOLDOWN_SEC/60:.0f}m | Post-Win {NORMAL_COOLDOWN_SEC/60:.0f}m | Jev Veto {JEV_VETO_COOLDOWN_SEC/60:.0f}m")
         logger.info("=" * 70)
 
@@ -154,6 +155,7 @@ class OKXJevDemoTrader:
         self.peak_prices = {k: float(v) for k, v in st.get("peak_prices", {}).items()}
         self.trade_cooldowns = {k: float(v) for k, v in st.get("trade_cooldowns", {}).items() if float(v) > now}
         self.position_entry_times = {k: float(v) for k, v in st.get("position_entry_times", {}).items()}
+        self.position_params = st.get("position_params", {}) or {}
         self.positions = st.get("positions", {}) or {}  # lets us detect exchange-side closes that happened while down
         if st:
             logger.info(f"♻️ [State Restored] peaks={self.peak_prices} cooldowns={list(self.trade_cooldowns)}")
@@ -163,6 +165,7 @@ class OKXJevDemoTrader:
             "peak_prices": self.peak_prices,
             "trade_cooldowns": {k: v for k, v in self.trade_cooldowns.items() if v > time.time()},
             "position_entry_times": self.position_entry_times,
+            "position_params": self.position_params,
             "positions": {k: {"avgPx": v.get("avgPx"), "pos": v.get("pos"), "upl": v.get("upl"), "uplRatio": v.get("uplRatio")}
                           for k, v in self.positions.items()},
             "saved_at": datetime.now(timezone.utc).isoformat(),
@@ -296,7 +299,9 @@ class OKXJevDemoTrader:
         self.trade_cooldowns[inst_id] = time.time() + cooldown
         self.peak_prices.pop(inst_id, None)
         self.position_entry_times.pop(inst_id, None)
+        self.position_params.pop(inst_id, None)
         self._cancel_algo_orders(inst_id)
+        self._save_state()
         tag = "LOSS" if is_loss else "WIN"
         logger.info(f"ℹ️ [Position Closed Externally] {inst_id} {tag} pnl={pnl:+.2f} USDT ({src}) -> cooldown {cooldown/60:.0f}m")
         send_telegram(f"[OKX Demo] {inst_id} 거래소 SL/TP 청산 ({tag} {pnl:+.2f} USDT)")
@@ -411,8 +416,10 @@ class OKXJevDemoTrader:
             self._request("POST", "/api/v5/trade/cancel-algos", data=algos)
             logger.info(f"🧹 [Algo Cleanup] {inst_id} cancelled {len(algos)} leftover SL/TP algo order(s)")
 
-    def open_position(self, inst_id: str, side: str = "buy") -> bool:
-        """Submits market order with exchange-attached SL/TP (Buy for Long, Sell for Short)"""
+    def open_position(self, inst_id: str, side: str = "buy",
+                      sl_pct: float = SL_PCT, tp_pct: float = TP_PCT,
+                      trail_arm: float = TRAIL_ARM_PCT, trail_drop: float = TRAIL_DROP_PCT) -> bool:
+        """Submits market order with exchange-attached dynamic SL/TP (Buy for Long, Sell for Short)"""
         info = self.get_instrument(inst_id)
         mid_pr, imb = self.get_ticker_and_imbalance(inst_id)
         if not info or mid_pr <= 0:
@@ -430,8 +437,8 @@ class OKXJevDemoTrader:
             return False
 
         is_long = side == "buy"
-        sl_px = mid_pr * (1 - SL_PCT) if is_long else mid_pr * (1 + SL_PCT)
-        tp_px = mid_pr * (1 + TP_PCT) if is_long else mid_pr * (1 - TP_PCT)
+        sl_px = mid_pr * (1 - sl_pct) if is_long else mid_pr * (1 + sl_pct)
+        tp_px = mid_pr * (1 + tp_pct) if is_long else mid_pr * (1 - tp_pct)
         tick = info["tickSz"]
         order_data = {
             "instId": inst_id,
@@ -454,7 +461,7 @@ class OKXJevDemoTrader:
         pos_type_desc = "LONG" if is_long else "SHORT"
         approx_usd = float(contracts) * ct_val * mid_pr
         logger.info(f"📤 [Demo Order Submit] {pos_type_desc} {order_data['sz']} contracts {inst_id} (~${approx_usd:,.1f}) @ ${mid_pr:,.4f} "
-                    f"| SL {order_data['attachAlgoOrds'][0]['slTriggerPx']} / TP {order_data['attachAlgoOrds'][0]['tpTriggerPx']}")
+                    f"| Dyn SL {order_data['attachAlgoOrds'][0]['slTriggerPx']} (-{sl_pct*100:.2f}%) / TP {order_data['attachAlgoOrds'][0]['tpTriggerPx']} (+{tp_pct*100:.2f}%)")
         res = self._request("POST", "/api/v5/trade/order", data=order_data)
         if res and res.get("data"):
             oid = res["data"][0].get("ordId")
@@ -462,7 +469,14 @@ class OKXJevDemoTrader:
             self.trade_cooldowns[inst_id] = time.time() + ENTRY_COOLDOWN_SEC
             self.position_entry_times[inst_id] = time.time()
             self.peak_prices[inst_id] = mid_pr
-            send_telegram(f"[OKX Demo] {pos_type_desc} {inst_id} {order_data['sz']}ct ~${approx_usd:,.0f} @ {mid_pr:,.4f}")
+            self.position_params[inst_id] = {
+                "sl_pct": sl_pct,
+                "tp_pct": tp_pct,
+                "trail_arm": trail_arm,
+                "trail_drop": trail_drop
+            }
+            self._save_state()
+            send_telegram(f"[OKX Demo] {pos_type_desc} {inst_id} {order_data['sz']}ct ~${approx_usd:,.0f} @ {mid_pr:,.4f} | SL -{sl_pct*100:.1f}%, TP +{tp_pct*100:.1f}%")
             return True
 
         self.trade_cooldowns[inst_id] = time.time() + ORDER_FAIL_COOLDOWN_SEC
@@ -493,6 +507,8 @@ class OKXJevDemoTrader:
         self.positions.pop(inst_id, None)
         self.peak_prices.pop(inst_id, None)
         self.position_entry_times.pop(inst_id, None)
+        self.position_params.pop(inst_id, None)
+        self._save_state()
 
         if "STOP_LOSS" in reason or pnl_pct < 0:
             logger.info(f"⏳ [Post-Loss Lockout] {inst_id} enforcing {POST_LOSS_COOLDOWN_SEC/60:.0f}m cooling period.")
@@ -519,6 +535,18 @@ class OKXJevDemoTrader:
                 is_long = pos_amt > 0
                 spot_pl_pct = (curr_px - avg_px) / avg_px if is_long else (avg_px - curr_px) / avg_px
 
+                # Retrieve dynamic risk parameters for this position (fallback to defaults)
+                params = self.position_params.get(inst_id, {
+                    "sl_pct": SL_PCT,
+                    "tp_pct": TP_PCT,
+                    "trail_arm": TRAIL_ARM_PCT,
+                    "trail_drop": TRAIL_DROP_PCT
+                })
+                pos_sl_pct = params.get("sl_pct", SL_PCT)
+                pos_tp_pct = params.get("tp_pct", TP_PCT)
+                pos_trail_arm = params.get("trail_arm", TRAIL_ARM_PCT)
+                pos_trail_drop = params.get("trail_drop", TRAIL_DROP_PCT)
+
                 # Peak price tracking
                 peak = self.peak_prices.get(inst_id, avg_px)
                 if is_long and curr_px > peak:
@@ -528,22 +556,22 @@ class OKXJevDemoTrader:
                     self.peak_prices[inst_id] = curr_px
                     peak = curr_px
 
-                # 1. Hard Stop-Loss backup (-1.5% Spot = -4.5% ROE)
-                if spot_pl_pct <= -SL_PCT:
-                    logger.warning(f"🛑 [Stop Loss Trigger] {inst_id} {'LONG' if is_long else 'SHORT'} Spot PnL: {spot_pl_pct*100:.2f}% (Limit: -{SL_PCT*100:.1f}%)")
+                # 1. Hard Stop-Loss backup
+                if spot_pl_pct <= -pos_sl_pct:
+                    logger.warning(f"🛑 [Stop Loss Trigger] {inst_id} {'LONG' if is_long else 'SHORT'} Spot PnL: {spot_pl_pct*100:.2f}% (Limit: -{pos_sl_pct*100:.2f}%)")
                     self.close_position(inst_id, f"STOP_LOSS_{spot_pl_pct*100:.1f}PCT", spot_pl_pct)
                     continue
 
-                # 2. Take-Profit backup (+3.5% Spot = +10.5% ROE)
-                if spot_pl_pct >= TP_PCT:
-                    logger.info(f"🎯 [Take Profit Trigger] {inst_id} {'LONG' if is_long else 'SHORT'} Spot PnL: +{spot_pl_pct*100:.2f}% (Target: +{TP_PCT*100:.1f}%)")
+                # 2. Take-Profit backup
+                if spot_pl_pct >= pos_tp_pct:
+                    logger.info(f"🎯 [Take Profit Trigger] {inst_id} {'LONG' if is_long else 'SHORT'} Spot PnL: +{spot_pl_pct*100:.2f}% (Target: +{pos_tp_pct*100:.2f}%)")
                     self.close_position(inst_id, f"TAKE_PROFIT_{spot_pl_pct*100:.1f}PCT", spot_pl_pct)
                     continue
 
                 # 3. Dynamic Trailing Stop
-                if spot_pl_pct >= TRAIL_ARM_PCT:
+                if spot_pl_pct >= pos_trail_arm:
                     pullback = (peak - curr_px) / peak if is_long else (curr_px - peak) / peak
-                    if pullback >= TRAIL_DROP_PCT:
+                    if pullback >= pos_trail_drop:
                         logger.info(f"🔒 [Trailing Stop Exit] {inst_id} {'LONG' if is_long else 'SHORT'} profit locked: Entry ${avg_px} -> Peak ${peak} -> Curr ${curr_px} (Gain: +{spot_pl_pct*100:.2f}%)")
                         self.close_position(inst_id, f"TRAILING_EXIT_{spot_pl_pct*100:.2f}PCT", spot_pl_pct)
                         continue
@@ -568,6 +596,21 @@ class OKXJevDemoTrader:
 
         macro_bullish = btc_px > (btc_e50 * 1.001)
         macro_bearish = btc_px < (btc_e50 * 0.999)
+
+        # 1.1 Higher Timeframe (15m) BTC Confirmation (MTF Filter)
+        btc_15m_bars = self.fetch_bars("BTC-USDT-SWAP", bar="15m", limit=50)
+        if btc_15m_bars is not None and len(btc_15m_bars) >= 20:
+            btc_15m_tech = self.calculate_technical_signals(btc_15m_bars)
+            btc_15m_px = btc_15m_tech.get("price", 0.0)
+            btc_15m_e50 = btc_15m_tech.get("ema50", 0.0)
+            if btc_15m_px > 0 and btc_15m_e50 > 0:
+                if macro_bullish and not (btc_15m_px > btc_15m_e50):
+                    logger.debug("⏳ [MTF BTC Filter] 5m is Bullish but 15m is below EMA50. Skipping chop.")
+                    macro_bullish = False
+                elif macro_bearish and not (btc_15m_px < btc_15m_e50):
+                    logger.debug("⏳ [MTF BTC Filter] 5m is Bearish but 15m is above EMA50. Skipping chop.")
+                    macro_bearish = False
+
         if not (macro_bullish or macro_bearish):
             return
 
@@ -602,13 +645,15 @@ class OKXJevDemoTrader:
             if bars_15m is not None and len(bars_15m) >= 20:
                 tech_15m = self.calculate_technical_signals(bars_15m)
                 dist_15m = tech_15m.get("dist_ema20_pct", 0.0)
+                px_15m = tech_15m.get("price", 0.0)
+                ema20_15m = tech_15m.get("ema20", 0.0)
                 if macro_bearish and tech["signal"] == "SELL":
-                    if tech_15m.get("signal") == "BUY" or dist_15m < -2.2:
-                        logger.info(f"⏳ [15M Trend Guard] {sym} SHORT skipped: 15m signal is {tech_15m.get('signal')} or 15m oversold ({dist_15m:.2f}%).")
+                    if tech_15m.get("signal") == "BUY" or dist_15m < -2.2 or (ema20_15m > 0 and px_15m > ema20_15m):
+                        logger.info(f"⏳ [15M Trend Guard] {sym} SHORT skipped: 15m signal is {tech_15m.get('signal')} or 15m above EMA20 / oversold ({dist_15m:.2f}%).")
                         continue
                 elif macro_bullish and tech["signal"] == "BUY":
-                    if tech_15m.get("signal") == "SELL" or dist_15m > 2.2:
-                        logger.info(f"⏳ [15M Trend Guard] {sym} LONG skipped: 15m signal is {tech_15m.get('signal')} or 15m overbought ({dist_15m:.2f}%).")
+                    if tech_15m.get("signal") == "SELL" or dist_15m > 2.2 or (ema20_15m > 0 and px_15m < ema20_15m):
+                        logger.info(f"⏳ [15M Trend Guard] {sym} LONG skipped: 15m signal is {tech_15m.get('signal')} or 15m below EMA20 / overbought ({dist_15m:.2f}%).")
                         continue
 
             # 3. Signal Decision: Long or Short
@@ -624,8 +669,14 @@ class OKXJevDemoTrader:
             if target_side is None:
                 continue
 
+            # Dynamic ATR parameters (Var 2 validated: 2.2*ATR: 1.8%~3.5% SL, 2.5*SL: 4.0%~8.0% TP)
+            dyn_sl_pct = max(0.018, min(0.035, 2.2 * atr_ratio))
+            dyn_tp_pct = max(0.040, min(0.080, 2.5 * dyn_sl_pct))
+            dyn_trail_arm = max(0.018, dyn_sl_pct * 1.1)
+            dyn_trail_drop = max(0.006, dyn_sl_pct * 0.35)
+
             pos_desc = "LONG" if target_side == "buy" else "SHORT"
-            logger.info(f"🔎 [Signal Detected] {sym} {pos_desc} | Price: ${px:,.4f} | Imbalance: {imb:+.2f} | ATR: {atr_ratio*100:.2f}%")
+            logger.info(f"🔎 [Signal Detected] {sym} {pos_desc} | Price: ${px:,.4f} | Imbalance: {imb:+.2f} | ATR: {atr_ratio*100:.2f}% | Dyn SL: -{dyn_sl_pct*100:.2f}%, TP: +{dyn_tp_pct*100:.2f}%")
 
             # 4. Universal Jev AI Gate (trend prompt, fail-closed)
             if self.jev_gate:
@@ -639,8 +690,8 @@ class OKXJevDemoTrader:
                                                      "dist_ema20_pct", "recent_return_pct", "lookback_bars")},
                             "atr_pct": atr_ratio * 100,
                             "imbalance": imb,
-                            "macro": f"BTC 5m {'BULLISH' if macro_bullish else 'BEARISH'} (P {btc_px:.1f} vs EMA50 {btc_e50:.1f})",
-                            "sl_pct": SL_PCT * 100, "tp_pct": TP_PCT * 100,
+                            "macro": f"BTC 5m {'BULLISH' if macro_bullish else 'BEARISH'} (P {btc_px:.1f} vs EMA50 {btc_e50:.1f}) | 15m MTF Confirmed",
+                            "sl_pct": dyn_sl_pct * 100, "tp_pct": dyn_tp_pct * 100,
                         },
                     )
                 except Exception as e:
@@ -655,8 +706,8 @@ class OKXJevDemoTrader:
                     continue
                 logger.info(f"🧠 [Jev Approved] {sym} {pos_desc} (conf {decision.confidence:.2f}, {decision.latency_ms:.0f}ms{', fallback' if decision.is_fallback else ''}): {decision.reason}")
 
-            logger.info(f"🚀 Entering {sym} {pos_desc} on OKX Demo")
-            self.open_position(sym, target_side)
+            logger.info(f"🚀 Entering {sym} {pos_desc} on OKX Demo (Dyn SL -{dyn_sl_pct*100:.2f}%, TP +{dyn_tp_pct*100:.2f}%)")
+            self.open_position(sym, target_side, sl_pct=dyn_sl_pct, tp_pct=dyn_tp_pct, trail_arm=dyn_trail_arm, trail_drop=dyn_trail_drop)
 
     # ── MAIN LOOP ──
     def run(self):

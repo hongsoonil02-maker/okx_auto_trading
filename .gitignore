@@ -18,3 +18,7 @@ remote_deploy/*regime_state*.json
 *.bak*
 *_state.json
 
+
+# Backtest data cache
+data/*.pkl
+data/*.parquet
