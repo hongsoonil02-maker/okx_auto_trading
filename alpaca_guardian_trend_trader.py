@@ -27,10 +27,10 @@ load_dotenv()
 # ==========================================
 SYMBOLS = ["TSLA", "TQQQ", "NVDA", "PLTR"]
 TIMEFRAME = "1Hour"
-RISK_PER_TRADE = 0.01          # 1% equity risk per trade
-MAX_POS_EQUITY_PCT = 0.10      # Max 10% equity per symbol (Swing allocation cap)
-MAX_CONCURRENT_POS = 3         # Max 3 concurrent swing positions (30% max gross)
-RR_RATIO = 2.0                 # 1:2 Risk/Reward for TP1
+RISK_PER_TRADE = 0.025         # 2.5% equity risk per trade (High Alpha Return Boost)
+MAX_POS_EQUITY_PCT = 0.25     # Max 25% equity per symbol (Active Swing allocation)
+MAX_CONCURRENT_POS = 3        # Max 3 concurrent swing positions (75% max gross utilization)
+RR_RATIO = 3.0                # 1:3 Risk/Reward for TP1 (Catching full trend runners)
 STATE_FILE = "alpaca_guardian_trend_state.json"
 LOG_FILE = "alpaca_guardian_trend_trader.log"
 
@@ -97,6 +97,7 @@ class AlpacaGuardianTrendBot:
         self.positions: Dict[str, Dict[str, Any]] = {}
         self.last_bar_times: Dict[str, str] = {}
         self.load_state()
+        self.reconcile_with_alpaca()
 
     def load_state(self):
         if os.path.exists(STATE_FILE):
@@ -108,6 +109,30 @@ class AlpacaGuardianTrendBot:
                 logger.info(f"Loaded state: {len(self.positions)} active swing positions.")
             except Exception as e:
                 logger.error(f"State load failed: {e}")
+
+    def reconcile_with_alpaca(self):
+        """Validates that tracked swing positions still exist in Alpaca account."""
+        if not self.positions:
+            return
+        try:
+            r = self.session.get(f"{ALPACA_BASE_URL}/v2/positions", timeout=5)
+            if r.status_code == 200:
+                live_pos = {p["symbol"]: int(float(p.get("qty", 0))) for p in r.json()}
+                removed = []
+                for sym, pos_data in list(self.positions.items()):
+                    live_qty = live_pos.get(sym, 0)
+                    if live_qty <= 0:
+                        logger.warning(f"⚠️ [{sym}] Tracked swing position not found in Alpaca account. Reconciling state (clearing ghost position).")
+                        removed.append(sym)
+                    elif live_qty < pos_data.get("qty", 0):
+                        logger.info(f"ℹ️ [{sym}] Adjusting tracked qty from {pos_data.get('qty')} to {live_qty} (partial fill/close).")
+                        pos_data["qty"] = live_qty
+                for sym in removed:
+                    self.positions.pop(sym, None)
+                if removed:
+                    self.save_state()
+        except Exception as e:
+            logger.error(f"Alpaca position reconciliation failed: {e}")
 
     def save_state(self):
         try:
@@ -350,13 +375,22 @@ class AlpacaGuardianTrendBot:
                     time.sleep(60)
                     continue
 
-                # Manage existing swing positions
+                # Reconcile & Manage existing swing positions
                 if self.positions:
+                    self.reconcile_with_alpaca()
                     self.manage_positions()
 
-                # Scan for new swing entries
+                # Scan for new swing entries (skip symbols already held in Alpaca account by Golden Trader)
+                live_account_symbols = set()
+                try:
+                    r_pos = self.session.get(f"{ALPACA_BASE_URL}/v2/positions", timeout=5)
+                    if r_pos.status_code == 200:
+                        live_account_symbols = {p.get("symbol") for p in r_pos.json() if float(p.get("qty", 0)) > 0}
+                except Exception:
+                    pass
+
                 for symbol in SYMBOLS:
-                    if symbol in self.positions:
+                    if symbol in self.positions or symbol in live_account_symbols:
                         continue
 
                     df = self.fetch_1h_bars(symbol, limit=130)

@@ -149,6 +149,7 @@ class AlpacaGoldenTrader:
         self.golden_positions: Dict[str, Dict[str, Any]] = {}  # Tracks positions entered exclusively by Golden Trader
         self.pending_orders: List[Dict[str, Any]] = []
         self.peak_prices: Dict[str, float] = {}
+        self.floor_sl_prices: Dict[str, float] = {}
         self.trade_cooldowns: Dict[str, float] = {}
         self.position_entry_times: Dict[str, float] = {}
         self.last_clock_check: float = 0.0
@@ -173,13 +174,13 @@ class AlpacaGoldenTrader:
             logger.warning("⚠️ Universal Jev Gate module not available -> technical signals only.")
 
         logger.info("=" * 70)
-        logger.info("🏆 [Alpaca Golden Trader] Optimal Alpha Boost Engine Active (v2.1 Guarded)")
-        logger.info(f"   REST Endpoint: {ALPACA_BASE_URL} | Data feed: {ALPACA_DATA_FEED}")
-        logger.info(f"   Target Universe (6): {', '.join(SYMBOLS_UNIVERSE)}")
-        logger.info(f"   Balanced Sizing: 1st=32% | 2nd=30% | 3rd=28% (Max 3 Pos, gross cap {MAX_GROSS_EXPOSURE_PCT*100:.0f}%, max {MAX_LEVERAGED_ETF_POSITIONS} lev-ETF)")
-        logger.info(f"   1x Tech (NVDA): SL -1.2%, TP +2.8%, Trail +1.5% (drop 0.5%)")
-        logger.info(f"   High Beta (TSLA/PLTR/MSTR/TQQQ/SOXL): SL -2.2%, TP +4.8%, Trail +2.5% (drop 1.0%)")
-        logger.info(f"   Lockout Guard: {POST_LOSS_COOLDOWN_SEC/60:.0f}m post-loss | {NORMAL_COOLDOWN_SEC/60:.0f}m post-win | {JEV_VETO_COOLDOWN_SEC/60:.0f}m veto | EOD flatten T-{EOD_FLATTEN_MIN_BEFORE_CLOSE:.0f}m")
+        logger.info("🏆 [Alpaca Golden Trader] Optimal Alpha Boost Engine Active (v3.0 RS-Swing)")
+        logger.info(f"   REST Endpoint: {ALPACA_BASE_URL} | Data feed: {ALPACA_DATA_FEED} (RTH Filtered)")
+        logger.info(f"   Target Universe (6): {', '.join(SYMBOLS_UNIVERSE)} (Sorted by 1H Relative Strength)")
+        logger.info(f"   Balanced Sizing: 30% / 30% / 30% (Max 3 Pos, gross cap {MAX_GROSS_EXPOSURE_PCT*100:.0f}%, max {MAX_LEVERAGED_ETF_POSITIONS} lev-ETF)")
+        logger.info("   Trend Filter: Price > EMA9 > EMA20 & Price > EMA50 & Price > EMA200 (5m RTH)")
+        logger.info("   Step-Ratchet SL: Peak +2%->SL +0.2% | Peak +4%->SL +2.0% | Peak +6%->SL +4.0%")
+        logger.info("   Smart EOD: Cut broken losers (P < EMA50 & PnL < 0), hold intact trend winners overnight")
         logger.info("=" * 70)
 
     # ── STATE ──
@@ -187,16 +188,18 @@ class AlpacaGoldenTrader:
         st = load_state(STATE_FILE)
         now = time.time()
         self.peak_prices = {k: float(v) for k, v in st.get("peak_prices", {}).items()}
+        self.floor_sl_prices = {k: float(v) for k, v in st.get("floor_sl_prices", {}).items()}
         self.trade_cooldowns = {k: float(v) for k, v in st.get("trade_cooldowns", {}).items() if float(v) > now}
         self.position_entry_times = {k: float(v) for k, v in st.get("position_entry_times", {}).items()}
         self.golden_positions = st.get("golden_positions", {})
         self.runner_positions = st.get("runner_positions", {})
         if st:
-            logger.info(f"♻️ [State Restored] peaks={self.peak_prices} cooldowns={list(self.trade_cooldowns)} golden_pos={list(self.golden_positions)} runners={list(self.runner_positions)}")
+            logger.info(f"♻️ [State Restored] peaks={self.peak_prices} floor_sl={self.floor_sl_prices} cooldowns={list(self.trade_cooldowns)} golden_pos={list(self.golden_positions)} runners={list(self.runner_positions)}")
 
     def _save_state(self):
         save_state(STATE_FILE, {
             "peak_prices": self.peak_prices,
+            "floor_sl_prices": self.floor_sl_prices,
             "trade_cooldowns": {k: v for k, v in self.trade_cooldowns.items() if v > time.time()},
             "position_entry_times": self.position_entry_times,
             "golden_positions": self.golden_positions,
@@ -285,6 +288,7 @@ class AlpacaGoldenTrader:
         cooldown = POST_LOSS_COOLDOWN_SEC if is_loss else NORMAL_COOLDOWN_SEC
         self.trade_cooldowns[symbol] = time.time() + cooldown
         self.peak_prices.pop(symbol, None)
+        self.floor_sl_prices.pop(symbol, None)
         self.position_entry_times.pop(symbol, None)
         self.runner_positions.pop(symbol, None)
         tag = "LOSS" if is_loss else "WIN"
@@ -304,6 +308,13 @@ class AlpacaGoldenTrader:
     def _pending_buy_symbols(self) -> set:
         return {o["symbol"] for o in self.pending_orders
                 if o.get("side", "").lower() == "buy" and o.get("symbol") in SYMBOLS_UNIVERSE}
+
+    def _pending_sell_symbols(self) -> set:
+        """Returns symbols that currently have an active market-close sell order in flight (prevents duplicate close orders)."""
+        return {o["symbol"] for o in self.pending_orders
+                if o.get("side", "").lower() == "sell"
+                and o.get("type", "").lower() == "market"
+                and o.get("symbol") in SYMBOLS_UNIVERSE}
 
     def get_active_symbols(self) -> set:
         """Open positions + pending buy orders (universe only, uses cached pending orders)"""
@@ -381,21 +392,21 @@ class AlpacaGoldenTrader:
             return cached
         return {}
 
-    def fetch_bars(self, symbol: str, timeframe: str = "1Min", limit: int = 60) -> Optional[pd.DataFrame]:
-        """Fetches the LATEST `limit` bars (sort=desc, then re-ordered ascending).
+    def fetch_bars(self, symbol: str, timeframe: str = "1Min", limit: int = 250) -> Optional[pd.DataFrame]:
+        """Fetches the LATEST `limit` bars (sort=desc, then re-ordered ascending) and filters to Regular Trading Hours (09:30-16:00 ET).
 
-        Without sort=desc Alpaca returns the FIRST `limit` bars of the day (pre-market 04:00 ET), which made
-        every indicator stale all session long.
+        Filtering out pre-market / after-hours thin-volume IEX bars eliminates indicator distortion at market open.
         """
         try:
             url = f"{ALPACA_DATA_URL}/stocks/{symbol}/bars"
+            req_limit = max(limit, 360) if timeframe == "5Min" else limit
             params = {
                 "timeframe": timeframe,
-                "limit": limit,
+                "limit": req_limit,
                 "adjustment": "all",
                 "feed": ALPACA_DATA_FEED,
                 "sort": "desc",
-                "start": (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "start": (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
             resp = session.get(url, headers=HEADERS, params=params, timeout=5)
             if resp.status_code == 200:
@@ -407,6 +418,13 @@ class AlpacaGoldenTrader:
                 for col in ("open", "high", "low", "close"):
                     df[col] = df[col].astype(float)
                 df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
+                # Filter to Regular Trading Hours (09:30 <= ET < 16:00) so pre-market 100-share bars never distort EMAs
+                et_ts = df["timestamp"].dt.tz_convert("America/New_York")
+                et_mins = et_ts.dt.hour * 60 + et_ts.dt.minute
+                rth_df = df[(et_mins >= 9 * 60 + 30) & (et_mins < 16 * 60)].reset_index(drop=True)
+                if len(rth_df) >= 20:
+                    df = rth_df
 
                 max_age = MAX_BAR_AGE_SEC.get(timeframe)
                 if max_age:
@@ -421,23 +439,24 @@ class AlpacaGoldenTrader:
         return None
 
     def calculate_technical_signals(self, df: Optional[pd.DataFrame]) -> Dict[str, Any]:
-        """Calculates EMA9, EMA20, EMA50, ATR and trend alignment"""
+        """Calculates EMA9, EMA20, EMA50, EMA200, ATR, 1H Relative Strength, and multi-EMA trend alignment"""
         if df is None or len(df) < 20:
-            return {"signal": "NEUTRAL", "price": 0.0, "ema50": 0.0, "reason": "INSUFFICIENT_OR_STALE_DATA"}
+            return {"signal": "NEUTRAL", "price": 0.0, "ema50": 0.0, "ema200": 0.0, "reason": "INSUFFICIENT_OR_STALE_DATA"}
 
         closes = df["close"]
         price = float(closes.iloc[-1])
         ema9 = float(closes.ewm(span=9, adjust=False).mean().iloc[-1])
         ema20 = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
         ema50 = float(closes.ewm(span=min(50, len(closes)), adjust=False).mean().iloc[-1])
+        ema200 = float(closes.ewm(span=min(200, len(closes)), adjust=False).mean().iloc[-1])
         tr = pd.concat([df["high"] - df["low"],
                         (df["high"] - closes.shift()).abs(),
                         (df["low"] - closes.shift()).abs()], axis=1).max(axis=1)
         atr = float(tr.rolling(14).mean().iloc[-1])
-        lookback = min(15, len(closes) - 1)
+        lookback = min(12, len(closes) - 1)  # 12 x 5Min = 1-hour Relative Strength lookback
         recent_ret = (price / float(closes.iloc[-1 - lookback]) - 1.0) if lookback > 0 else 0.0
 
-        is_bullish = (price > ema9) and (ema9 > ema20) and (price > ema50)
+        is_bullish = (price > ema9) and (ema9 > ema20) and (price > ema50) and (price > ema200)
         is_bearish = (price < ema9) and (ema9 < ema20) and (price < ema50)
 
         sig = "BUY" if is_bullish else ("SELL" if is_bearish else "NEUTRAL")
@@ -447,11 +466,12 @@ class AlpacaGoldenTrader:
             "ema9": ema9,
             "ema20": ema20,
             "ema50": ema50,
+            "ema200": ema200,
             "atr_pct": (atr / price * 100.0) if price > 0 and not math.isnan(atr) else 0.0,
             "dist_ema20_pct": (price / ema20 - 1.0) * 100.0 if ema20 > 0 else 0.0,
             "recent_return_pct": recent_ret * 100.0,
             "lookback_bars": lookback,
-            "reason": f"P:${price:.2f} | EMA9:${ema9:.2f} | EMA20:${ema20:.2f} | EMA50:${ema50:.2f}"
+            "reason": f"P:${price:.2f} | EMA9:${ema9:.2f} | EMA20:${ema20:.2f} | EMA50:${ema50:.2f} | EMA200:${ema200:.2f} | RS1H:{recent_ret*100:+.2f}%"
         }
 
     def get_dynamic_position_pct(self) -> float:
@@ -530,20 +550,22 @@ class AlpacaGoldenTrader:
             return None
 
     def manage_open_positions(self):
-        """Monitors unrealized PnL and executes dynamic trailing stop & ask-wall protection"""
+        """Monitors unrealized PnL and executes Step-Ratchet Floor SL protection (eliminates premature 5m shakeouts)"""
         if not self.positions:
             return
 
+        pending_sells = self._pending_sell_symbols()
+
         for symbol, pos in list(self.positions.items()):
             try:
+                if symbol in pending_sells:
+                    continue
+
                 curr_price = float(pos.get("current_price", 0.0))
                 entry_price = float(pos.get("avg_entry_price", 0.0))
-                unrealized_plpc = float(pos.get("unrealized_plpc", 0.0))
 
                 if curr_price <= 0 or entry_price <= 0:
                     continue
-
-                sym_sl, sym_tp, sym_trail_arm = get_symbol_risk(symbol)
 
                 # Track peak price
                 peak = self.peak_prices.get(symbol, entry_price)
@@ -555,34 +577,42 @@ class AlpacaGoldenTrader:
                 gain_from_entry = (curr_price - entry_price) / entry_price
                 peak_gain = (peak - entry_price) / entry_price
 
-                # Overnight Runner Breakeven Defense
+                # Step-Ratchet Floor SL Elevation:
+                # Peak >= +6.0% -> Lock +4.0% floor SL
+                # Peak >= +4.0% -> Lock +2.0% floor SL
+                # Peak >= +2.0% -> Lock +0.2% Breakeven floor SL
+                cur_floor_sl = self.floor_sl_prices.get(symbol, 0.0)
                 if symbol in self.runner_positions:
-                    runner_sl = entry_price * 1.002
-                    if curr_price <= runner_sl:
-                        logger.info(f"🛡️ [Overnight Runner Breakeven] {symbol} hit breakeven protection (${curr_price:.2f} <= ${runner_sl:.2f}). Exiting remaining position.")
-                        self.close_position(symbol, f"RUNNER_BREAKEVEN_PROTECT_{gain_from_entry*100:+.2f}PCT")
-                        continue
+                    cur_floor_sl = max(cur_floor_sl, float(self.runner_positions[symbol].get("sl", 0.0)))
 
-                # Breakeven Defense for Intraday Trades: Lock gains after +1.5% peak if price pulls back near entry
-                if peak_gain >= 0.015 and gain_from_entry <= 0.002:
-                    logger.info(f"🛡️ [Breakeven Defense] {symbol} peaked at +{peak_gain*100:.2f}%, locking breakeven exit (Gain: {gain_from_entry*100:+.2f}%)")
-                    self.close_position(symbol, f"BREAKEVEN_DEFENSE_{gain_from_entry*100:.2f}PCT")
+                new_floor_sl = cur_floor_sl
+                if peak_gain >= 0.060:
+                    new_floor_sl = max(new_floor_sl, round(entry_price * 1.040, 2))
+                elif peak_gain >= 0.040:
+                    new_floor_sl = max(new_floor_sl, round(entry_price * 1.020, 2))
+                elif peak_gain >= 0.020:
+                    new_floor_sl = max(new_floor_sl, round(entry_price * 1.002, 2))
+
+                if new_floor_sl > cur_floor_sl:
+                    self.floor_sl_prices[symbol] = new_floor_sl
+                    cur_floor_sl = new_floor_sl
+                    logger.info(f"🔒 [Step-Ratchet Armed] {symbol} Peak +{peak_gain*100:.2f}% -> Floor SL raised to ${cur_floor_sl:.2f} (+{(cur_floor_sl/entry_price - 1)*100:.2f}%)")
+
+                # Execute Floor SL if price drops back to ratcheted profit lock
+                if cur_floor_sl > 0 and curr_price <= cur_floor_sl:
+                    logger.info(f"🎯 [Step-Ratchet Exit] {symbol} hit ratcheted floor SL (${curr_price:.2f} <= ${cur_floor_sl:.2f}, Peak was +{peak_gain*100:.2f}%, Gain: {gain_from_entry*100:+.2f}%)")
+                    self.close_position(symbol, f"STEP_RATCHET_LOCK_{gain_from_entry*100:+.2f}PCT")
                     continue
-
-                # Trailing stop: armed once peak profit exceeded sym_trail_arm (+2.2% for high beta, +1.8% for tech)
-                if peak_gain >= sym_trail_arm:
-                    drop_from_peak = (peak - curr_price) / peak
-                    trail_drop_threshold = 0.012 if symbol in HIGH_BETA_SYMBOLS else 0.008
-                    if drop_from_peak >= trail_drop_threshold:
-                        logger.info(f"🎯 [Trailing Stop Exit] {symbol} locked in profit: Entry ${entry_price:.2f} -> Peak ${peak:.2f} -> Curr ${curr_price:.2f} (Gain: {gain_from_entry*100:+.2f}%)")
-                        self.close_position(symbol, f"TRAILING_STOP_EXIT_{gain_from_entry*100:.2f}PCT")
-                        continue
 
             except Exception as e:
                 logger.error(f"Error managing position for {symbol}: {e}")
 
     def close_position(self, symbol: str, reason: str = "MANUAL", partial_ratio: float = 1.0) -> bool:
-        """Closes position (or partial ratio) via Alpaca REST API. Sells only Golden Trader's quantity with strict short-guard."""
+        """Closes position (or partial ratio) via Alpaca REST API. Pre-cancels bracket legs and guards against duplicate close orders."""
+        if symbol in self._pending_sell_symbols():
+            logger.info(f"⏳ [Close Skip] {symbol} already has an active market sell order in flight.")
+            return False
+
         pos = self.positions.get(symbol, {})
         unrealized_pl = float(pos.get("unrealized_pl", 0.0))
         unrealized_plpc = float(pos.get("unrealized_plpc", 0.0))
@@ -598,6 +628,7 @@ class AlpacaGoldenTrader:
             self.positions.pop(symbol, None)
             self.golden_positions.pop(symbol, None)
             self.runner_positions.pop(symbol, None)
+            self.floor_sl_prices.pop(symbol, None)
             self._save_state()
             return True
 
@@ -610,19 +641,38 @@ class AlpacaGoldenTrader:
         logger.info(f"🔄 [Closing Position] {symbol} ({qty_to_close}/{actual_pos_qty} shares, partial={is_partial}) | Reason: {reason}")
 
         try:
-            # 1. Close position via Alpaca native liquidation API (auto-cancels open bracket orders)
+            # 1. Pre-cancel any open orders (bracket TP/SL legs) for this symbol so held_for_orders is released
+            open_sym_orders = [o for o in self.pending_orders if o.get("symbol") == symbol]
+            if not open_sym_orders:
+                r_ord = session.get(f"{ALPACA_BASE_URL}/v2/orders", headers=HEADERS,
+                                    params={"status": "open", "symbols": symbol}, timeout=4)
+                if r_ord.status_code == 200:
+                    open_sym_orders = r_ord.json()
+
+            cancelled = 0
+            for o in open_sym_orders:
+                client_id = o.get("client_order_id", "")
+                if not client_id.startswith("GD_"):
+                    session.delete(f"{ALPACA_BASE_URL}/v2/orders/{o.get('id')}", headers=HEADERS, timeout=3)
+                    cancelled += 1
+
+            # Wait up to 2.0s for Alpaca matching engine to release held_for_orders
+            if cancelled > 0:
+                for _ in range(5):
+                    time.sleep(0.4)
+                    r_chk = session.get(f"{ALPACA_BASE_URL}/v2/orders", headers=HEADERS,
+                                        params={"status": "open", "symbols": symbol}, timeout=3)
+                    if r_chk.status_code == 200 and len(r_chk.json()) == 0:
+                        break
+
+            # 2. Close position via Alpaca native liquidation API (or market sell fallback)
             if not is_partial:
                 resp = session.delete(f"{ALPACA_BASE_URL}/v2/positions/{symbol}", headers=HEADERS, timeout=8)
             else:
                 resp = session.delete(f"{ALPACA_BASE_URL}/v2/positions/{symbol}", headers=HEADERS, params={"qty": str(qty_to_close)}, timeout=8)
 
-            # If direct position deletion was rejected, fallback to manual cancel + market sell
             if resp.status_code not in [200, 201, 204]:
-                logger.warning(f"⚠️ Direct position delete returned HTTP {resp.status_code} ({resp.text}). Executing fallback order cancel + sell...")
-                for o in self.pending_orders:
-                    if o.get("symbol") == symbol:
-                        session.delete(f"{ALPACA_BASE_URL}/v2/orders/{o.get('id')}", headers=HEADERS, timeout=3)
-                time.sleep(1.0)
+                logger.warning(f"⚠️ Direct position delete returned HTTP {resp.status_code} ({resp.text}). Executing fallback market sell...")
                 close_order = {
                     "symbol": symbol,
                     "qty": str(qty_to_close),
@@ -637,22 +687,29 @@ class AlpacaGoldenTrader:
                     send_telegram(f"[Alpaca Golden] ❌ {symbol} 청산 실패 ({reason}): HTTP {resp.status_code}",
                                   dedupe_key=f"alpaca_close_fail_{symbol}", min_interval_sec=600)
                     return False
+                self.pending_orders.append(resp.json())
+            else:
+                if resp.status_code in [200, 201] and resp.text:
+                    try:
+                        self.pending_orders.append(resp.json())
+                    except Exception:
+                        pass
         except Exception as e:
             logger.error(f"❌ Exception closing {symbol}: {e} (will retry next loop)")
             return False
 
         if is_partial:
-            # Partial close successful: update remaining quantity and designate as overnight runner
             rem_qty = actual_pos_qty - qty_to_close
             entry_px = float(pos.get("avg_entry_price", 0.0))
             if symbol in self.golden_positions:
                 self.golden_positions[symbol]["qty"] = rem_qty
             self.runner_positions[symbol] = {
                 "entry": entry_px,
-                "sl": entry_px * 1.002,
+                "sl": round(entry_px * 1.002, 2),
                 "qty": rem_qty,
                 "locked_at": time.time()
             }
+            self.floor_sl_prices[symbol] = max(self.floor_sl_prices.get(symbol, 0.0), round(entry_px * 1.002, 2))
             self.positions[symbol]["qty"] = str(rem_qty)
             self._save_state()
             logger.info(f"✅ [Partial Close] {symbol} {qty_to_close} shares locked. {rem_qty} shares designated as Overnight Runner with Breakeven SL.")
@@ -660,7 +717,7 @@ class AlpacaGoldenTrader:
             return True
 
         # Full Close
-        is_loss = (unrealized_pl < 0) or ("STOP_LOSS" in reason) or ("HEAVY_ASK" in reason)
+        is_loss = (unrealized_pl < 0) or ("STOP_LOSS" in reason) or ("WEAK" in reason and unrealized_pl < 0)
         if is_loss:
             cooldown_sec = POST_LOSS_COOLDOWN_SEC
             logger.info(f"⏳ [Post-Loss Lockout] {symbol} closed with loss ({unrealized_plpc*100:+.2f}%). Enforcing {POST_LOSS_COOLDOWN_SEC/60:.0f}m cooling period.")
@@ -668,44 +725,69 @@ class AlpacaGoldenTrader:
             cooldown_sec = NORMAL_COOLDOWN_SEC
         self.trade_cooldowns[symbol] = time.time() + cooldown_sec
         self.peak_prices.pop(symbol, None)
+        self.floor_sl_prices.pop(symbol, None)
         self.position_entry_times.pop(symbol, None)
         self.golden_positions.pop(symbol, None)
         self.positions.pop(symbol, None)
         self.runner_positions.pop(symbol, None)
-        self.pending_orders = [o for o in self.pending_orders if o.get("symbol") != symbol]
         self._save_state()
         logger.info(f"✅ [Position Closed] {symbol} ({qty_to_close} shares) closed successfully.")
         send_telegram(f"[Alpaca Golden] {symbol} 청산 ({reason}) PnL {unrealized_plpc*100:+.2f}% (${unrealized_pl:+,.2f})")
         return True
 
     def flatten_all(self, reason: str):
-        """Intelligent EOD Position Handler:
-        - Big Trend Runners (unrealized_plpc >= RUNNER_MIN_GAIN_PCT, +2.5%):
-          Lock 50% profit, hold remaining 50% overnight with Breakeven Stop!
-        - Non-runners / low profit / losses:
-          Flatten 100% to eliminate overnight gap-down risk.
+        """Smart EOD Trend Swing Filter:
+        - Broken Trend Losers (Price < 5m EMA50 AND unrealized_plpc < 0):
+          Flatten 100% at EOD to eliminate overnight gap-down risk on weak positions.
+        - Intact Trend / Profitable Positions (Price >= 5m EMA50 OR unrealized_plpc >= 0):
+          Hold overnight to capture multi-day trend swings and overnight drift!
+          If gain >= +1.5%, arm Breakeven Floor SL (+0.2%).
         """
         if not self.positions:
             return
-        logger.info(f"🌙 [EOD Intelligent Flatten] Managing {list(self.positions.keys())} | Reason: {reason}")
+        logger.info(f"🌙 [Smart EOD Trend Handler] Evaluating {list(self.positions.keys())} | Reason: {reason}")
         for sym in list(self.positions.keys()):
+            if sym in self._pending_sell_symbols():
+                continue
             pos = self.positions.get(sym, {})
+            curr_price = float(pos.get("current_price", 0.0))
+            entry_price = float(pos.get("avg_entry_price", 0.0))
             unrealized_plpc = float(pos.get("unrealized_plpc", 0.0))
-            is_runner = sym in self.runner_positions
+            qty = int(float(pos.get("qty", 0)))
 
-            if unrealized_plpc >= RUNNER_MIN_GAIN_PCT and not is_runner:
-                logger.info(f"🚀 [Super-Trend Runner Selected] {sym}: Gain +{unrealized_plpc*100:.2f}%. Locking 50% profit, holding remaining 50% overnight!")
-                self.close_position(sym, "OVERNIGHT_RUNNER_LOCK_50PCT", partial_ratio=0.5)
-            elif is_runner:
-                logger.info(f"🌟 [Active Runner Holding] {sym} is already an overnight runner (PnL: {unrealized_plpc*100:+.2f}%). Riding the trend with Breakeven SL.")
+            df = self.fetch_bars(sym, timeframe="5Min", limit=250)
+            tech = self.calculate_technical_signals(df)
+            ema50 = tech.get("ema50", 0.0)
+            if curr_price <= 0:
+                curr_price = tech.get("price", 0.0)
+
+            is_broken_loser = (ema50 > 0 and curr_price < ema50 and unrealized_plpc < 0.0)
+
+            if is_broken_loser:
+                logger.info(f"🛡️ [EOD Weak Trend Cut] {sym} broke below EMA50 (${curr_price:.2f} < ${ema50:.2f}) with loss ({unrealized_plpc*100:+.2f}%). Closing 100%.")
+                self.close_position(sym, "EOD_WEAK_TREND_CUT", partial_ratio=1.0)
             else:
-                logger.info(f"🛡️ [Standard EOD Flatten] {sym} (PnL: {unrealized_plpc*100:+.2f}% < +{RUNNER_MIN_GAIN_PCT*100:.1f}%). Closing 100% to eliminate gap risk.")
-                self.close_position(sym, reason, partial_ratio=1.0)
+                be_sl = round(entry_price * 1.002, 2) if unrealized_plpc >= 0.015 else self.floor_sl_prices.get(sym, 0.0)
+                if be_sl > 0:
+                    self.floor_sl_prices[sym] = max(self.floor_sl_prices.get(sym, 0.0), be_sl)
+                self.runner_positions[sym] = {
+                    "entry": entry_price,
+                    "sl": self.floor_sl_prices.get(sym, round(entry_price * (1.0 - get_symbol_risk(sym)[0]), 2)),
+                    "qty": qty,
+                    "locked_at": time.time()
+                }
+                logger.info(f"🌟 [Overnight Trend Swing Hold] {sym} trend intact (P:${curr_price:.2f} vs EMA50:${ema50:.2f}, PnL:{unrealized_plpc*100:+.2f}%). Holding {qty} shares overnight!")
 
     # ── ENTRY LOGIC ──
     def evaluate_trading_opportunities(self):
-        """Scans Universe, checks QQQ Macro, and executes Trades with Dynamic Sizing"""
+        """Scans Universe, ranks candidates by 1H Relative Strength, checks EMA200 & QQQ Macro, and executes Trades"""
         if self.get_active_count() >= MAX_CONCURRENT_POSITIONS:
+            return
+
+        # Opening 5-Minute Stabilization Guard (Wait until 09:35 ET so first 5m RTH bar completes)
+        et_now = pd.Timestamp.now(tz="America/New_York")
+        if et_now.hour == 9 and et_now.minute < 35:
+            logger.debug("⏳ [Opening Stabilization] Waiting until 09:35 ET for first 5m RTH bar to close.")
             return
 
         equity = float(self.account_info.get("equity", 0.0) or 0.0)
@@ -713,8 +795,8 @@ class AlpacaGoldenTrader:
         if equity <= 0:
             return
 
-        # Step 1: Scan QQQ benchmark for macro regime (5Min, fallback 1Min)
-        qqq_bars = self.fetch_bars("QQQ", timeframe="5Min", limit=60)
+        # Step 1: Scan QQQ benchmark for macro regime (5Min RTH, fallback 1Min)
+        qqq_bars = self.fetch_bars("QQQ", timeframe="5Min", limit=250)
         if qqq_bars is None or len(qqq_bars) < 20:
             qqq_bars = self.fetch_bars("QQQ", timeframe="1Min", limit=60)
 
@@ -734,14 +816,13 @@ class AlpacaGoldenTrader:
             return
 
         guardian_symbols = get_guardian_symbols()
+        active = self.get_active_symbols()
 
+        # Step 2: Scan all eligible symbols and rank by 1-Hour Relative Strength (recent_return_pct)
+        candidates: List[Tuple[str, Dict[str, Any]]] = []
         for sym in SYMBOLS_UNIVERSE:
-            active = self.get_active_symbols()
-            if len(active) >= MAX_CONCURRENT_POSITIONS:
-                break
             if sym in active:
                 continue
-            # Isolation Guard: Skip symbols currently held by Guardian Trend Trader
             if sym in guardian_symbols:
                 logger.debug(f"🛡️ [Isolation Guard] {sym} is held by Alpaca Guardian Trend Trader -> skipping.")
                 continue
@@ -750,8 +831,7 @@ class AlpacaGoldenTrader:
             if sym in LEVERAGED_ETFS and len(active & LEVERAGED_ETFS) >= MAX_LEVERAGED_ETF_POSITIONS:
                 continue
 
-            # Fetch bars first (cheaper filter), then quote
-            df = self.fetch_bars(sym, timeframe="5Min", limit=60)
+            df = self.fetch_bars(sym, timeframe="5Min", limit=250)
             tech = self.calculate_technical_signals(df)
             if tech["signal"] != "BUY":
                 continue
@@ -760,6 +840,23 @@ class AlpacaGoldenTrader:
             dist_ema20 = tech.get("dist_ema20_pct", 0.0)
             if dist_ema20 > MAX_EMA20_DIST_PCT:
                 logger.info(f"⏳ [Overextension Guard] {sym} BUY skipped: Price is +{dist_ema20:.2f}% above EMA20 (overextended buying trap).")
+                continue
+
+            candidates.append((sym, tech))
+
+        if not candidates:
+            return
+
+        # Sort candidates by 1-Hour Relative Strength descending (top momentum leader gets Slot #1)
+        candidates.sort(key=lambda item: item[1].get("recent_return_pct", 0.0), reverse=True)
+
+        for sym, tech in candidates:
+            active = self.get_active_symbols()
+            if len(active) >= MAX_CONCURRENT_POSITIONS:
+                break
+            if sym in active:
+                continue
+            if sym in LEVERAGED_ETFS and len(active & LEVERAGED_ETFS) >= MAX_LEVERAGED_ETF_POSITIONS:
                 continue
 
             q = self.fetch_latest_quote(sym)
@@ -780,7 +877,7 @@ class AlpacaGoldenTrader:
                 logger.debug(f"{sym} skipped: insufficient room (target ${target_dollar_size:,.0f})")
                 continue
 
-            # Step 2: Jev AI gate (trend prompt, fail-closed)
+            # Step 3: Jev AI gate (trend prompt, fail-closed)
             sym_sl, sym_tp, _ = get_symbol_risk(sym)
             if self.jev_gate:
                 try:
