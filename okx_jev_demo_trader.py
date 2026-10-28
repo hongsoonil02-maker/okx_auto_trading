@@ -70,8 +70,8 @@ OKX_SECRET_KEY = os.getenv("OKX_DEMO_SECRET", "")
 OKX_PASSPHRASE = os.getenv("OKX_DEMO_PASSPHRASE", "")
 OKX_BASE_URL = "https://www.okx.com"
 
-# ── CONFIGURATION (OPTIMAL CRYPTO ALPHA) ──
-TARGET_SYMBOLS = ["BTC-USDT-SWAP", "SOL-USDT-SWAP", "DOGE-USDT-SWAP"]
+# ── CONFIGURATION (OPTIMAL CRYPTO ALPHA v3.2) ──
+TARGET_SYMBOLS = ["SOL-USDT-SWAP", "DOGE-USDT-SWAP", "SUI-USDT-SWAP"]
 LEVERAGE = 5                      # 5x leverage for aggressive capital growth
 MAX_CONCURRENT_POSITIONS = 2
 POSITION_MARGIN_PCT = 0.25        # 25% margin per position (High Alpha Allocation)
@@ -86,13 +86,16 @@ JEV_ERROR_COOLDOWN_SEC = 120.0    # 2-minute cooldown after a Jev API error
 ACCOUNT_MODE_RECHECK_SEC = 300.0
 STATE_FILE = os.path.join(CURRENT_DIR, "state", "okx_jev_demo_state.json")
 
-# Risk Parameters (in spot price terms)
-SL_PCT = 0.018                    # -1.8% Spot SL (at 5x lev = -9.0% ROE)
-TP_PCT = 0.060                    # +6.0% Spot TP (at 5x lev = +30.0% ROE, High Alpha Target)
-TRAIL_ARM_PCT = 0.025             # Arm trailing at +2.5% spot gain
-TRAIL_DROP_PCT = 0.008            # Lock profit on 0.8% pullback from peak
+# Risk & Filter Parameters (in spot price terms)
+SL_PCT = 0.016                    # Base -1.6% Spot SL (Dynamic ATR 1.6%~3.5%)
+TP_PCT = 0.040                    # Base +4.0% Spot TP (Dynamic 2.5*SL: 4.0%~8.5%)
+TRAIL_ARM_PCT = 0.0192            # Arm trailing at 1.2 * SL
+TRAIL_DROP_PCT = 0.0064           # Lock profit on 0.40 * SL pullback from peak
 MIN_ATR_RATIO = 0.0030            # Minimum ATR/Price volatility (filters out sideways chop)
 MAX_EMA20_DIST_PCT = 1.2          # Max allowed distance from 5m EMA20 to prevent overextension chasing
+MAX_LONG_FUNDING_RATE = 0.0005    # +0.05% funding cap to avoid Long Squeeze traps
+MIN_SHORT_FUNDING_RATE = -0.0003  # -0.03% funding floor to avoid Short Squeeze traps
+SUI_MIN_RS_OUTPERFORM = 0.015     # SUI requires >= +1.5% 1H RS outperformance vs BTC
 
 
 def _round_step(value: float, step: str, rounding=ROUND_DOWN) -> Decimal:
@@ -138,13 +141,13 @@ class OKXJevDemoTrader:
             logger.warning("⚠️ Universal Jev Gate unavailable -> technical signals only.")
 
         logger.info("=" * 70)
-        logger.info("🚀 [OKX Jev Demo Trader] Optimal Alpha Engine Active (v3.0 Dynamic ATR + MTF)")
-        logger.info(f"   Target Universe: {', '.join(TARGET_SYMBOLS)}")
-        logger.info(f"   Strategy: Bidirectional Long & Short with 15m MTF Gate + Dynamic ATR SL/TP")
-        logger.info(f"   Safety Level: 100% Simulated (x-simulated-trading: 1)")
+        logger.info("🚀 [OKX Jev Demo Trader] Ultra Alpha Engine Active (v3.2 RS-Leader + Funding Filter)")
+        logger.info(f"   Target Universe: {', '.join(TARGET_SYMBOLS)} (BTC = Macro Trend Engine)")
+        logger.info("   Strategy: 15m MTF Gate + 1H Relative Strength Ranking + Funding Squeeze Guard")
+        logger.info("   Safety Level: 100% Simulated (x-simulated-trading: 1)")
         logger.info(f"   Leverage: {LEVERAGE}x (Isolated Margin)")
         logger.info(f"   Max Concurrent Positions: {MAX_CONCURRENT_POSITIONS} | Margin: {POSITION_MARGIN_PCT*100:.0f}% (max ${MAX_MARGIN_PER_TRADE:,.0f})")
-        logger.info(f"   Risk: Dynamic ATR SL (2.2*ATR: 1.8%~3.5%), TP (2.5*SL: 4.0%~8.0%), Trailing Ratchet")
+        logger.info("   Risk: Dynamic ATR SL (1.6%~3.5%), TP (2.5*SL: 4.0%~8.5%), Trail (Arm 1.2*SL, Drop 0.40*SL)")
         logger.info(f"   Cooldowns: Post-Loss {POST_LOSS_COOLDOWN_SEC/60:.0f}m | Post-Win {NORMAL_COOLDOWN_SEC/60:.0f}m | Jev Veto {JEV_VETO_COOLDOWN_SEC/60:.0f}m")
         logger.info("=" * 70)
 
@@ -329,6 +332,19 @@ class OKXJevDemoTrader:
         except Exception as e:
             logger.debug(f"Ticker/Imb error for {inst_id}: {e}")
         return 0.0, 0.0
+
+    def get_funding_rate(self, inst_id: str) -> float:
+        """Fetches real-time 8H funding rate for perpetual swap to guard against Long/Short Squeezes"""
+        try:
+            url = f"{OKX_BASE_URL}/api/v5/public/funding-rate?instId={inst_id}"
+            resp = self.session.get(url, timeout=3)
+            if resp.status_code == 200:
+                d = resp.json().get("data", [])
+                if d and d[0].get("fundingRate"):
+                    return float(d[0]["fundingRate"])
+        except Exception as e:
+            logger.debug(f"Funding rate error for {inst_id}: {e}")
+        return 0.0
 
     def fetch_bars(self, inst_id: str, bar: str = "5m", limit: int = 100) -> Optional[pd.DataFrame]:
         """Fetches CONFIRMED candlestick bars only (the live, still-forming candle is dropped to avoid repaint)"""
@@ -614,15 +630,16 @@ class OKXJevDemoTrader:
         if not (macro_bullish or macro_bearish):
             return
 
+        btc_ret_1h = btc_tech.get("recent_return_pct", 0.0) / 100.0
+        candidates = []
+
         for sym in TARGET_SYMBOLS:
-            if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
-                break
             if sym in self.positions:
                 continue
             if time.time() < self.trade_cooldowns.get(sym, 0.0):
                 continue
 
-            df = btc_bars if sym == "BTC-USDT-SWAP" else self.fetch_bars(sym, bar="5m", limit=100)
+            df = self.fetch_bars(sym, bar="5m", limit=100)
             tech = self.calculate_technical_signals(df)
 
             # 2. Chop Filter: Reject low volatility / sideways noise
@@ -656,27 +673,58 @@ class OKXJevDemoTrader:
                         logger.info(f"⏳ [15M Trend Guard] {sym} LONG skipped: 15m signal is {tech_15m.get('signal')} or 15m below EMA20 / overbought ({dist_15m:.2f}%).")
                         continue
 
-            # 3. Signal Decision: Long or Short
+            # 3. Signal Direction & Relative Strength (RS) Ranking vs BTC
             if not ((macro_bullish and tech["signal"] == "BUY") or (macro_bearish and tech["signal"] == "SELL")):
                 continue
+
+            sym_ret_1h = tech.get("recent_return_pct", 0.0) / 100.0
+            rs_vs_btc = (sym_ret_1h - btc_ret_1h) if macro_bullish else (btc_ret_1h - sym_ret_1h)
+
+            # High-Beta SUI Gate: Only allow SUI when it exhibits strong >= +1.5% 1H RS outperformance vs BTC
+            if sym == "SUI-USDT-SWAP" and rs_vs_btc < SUI_MIN_RS_OUTPERFORM:
+                logger.debug(f"⏳ [SUI RS Filter] SUI 1H RS vs BTC ({rs_vs_btc*100:+.2f}%) < +{SUI_MIN_RS_OUTPERFORM*100:.1f}% threshold. Prioritizing SOL/DOGE.")
+                continue
+
+            candidates.append((sym, tech, atr_ratio, rs_vs_btc))
+
+        # Sort candidates by Relative Strength (strongest momentum leader first)
+        candidates.sort(key=lambda x: x[3], reverse=True)
+
+        for sym, tech, atr_ratio, rs_vs_btc in candidates:
+            if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
+                break
+
             px, imb = self.get_ticker_and_imbalance(sym)
             target_side = None
             if macro_bullish and tech["signal"] == "BUY" and imb >= 0.20:
-                target_side = "buy" # LONG
+                target_side = "buy"  # LONG
             elif macro_bearish and tech["signal"] == "SELL" and imb <= -0.20:
-                target_side = "sell" # SHORT
+                target_side = "sell"  # SHORT
 
             if target_side is None:
                 continue
 
-            # Dynamic ATR parameters (Var 2 validated: 2.2*ATR: 1.8%~3.5% SL, 2.5*SL: 4.0%~8.0% TP)
-            dyn_sl_pct = max(0.018, min(0.035, 2.2 * atr_ratio))
-            dyn_tp_pct = max(0.040, min(0.080, 2.5 * dyn_sl_pct))
-            dyn_trail_arm = max(0.018, dyn_sl_pct * 1.1)
-            dyn_trail_drop = max(0.006, dyn_sl_pct * 0.35)
+            # 3.1 Perpetual Swap Funding Rate Contrarian Squeeze Filter
+            funding_rate = self.get_funding_rate(sym)
+            if target_side == "buy" and funding_rate >= MAX_LONG_FUNDING_RATE:
+                logger.info(f"⏳ [Funding Squeeze Filter] {sym} LONG skipped: Funding rate {funding_rate*100:+.4f}% >= +{MAX_LONG_FUNDING_RATE*100:.2f}% (Long Squeeze risk).")
+                continue
+            if target_side == "sell" and funding_rate <= MIN_SHORT_FUNDING_RATE:
+                logger.info(f"⏳ [Funding Squeeze Filter] {sym} SHORT skipped: Funding rate {funding_rate*100:+.4f}% <= {MIN_SHORT_FUNDING_RATE*100:.2f}% (Short Squeeze risk).")
+                continue
+
+            # Dynamic ATR parameters (v3.2 validated: SL 1.6%~3.5%, TP 2.5*SL: 4.0%~8.5%, Trail Arm 1.2*SL, Drop 0.40*SL)
+            dyn_sl_pct = max(0.016, min(0.035, 2.2 * atr_ratio))
+            dyn_tp_pct = max(0.040, min(0.085, 2.5 * dyn_sl_pct))
+            dyn_trail_arm = max(0.018, dyn_sl_pct * 1.2)
+            dyn_trail_drop = max(0.006, dyn_sl_pct * 0.40)
 
             pos_desc = "LONG" if target_side == "buy" else "SHORT"
-            logger.info(f"🔎 [Signal Detected] {sym} {pos_desc} | Price: ${px:,.4f} | Imbalance: {imb:+.2f} | ATR: {atr_ratio*100:.2f}% | Dyn SL: -{dyn_sl_pct*100:.2f}%, TP: +{dyn_tp_pct*100:.2f}%")
+            logger.info(
+                f"🔎 [Signal Detected] {sym} {pos_desc} | Price: ${px:,.4f} | RS vs BTC: {rs_vs_btc*100:+.2f}% | "
+                f"Funding: {funding_rate*100:+.4f}% | Imb: {imb:+.2f} | ATR: {atr_ratio*100:.2f}% | "
+                f"Dyn SL: -{dyn_sl_pct*100:.2f}%, TP: +{dyn_tp_pct*100:.2f}%"
+            )
 
             # 4. Universal Jev AI Gate (trend prompt, fail-closed)
             if self.jev_gate:
@@ -690,6 +738,8 @@ class OKXJevDemoTrader:
                                                      "dist_ema20_pct", "recent_return_pct", "lookback_bars")},
                             "atr_pct": atr_ratio * 100,
                             "imbalance": imb,
+                            "rs_vs_btc_1h_pct": rs_vs_btc * 100,
+                            "funding_rate_pct": funding_rate * 100,
                             "macro": f"BTC 5m {'BULLISH' if macro_bullish else 'BEARISH'} (P {btc_px:.1f} vs EMA50 {btc_e50:.1f}) | 15m MTF Confirmed",
                             "sl_pct": dyn_sl_pct * 100, "tp_pct": dyn_tp_pct * 100,
                         },
@@ -706,7 +756,7 @@ class OKXJevDemoTrader:
                     continue
                 logger.info(f"🧠 [Jev Approved] {sym} {pos_desc} (conf {decision.confidence:.2f}, {decision.latency_ms:.0f}ms{', fallback' if decision.is_fallback else ''}): {decision.reason}")
 
-            logger.info(f"🚀 Entering {sym} {pos_desc} on OKX Demo (Dyn SL -{dyn_sl_pct*100:.2f}%, TP +{dyn_tp_pct*100:.2f}%)")
+            logger.info(f"🚀 Entering {sym} {pos_desc} on OKX Demo (Dyn SL -{dyn_sl_pct*100:.2f}%, TP +{dyn_tp_pct*100:.2f}%, TrailDrop -{dyn_trail_drop*100:.2f}%)")
             self.open_position(sym, target_side, sl_pct=dyn_sl_pct, tp_pct=dyn_tp_pct, trail_arm=dyn_trail_arm, trail_drop=dyn_trail_drop)
 
     # ── MAIN LOOP ──
