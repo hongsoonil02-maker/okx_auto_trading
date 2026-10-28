@@ -72,25 +72,25 @@ OKX_BASE_URL = "https://www.okx.com"
 
 # ── CONFIGURATION (OPTIMAL CRYPTO ALPHA) ──
 TARGET_SYMBOLS = ["BTC-USDT-SWAP", "SOL-USDT-SWAP", "DOGE-USDT-SWAP"]
-LEVERAGE = 3                      # Low 3x leverage
+LEVERAGE = 5                      # 5x leverage for aggressive capital growth
 MAX_CONCURRENT_POSITIONS = 2
-POSITION_MARGIN_PCT = 0.15        # 15% margin per position (prevents oversized positions)
-MAX_MARGIN_PER_TRADE = 1000.0     # Max $1,000 margin per trade (prevents sizing explosion after wins)
+POSITION_MARGIN_PCT = 0.25        # 25% margin per position (High Alpha Allocation)
+MAX_MARGIN_PER_TRADE = 2500.0     # Max $2,500 margin per trade
 LOOP_INTERVAL_SEC = 10
 POST_LOSS_COOLDOWN_SEC = 1800.0   # 30-minute lockout after stop-loss
-NORMAL_COOLDOWN_SEC = 3600.0      # 60-minute cooldown after win / TP / trailing exit (prevents bottom/top chasing)
+NORMAL_COOLDOWN_SEC = 1800.0      # 30-minute normal cooldown (improved rotation)
 ENTRY_COOLDOWN_SEC = 180.0
-ORDER_FAIL_COOLDOWN_SEC = 300.0   # 5-minute cooldown after a rejected order (no 10s retry spam)
-JEV_VETO_COOLDOWN_SEC = 1800.0    # 30-minute cooldown after a Jev veto (prevents immediate re-entry after warning)
-JEV_ERROR_COOLDOWN_SEC = 120.0    # 2-minute cooldown after a Jev API error (fail-closed)
+ORDER_FAIL_COOLDOWN_SEC = 300.0   # 5-minute cooldown after a rejected order
+JEV_VETO_COOLDOWN_SEC = 1800.0    # 30-minute cooldown after a Jev veto
+JEV_ERROR_COOLDOWN_SEC = 120.0    # 2-minute cooldown after a Jev API error
 ACCOUNT_MODE_RECHECK_SEC = 300.0
 STATE_FILE = os.path.join(CURRENT_DIR, "state", "okx_jev_demo_state.json")
 
 # Risk Parameters (in spot price terms)
-SL_PCT = 0.015                    # -1.5% Spot SL (at 3x lev = -4.5% ROE)
-TP_PCT = 0.035                    # +3.5% Spot TP (at 3x lev = +10.5% ROE)
-TRAIL_ARM_PCT = 0.015             # Arm trailing at +1.5% spot gain
-TRAIL_DROP_PCT = 0.006            # Lock profit on 0.6% pullback from peak
+SL_PCT = 0.018                    # -1.8% Spot SL (at 5x lev = -9.0% ROE)
+TP_PCT = 0.060                    # +6.0% Spot TP (at 5x lev = +30.0% ROE, High Alpha Target)
+TRAIL_ARM_PCT = 0.025             # Arm trailing at +2.5% spot gain
+TRAIL_DROP_PCT = 0.008            # Lock profit on 0.8% pullback from peak
 MIN_ATR_RATIO = 0.0030            # Minimum ATR/Price volatility (filters out sideways chop)
 MAX_EMA20_DIST_PCT = 1.2          # Max allowed distance from 5m EMA20 to prevent overextension chasing
 
@@ -201,18 +201,26 @@ class OKXJevDemoTrader:
             if resp.status_code == 200:
                 res_json = resp.json()
                 if res_json.get("code") == "0":
+                    self.server_error_count = 0
                     return res_json
                 # Per-item errors (sCode/sMsg) carry the real reason, e.g. 51010 account-mode / 51008 margin
                 details = [f"{d.get('sCode')}:{d.get('sMsg')}" for d in res_json.get("data", [])
                            if isinstance(d, dict) and d.get("sCode")]
                 self.last_error = f"{res_json.get('code')} {res_json.get('msg')} {details}".strip()
                 logger.warning(f"⚠️ OKX API code error: {res_json.get('code')} - {res_json.get('msg')} {details} ({path})")
+            elif resp.status_code in (500, 502, 503, 504):
+                self.server_error_count = getattr(self, "server_error_count", 0) + 1
+                backoff = min(60.0, 5.0 * (2 ** min(self.server_error_count - 1, 3)))
+                self.last_error = f"HTTP {resp.status_code} Temporary Gateway/Maintenance"
+                logger.warning(f"⚠️ OKX 서버 일시 점검/지연 (HTTP {resp.status_code}) [{path}] - {backoff:.0f}s 백오프 대기 (연속 {self.server_error_count}회)")
+                time.sleep(backoff)
             else:
                 self.last_error = f"HTTP {resp.status_code} {resp.text[:200]}"
                 logger.error(f"❌ OKX HTTP error: {resp.status_code} - {resp.text[:300]} ({path})")
         except Exception as e:
             self.last_error = str(e)
             logger.error(f"❌ OKX Request exception ({path}): {e}")
+            time.sleep(2.0)
         return None
 
     # ── ACCOUNT ──

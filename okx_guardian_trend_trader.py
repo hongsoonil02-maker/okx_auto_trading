@@ -25,10 +25,10 @@ load_dotenv()
 # ==========================================
 SYMBOL = os.getenv("OKX_TREND_SYMBOL", "BTC/USDT:USDT")
 TIMEFRAME = "1h"
-LEVERAGE = 3
-RISK_PER_TRADE = 0.01          # 1% equity risk per trade
-RR_RATIO = 2.0                 # 1:2 Risk/Reward ratio for TP1
-MAX_MARGIN_PCT = 0.20          # Max 20% of account as initial margin per position
+LEVERAGE = 5
+RISK_PER_TRADE = 0.025         # 2.5% equity risk per trade (High Alpha Boost)
+RR_RATIO = 3.0                 # 1:3 Risk/Reward ratio for TP1
+MAX_MARGIN_PCT = 0.35          # Max 35% of account as initial margin per position
 STATE_FILE = "okx_guardian_trend_state.json"
 
 # Logging setup
@@ -305,8 +305,13 @@ class OKXGuardianTrendBot:
                 time.sleep(30)
 
             except Exception as e:
-                logger.error(f"Main loop exception: {e}")
-                time.sleep(15)
+                err_str = str(e)
+                if any(x in err_str for x in ("500", "502", "503", "504", "ExchangeNotAvailable", "DDoSProtection", "RequestTimeout")):
+                    logger.warning(f"⚠️ OKX 서버 일시 점검/지연 ({err_str[:200]}) - 30s 백오프 대기")
+                    time.sleep(30)
+                else:
+                    logger.error(f"Main loop exception: {e}")
+                    time.sleep(15)
 
 if __name__ == '__main__':
     bot = OKXGuardianTrendBot()

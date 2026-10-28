@@ -16,4 +16,5 @@ remote_deploy/*equity_history*.json
 remote_deploy/*regime_state*.json
 *.csv
 *.bak*
+*_state.json
 
