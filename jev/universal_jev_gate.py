@@ -48,7 +48,8 @@ class UniversalJevGate:
         api_key: Optional[str] = None,
         confidence_threshold: float = 0.60,
         timeout_ms: int = 2500,
-        simulation_mode: bool = False
+        simulation_mode: bool = False,
+        fail_closed: Optional[bool] = None
     ):
         raw_key = api_key or os.getenv("TYPESAFE_AI_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", "")
         self.api_key = raw_key.strip()
@@ -56,6 +57,10 @@ class UniversalJevGate:
         self.timeout_ms = timeout_ms
         self.simulation_mode = simulation_mode or (os.getenv("JEV_SIMULATION_MODE", "false").lower() == "true")
         self.is_enabled = os.getenv("USE_JEV_PREDICTION", "true").lower() == "true"
+        if fail_closed is None:
+            self.fail_closed = os.getenv("JEV_FAIL_CLOSED", "true").lower() == "true"
+        else:
+            self.fail_closed = fail_closed
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -152,17 +157,27 @@ class UniversalJevGate:
                         latency_ms=elapsed_ms
                     )
                 else:
-                    logger.warning(f"⚠️ Jev API returned status {resp.status}. Degrading gracefully.")
+                    logger.warning(f"⚠️ Jev API returned status {resp.status} for {symbol}. Fail-closed={self.fail_closed}.")
         except Exception as e:
-            logger.warning(f"⚠️ Jev verification error ({symbol}): {e}. Fallback to baseline.")
+            logger.warning(f"⚠️ Jev verification error ({symbol}): {e}. Fail-closed={self.fail_closed}.")
 
-        # Fallback Graceful Degradation
+        # Fallback Handling (Fail-Closed by default to prevent blind leveraged entries on timeout/HTTP error)
         elapsed_ms = (time.perf_counter() - start_t) * 1000.0
+        if self.fail_closed:
+            return JevGateDecision(
+                approved=False,
+                confidence=0.0,
+                risk_level="HIGH",
+                reason="Fail-closed veto due to Jev API timeout/error",
+                action="VETO",
+                latency_ms=elapsed_ms,
+                is_fallback=True
+            )
         return JevGateDecision(
             approved=True,
             confidence=0.50,
             risk_level="MEDIUM",
-            reason=f"Fallback baseline due to API timeout/error",
+            reason="Fallback baseline due to API timeout/error",
             action="ENTER",
             latency_ms=elapsed_ms,
             is_fallback=True
@@ -260,12 +275,21 @@ class UniversalJevGate:
     def _build_prompt(self, asset_class: str, symbol: str, setup_name: str, context: Dict[str, Any]) -> str:
         if asset_class == "CRYPTO":
             if "macro" in context or "dist_ema20_pct" in context:
+                extra_lines = ""
+                if "vol_ratio" in context or "dist_1h_ema50_pct" in context:
+                    extra_lines = (
+                        f"Volume Ratio (3/20): {context.get('vol_ratio', 1.0):.2f}x | "
+                        f"1H Dist EMA50: {context.get('dist_1h_ema50_pct', 0.0):+.2f}% | "
+                        f"1H RS vs BTC: {context.get('rs_vs_btc_1h_pct', 0.0):+.2f}% | "
+                        f"Funding: {context.get('funding_rate_pct', 0.0):+.4f}%\n"
+                    )
                 return (
                     f"Asset: Crypto Swap ({symbol}) | Direction: {setup_name}\n"
                     f"Price: ${context.get('price', 0):,.4f} | Dist from EMA20: {context.get('dist_ema20_pct', 0):+.2f}%\n"
                     f"Macro Trend: {context.get('macro', 'N/A')} | LOB Imbalance: {context.get('imbalance', 0):+.2f}\n"
                     f"ATR Volatility: {context.get('atr_pct', 0):.2f}% | SL: -{context.get('sl_pct', 1.5):.1f}% | TP: +{context.get('tp_pct', 3.5):.1f}%\n"
                     f"Recent Return ({context.get('lookback_bars', 12)} bars): {context.get('recent_return_pct', 0):+.2f}%\n"
+                    f"{extra_lines}"
                     f"Question: Does this {setup_name} trade have high continuation probability, or is it an overextended trap / exhaustion near support/resistance?\n"
                     f"Approve only if continuation probability >= 65%."
                 )
