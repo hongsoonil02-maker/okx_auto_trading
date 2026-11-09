@@ -1,25 +1,28 @@
 # -*- coding: utf-8 -*-
 """
 okx_jev_demo_trader.py — Autonomous OKX Demo Quant Engine with Bidirectional Jev Alpha
-Optimal Alpha Boost Configuration (Backtest Validated: +8.06% Return in 45 Days)
-NOTE (2026-10-22 review): the backtest figure pre-dates the fixes below (Jev gate never invoked,
-unconfirmed-candle signals, no fills due to Spot-mode account). Re-validate before trusting it.
+Argon V4-Pro (S8): 4-Major Dominance Synchronization (3/4) + 1H MA(5/10/20) Wave Rider (10x Isolated)
+
+Backtest Validated 2026-11-09 (122D, 2026-07-10~11-09, 2,938 1H bars, 상승/하락/횡보 포함):
+- S8 (10x, 3/4 gate, SL 2.5%/dyn cap 4.0%, TP +5%): 64 Trades, 68.8% WR, PF 1.83, +49.2%, MDD -12.5%, 0 Liquidations
+- Regime split: first-half PF 1.51 / second-half PF 1.88 (MDD -10.5% / -9.8%)
+- Supersedes prior 30D/45D claims (단기 구간 편향으로 폐기) — see agrolib/2026-11-09 정밀분석 보고서 §6
 
 Key Features:
 - 100% Simulated Sandbox: Forced 'x-simulated-trading: 1' on all requests
-- Targeted Universe: BTC-USDT-SWAP, SOL-USDT-SWAP, DOGE-USDT-SWAP (High Momentum Leaders)
-- Smart Bidirectional: Long during Bullish Macro, Short during Bearish Macro
-- Chop/Whipsaw Filter: ATR Volatility Gate filters out 70% of noisy sideways chop
-- Macro Gate: BTC 5Min EMA50 Directional Filter (confirmed candles only, no repaint)
-- Microstructure & AI: Real-time LOB Imbalance + Universal Jev AI Gate (trend prompt, fail-closed)
-- Strict Risk Management:
-  * Low Leverage (3x isolated) for high safety
-  * SL: -1.5% | TP: +3.5% | Trailing Arm: +1.5% (spot price movement)
-  * SL/TP attached to the order on the exchange (attachAlgoOrds) + bot-side backup monitoring
-  * 30-minute Post-Loss Lockout after any losing exit (incl. exchange-side SL fills)
-  * Max 2 Concurrent Positions, 25% margin per trade, lotSz/minSz-aware sizing
-- Ops: account-mode guard (requires Futures mode, acctLv>=2), sCode/sMsg error logging,
-  order-failure cooldown, restart-safe state, Telegram alerts. Credentials from .env only.
+- Targeted Universe: BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP, XRP-USDT-SWAP (4 Major Leaders)
+- 4-Major Dominance Synchronization (3/4 Consensus, S8):
+  * Enters ONLY when at least 3 of 4 Majors simultaneously align on confirmed 1H MA(5/10/20) + BTC 15m EMA20
+  * Anti-Spaghetti Chop Filter: |1H MA5 - MA20| >= 0.30%, 1H ADX(14) >= 18, 15m ADX(14) >= 18
+  * One-Wave-One-Shot Lock: Invariant 1H wave_start_ts tracking blocks late climax / bottom re-entries
+- 4-Stage Wave Harvest & Risk Management (10x Isolated, 20% Margin/Slot, Max 2 Slots):
+  * Exchange-attached Hard SL (2.5% base ~4.0% dynamic ATR, safely inside ~9% 10x liquidation) & +5.0% Wave TP
+  * Stage 1: Peak >= +1.50% spot (+30% ROE) -> Lock +0.25% spot (+5% ROE) Breakeven Floor
+  * Stage 2: Peak >= +2.20% spot (+44% ROE) -> Lock +1.10% spot (+22% ROE) Mid-Wave Profit Floor
+  * Stage 3: Peak >= +3.20% spot (+64% ROE) -> Wide 1.00% Wave Trailing Stop
+  * Stage 4: Confirmed 1H MA20 Structure Reversal Exit (cuts invalidated waves early around -0.85%)
+- Execution & Ops: Passive 1-Tick Post-Only Maker (0.02% fee) w/ Market fallback, Universal Jev AI Gate
+  (strict fail-closed), account-mode guard, restart-safe state, Telegram alerts. Credentials from .env only.
 """
 
 import os
@@ -30,8 +33,8 @@ import hmac
 import base64
 import json
 import logging
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
-from datetime import datetime, timezone, timedelta
+from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_UP
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
 import requests
 import numpy as np
@@ -70,36 +73,60 @@ OKX_SECRET_KEY = os.getenv("OKX_DEMO_SECRET", "")
 OKX_PASSPHRASE = os.getenv("OKX_DEMO_PASSPHRASE", "")
 OKX_BASE_URL = "https://www.okx.com"
 
-# ── CONFIGURATION (OPTIMAL CRYPTO ALPHA v3.3 ULTRA-PRECISION) ──
-TARGET_SYMBOLS = ["SOL-USDT-SWAP", "DOGE-USDT-SWAP", "SUI-USDT-SWAP"]
-LEVERAGE = 5                      # 5x leverage for aggressive capital growth
+# ── CONFIGURATION (ARGON V4-PRO S8: 4-MAJOR 3/4 WAVE RIDER — 10x, 122D 백테스트 검증 2026-11-09) ──
+TARGET_SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP"]
+LEGACY_MANAGE_SYMBOLS = ["DOGE-USDT-SWAP", "SUI-USDT-SWAP"]
+LEVERAGE = 10                     # 10x Isolated (S8: 122D PF 1.83, MDD -12.5%; 20x는 MDD -27.5%로 기준 미달)
 MAX_CONCURRENT_POSITIONS = 2
-POSITION_MARGIN_PCT = 0.25        # 25% of USDT equity per position (Symmetric High Alpha Allocation)
-MAX_MARGIN_PER_TRADE = 2500.0     # Max $2,500 margin per trade
+POSITION_MARGIN_PCT = 0.20        # 20% of USDT equity per slot (max 40% total margin deployed, 60% cash reserve)
+MAX_MARGIN_PER_TRADE = 5000.0     # Max $5,000 margin per slot ($50k notional @ 10x -> stays in OKX Tier-1/2 MMR)
 LOOP_INTERVAL_SEC = 10
-POST_LOSS_COOLDOWN_SEC = 1800.0   # 30-minute lockout after stop-loss
-NORMAL_COOLDOWN_SEC = 1800.0      # 30-minute normal cooldown (improved rotation)
+POST_LOSS_COOLDOWN_SEC = 3600.0   # 60-minute lockout after stop-loss / wave exit (matches V4-Pro backtest)
+NORMAL_COOLDOWN_SEC = 3600.0      # 60-minute post-wave cooldown
 ENTRY_COOLDOWN_SEC = 180.0
 ORDER_FAIL_COOLDOWN_SEC = 300.0   # 5-minute cooldown after a rejected order
 JEV_VETO_COOLDOWN_SEC = 1800.0    # 30-minute cooldown after a Jev veto
 JEV_ERROR_COOLDOWN_SEC = 120.0    # 2-minute cooldown after a Jev API error
 ACCOUNT_MODE_RECHECK_SEC = 300.0
+RADAR_LOG_INTERVAL_SEC = 300.0    # Log 4-Major Dominance Radar summary every 5 minutes
+CANDLE_CACHE_TTL_SEC = 18.0       # Cache confirmed 1H/15m candles for 18s to avoid redundant REST polling
 STATE_FILE = os.path.join(CURRENT_DIR, "state", "okx_jev_demo_state.json")
 
-# Risk & Filter Parameters (in spot price terms)
-SL_PCT = 0.016                    # Base -1.6% Spot SL (Dynamic ATR 1.6%~3.5%)
-TP_PCT = 0.040                    # Base +4.0% Spot TP (Dynamic 2.5*SL: 4.0%~8.5%)
-TRAIL_ARM_PCT = 0.0192            # Arm peak-latched trailing at 1.2 * SL
-TRAIL_DROP_PCT = 0.0064           # Lock profit on 0.40 * SL pullback from peak
-TRAIL_MIN_PROFIT_PCT = 0.0015     # +0.15% minimum spot profit floor on trailing exit (covers ~0.10% fees)
-MIN_ATR_RATIO = 0.0030            # Minimum ATR/Price volatility (filters out sideways chop)
-MIN_VOL_RATIO = 0.80              # Minimum 5m Vol(3)/Vol(20) ratio (blocks dead-volume liquidity-vacuum fakeouts)
-MIN_LOB_IMBALANCE = 0.25          # Upgraded from 0.20 -> blocks weak orderbook noise entries
-MAX_EMA20_DIST_PCT = 1.2          # Max allowed distance from 5m EMA20 to prevent overextension chasing
-MAX_1H_EMA50_DIST_PCT = 4.5       # Max directional distance from 1H EMA50 (blocks climax crash/top chasing)
-MAX_LONG_FUNDING_RATE = 0.0005    # +0.05% funding cap to avoid Long Squeeze traps
-MIN_SHORT_FUNDING_RATE = -0.0003  # -0.03% funding floor to avoid Short Squeeze traps
-SUI_MIN_RS_OUTPERFORM = 0.015     # SUI requires >= +1.5% 1H RS outperformance vs BTC
+# ── ARGON V4.1-PRO WAVE & RISK PARAMETERS (in spot price terms) ──
+MIN_SYNC_BREADTH = 3              # Require 3/4 Major Coins (BTC, ETH, SOL, XRP) aligned on 1H MA(5/10/20) — S8 (4/4는 빈도 급감·검증 지연)
+MIN_BTC_MA20_SLOPE3_PCT = 0.18    # Minimum |BTC 1H MA20 3-bar slope| (%) to confirm standard market wave
+MIN_BTC_IMPULSE_SLOPE3_PCT = 0.10 # Minimum |BTC 1H MA20 3-bar slope| (%) on fresh compression-box breakout
+MIN_BTC_IMPULSE_MA5_SLOPE1_PCT = 0.30 # Minimum |BTC 1H MA5 1-bar slope| (%) on fresh compression-box breakout
+MIN_BTC_IMPULSE_RET3_PCT = 1.50   # Minimum |BTC 1H 3-bar return| (%) to confirm vertical compression breakout
+MIN_1H_MA_SPREAD_PCT = 0.30       # Minimum |1H MA5 - 1H MA20| / MA20 (%) to block tangled sideways chop
+MIN_1H_ADX = 18.0                 # Minimum 1H Wilder ADX(14)
+MIN_15M_ADX = 18.0                # Minimum 15m Wilder ADX(14)
+MIN_15M_VOL_RATIO = 0.75          # Minimum 15m Vol(3)/Vol(20) participation ratio
+MIN_DIST_1H_MA20_PCT = 0.15       # Minimum directional breakout clearance beyond 1H MA20 (%)
+MAX_DIST_1H_MA20_PCT = 3.10       # Maximum distance from 1H MA20 (%) — blocks late blow-off / waterfall chasing
+MAX_IMPULSE_DIST_1H_MA20_PCT = 4.80 # Maximum distance from 1H MA20 (%) on first vertical compression-breakout bar
+MAX_BTC_WAVE_AGE_HRS = 10         # Block late-wave entries when BTC wave > 10h AND coin wave > 6h
+MAX_SYM_LATE_WAVE_HRS = 6
+
+# Multi-Stage Wave Harvest & Protection (Spot % -> multiplied by 10x for ROE %) — S8 tuned
+BASE_SL_CORE = 0.025              # -2.50% base spot SL for BTC/ETH (-25% ROE @ 10x, safely inside ~9% liq)
+BASE_SL_ALT = 0.025               # -2.50% base spot SL for SOL/XRP (S8: 1.6~2.0%는 풀손절 반복으로 PF 악화)
+MAX_DYN_SL_PCT = 0.040            # -4.00% max dynamic ATR SL (still >= 5% buffer inside 10x isolated liq)
+DYN_SL_ATR_MULT = 3.0             # dynamic SL = max(base, min(cap, 3.0 x 15m ATR ratio)) — S8 (기존 2.2)
+WAVE_TP_PCT = 0.050               # +5.0% hard Wave Take-Profit (+50% ROE @ 10x) — S8: +10%는 도달률 4%로 미달
+STAGE1_BE_ARM_PCT = 0.0150        # Stage 1: Peak >= +1.50% spot (+15% ROE @ 10x) -> Lock +0.25% spot (+2.5% ROE)
+STAGE1_BE_FLOOR_PCT = 0.0025
+STAGE2_MID_ARM_PCT = 0.0220       # Stage 2: Peak >= +2.20% spot (+22% ROE @ 10x) -> Lock +1.10% spot (+11% ROE)
+STAGE2_MID_FLOOR_PCT = 0.0110
+STAGE3_TRAIL_ARM_PCT = 0.0320     # Stage 3: Peak >= +3.20% spot (+32% ROE @ 10x) -> Trail on 1.00% pullback from peak
+STAGE3_TRAIL_DROP_PCT = 0.0100
+STAGE3_MIN_PROFIT_PCT = 0.0100    # Minimum +1.00% spot profit required on Stage 3 trail exit
+MA20_REV_BUFFER_PCT = 0.0020      # Stage 4: 0.20% clearance across 1H MA20 + MA5 cross confirms wave invalidation
+
+SAME_SIDE_MAX_STREAK = 2          # 2 consecutive same-side losses -> 4-hour directional lockout
+SAME_SIDE_LOCKOUT_SEC = 14400.0
+MAX_LONG_FUNDING_RATE = 0.0008    # +0.08% extreme funding cap to guard 10x Long Squeeze
+MIN_SHORT_FUNDING_RATE = -0.0006  # -0.06% extreme funding floor to guard 10x Short Squeeze
 
 
 def _round_step(value: float, step: str, rounding=ROUND_DOWN) -> Decimal:
@@ -121,6 +148,7 @@ class OKXJevDemoTrader:
         self.passphrase = OKX_PASSPHRASE
         self.session = requests.Session()
         self.last_error = ""
+        self.server_error_count = 0
 
         self.account_equity = 0.0
         self.usdt_equity = 0.0
@@ -128,11 +156,17 @@ class OKXJevDemoTrader:
         self.positions: Dict[str, Dict[str, Any]] = {}
         self.peak_prices: Dict[str, float] = {}
         self.trade_cooldowns: Dict[str, float] = {}
+        self.order_fail_counts: Dict[str, int] = {}
         self.position_entry_times: Dict[str, float] = {}
         self.position_params: Dict[str, Dict[str, float]] = {}
+        self.side_loss_streak: Dict[str, int] = {}
+        self.side_lockout_until: Dict[str, float] = {}
+        self.traded_waves: List[str] = []
         self.inst_cache: Dict[str, Dict[str, str]] = {}
+        self.candle_cache: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
         self.trading_enabled = False
         self.last_mode_check = 0.0
+        self.last_radar_log = 0.0
         self._load_state()
 
         if JEV_GATE_AVAILABLE:
@@ -141,23 +175,25 @@ class OKXJevDemoTrader:
                 fail_closed=True,
             )
             if self.jev_gate.is_enabled and self.jev_gate.api_key:
-                logger.info("🧠 Universal Jev AI Gate loaded (trend prompt, strict fail-closed).")
+                logger.info("🧠 Universal Jev AI Gate loaded (4-Major Wave prompt, strict fail-closed).")
             else:
                 logger.warning("⚠️ Jev Gate disabled (USE_JEV_PREDICTION=false or no API key) -> technical signals only.")
         else:
             self.jev_gate = None
             logger.warning("⚠️ Universal Jev Gate unavailable -> technical signals only.")
 
-        logger.info("=" * 70)
-        logger.info("🚀 [OKX Jev Demo Trader] Ultra-Precision Alpha Engine Active (v3.3)")
-        logger.info(f"   Target Universe: {', '.join(TARGET_SYMBOLS)} (BTC = Macro Trend Engine)")
-        logger.info(f"   Strategy: 15m MTF + Vol(3/20)>={MIN_VOL_RATIO:.2f}x + 1H Climax Cap(<={MAX_1H_EMA50_DIST_PCT:.1f}%) + |Imb|>={MIN_LOB_IMBALANCE:.2f}")
-        logger.info("   Safety Level: 100% Simulated (x-simulated-trading: 1) | Jev Gate: Strict Fail-Closed")
-        logger.info(f"   Leverage: {LEVERAGE}x (Isolated Margin)")
-        logger.info(f"   Max Concurrent Positions: {MAX_CONCURRENT_POSITIONS} | Margin: {POSITION_MARGIN_PCT*100:.0f}% USDT Eq (max ${MAX_MARGIN_PER_TRADE:,.0f})")
-        logger.info("   Risk: Dynamic ATR SL (1.6%~3.5%), TP (2.5*SL: 4.0%~8.5%), Peak-Latched Trail (Arm 1.2*SL, Drop 0.40*SL)")
-        logger.info(f"   Cooldowns: Post-Loss {POST_LOSS_COOLDOWN_SEC/60:.0f}m | Post-Win {NORMAL_COOLDOWN_SEC/60:.0f}m | Jev Veto {JEV_VETO_COOLDOWN_SEC/60:.0f}m")
-        logger.info("=" * 70)
+        logger.info("=" * 76)
+        logger.info("🚀 [OKX Jev Demo Trader] Argon V4-Pro S8: 4-Major Dominance Wave Rider Active")
+        logger.info(f"   Target Universe : {', '.join(TARGET_SYMBOLS)} ({MIN_SYNC_BREADTH}/4 Synchronization Required)")
+        logger.info(f"   Leverage & Size : {LEVERAGE}x Isolated | {POSITION_MARGIN_PCT*100:.0f}% USDT Eq/Slot (Max {MAX_CONCURRENT_POSITIONS} Slots, Cap ${MAX_MARGIN_PER_TRADE:,.0f})")
+        logger.info(f"   Wave Entry Gate : {MIN_SYNC_BREADTH}/4 1H MA(5/10/20) + BTC Slope>={MIN_BTC_MA20_SLOPE3_PCT:.2f}% + Spread>={MIN_1H_MA_SPREAD_PCT:.2f}% + ADX>={MIN_1H_ADX:.0f}")
+        logger.info(
+            f"   4-Stage Harvest : S1 +{STAGE1_BE_ARM_PCT*100:.1f}%->+{STAGE1_BE_FLOOR_PCT*100:.2f}% | "
+            f"S2 +{STAGE2_MID_ARM_PCT*100:.1f}%->+{STAGE2_MID_FLOOR_PCT*100:.2f}% | "
+            f"S3 +{STAGE3_TRAIL_ARM_PCT*100:.1f}% (Drop {STAGE3_TRAIL_DROP_PCT*100:.1f}%) | S4 1H MA20 Exit"
+        )
+        logger.info("   Execution & Safe: 1-Tick Passive Maker (0.02%) -> Market Fallback | 100% Demo (x-simulated-trading: 1)")
+        logger.info("=" * 76)
 
     # ── STATE ──
     def _load_state(self):
@@ -167,20 +203,54 @@ class OKXJevDemoTrader:
         self.trade_cooldowns = {k: float(v) for k, v in st.get("trade_cooldowns", {}).items() if float(v) > now}
         self.position_entry_times = {k: float(v) for k, v in st.get("position_entry_times", {}).items()}
         self.position_params = st.get("position_params", {}) or {}
-        self.positions = st.get("positions", {}) or {}  # lets us detect exchange-side closes that happened while down
+        self.positions = st.get("positions", {}) or {}
+        self.side_loss_streak = {k: int(v) for k, v in st.get("side_loss_streak", {}).items() if int(v) > 0}
+        self.side_lockout_until = {k: float(v) for k, v in st.get("side_lockout_until", {}).items() if float(v) > now}
+        raw_waves = st.get("traded_waves", [])
+        self.traded_waves = [str(x) for x in raw_waves[-80:]] if isinstance(raw_waves, list) else []
         if st:
-            logger.info(f"♻️ [State Restored] peaks={self.peak_prices} cooldowns={list(self.trade_cooldowns)}")
+            logger.info(
+                f"♻️ [State Restored] peaks={self.peak_prices} cooldowns={list(self.trade_cooldowns)} "
+                f"waves={len(self.traded_waves)} streaks={self.side_loss_streak} lockouts={list(self.side_lockout_until)}"
+            )
 
     def _save_state(self):
+        now = time.time()
         save_state(STATE_FILE, {
             "peak_prices": self.peak_prices,
-            "trade_cooldowns": {k: v for k, v in self.trade_cooldowns.items() if v > time.time()},
+            "trade_cooldowns": {k: v for k, v in self.trade_cooldowns.items() if v > now},
             "position_entry_times": self.position_entry_times,
             "position_params": self.position_params,
+            "side_loss_streak": {k: v for k, v in self.side_loss_streak.items() if v > 0},
+            "side_lockout_until": {k: v for k, v in self.side_lockout_until.items() if v > now},
+            "traded_waves": self.traded_waves[-80:],
             "positions": {k: {"avgPx": v.get("avgPx"), "pos": v.get("pos"), "upl": v.get("upl"), "uplRatio": v.get("uplRatio")}
                           for k, v in self.positions.items()},
             "saved_at": datetime.now(timezone.utc).isoformat(),
         })
+
+    def _mark_wave_traded(self, inst_id: str, btc_wave_ts: str, sym_wave_ts: str):
+        for wk in (f"{inst_id}:BTC:{btc_wave_ts}", f"{inst_id}:SYM:{sym_wave_ts}"):
+            if wk not in self.traded_waves:
+                self.traded_waves.append(wk)
+        if len(self.traded_waves) > 80:
+            self.traded_waves = self.traded_waves[-80:]
+
+    def _record_trade_outcome(self, inst_id: str, side_desc: str, is_loss: bool):
+        key = f"{inst_id}:{side_desc}"
+        if is_loss:
+            streak = self.side_loss_streak.get(key, 0) + 1
+            if streak >= SAME_SIDE_MAX_STREAK:
+                self.side_lockout_until[key] = time.time() + SAME_SIDE_LOCKOUT_SEC
+                self.side_loss_streak[key] = 0
+                logger.warning(
+                    f"🛑 [2-Strike Directional Lockout] {inst_id} {side_desc} hit {streak} consecutive losses -> "
+                    f"locked out from {side_desc} for {SAME_SIDE_LOCKOUT_SEC/3600:.1f}h!"
+                )
+            else:
+                self.side_loss_streak[key] = streak
+        else:
+            self.side_loss_streak.pop(key, None)
 
     # ── HTTP ──
     def _sign_headers(self, method: str, path: str, body: str = "") -> Dict[str, str]:
@@ -217,7 +287,6 @@ class OKXJevDemoTrader:
                 if res_json.get("code") == "0":
                     self.server_error_count = 0
                     return res_json
-                # Per-item errors (sCode/sMsg) carry the real reason, e.g. 51010 account-mode / 51008 margin
                 details = [f"{d.get('sCode')}:{d.get('sMsg')}" for d in res_json.get("data", [])
                            if isinstance(d, dict) and d.get("sCode")]
                 self.last_error = f"{res_json.get('code')} {res_json.get('msg')} {details}".strip()
@@ -272,24 +341,26 @@ class OKXJevDemoTrader:
                 if d.get("ccy") == "USDT":
                     self.available_usdt = float(d.get("availBal") or d.get("availEq") or 0.0)
                     self.usdt_equity = float(d.get("eq") or self.available_usdt or 0.0)
-            logger.info(
-                f"💼 [Demo Account Sync] Total Eq: ${self.account_equity:,.2f} | "
-                f"USDT Eq: ${self.usdt_equity:,.2f} | Avail USDT: ${self.available_usdt:,.2f}"
-            )
+            self._sync_log_cnt = getattr(self, "_sync_log_cnt", 0) + 1
+            if self._sync_log_cnt % 30 == 1:
+                logger.info(
+                    f"💼 [Demo Account Sync] Total Eq: ${self.account_equity:,.2f} | "
+                    f"USDT Eq: ${self.usdt_equity:,.2f} | Avail USDT: ${self.available_usdt:,.2f}"
+                )
             return True
         return False
 
     def sync_positions(self) -> Dict[str, Dict[str, Any]]:
-        """Fetches active open positions"""
+        """Fetches active open positions across TARGET_SYMBOLS and any legacy symbols"""
         res = self._request("GET", "/api/v5/account/positions?instType=SWAP")
         if res:
+            managed_set = set(TARGET_SYMBOLS) | set(LEGACY_MANAGE_SYMBOLS) | set(self.positions.keys())
             new_pos = {}
             for p in res.get("data", []):
                 inst_id = p.get("instId")
-                if inst_id in TARGET_SYMBOLS and abs(float(p.get("pos", 0.0) or 0.0)) > 0:
+                if inst_id in managed_set and abs(float(p.get("pos", 0.0) or 0.0)) > 0:
                     new_pos[inst_id] = p
 
-            # Check external closes (exchange-attached SL/TP fills, liquidation, manual)
             for sym in list(self.positions.keys()):
                 if sym not in new_pos:
                     self._handle_external_close(sym, self.positions[sym])
@@ -310,6 +381,8 @@ class OKXJevDemoTrader:
             src = "last upl"
             pnl = float(prev_pos.get("upl") or 0.0)
         is_loss = pnl < 0
+        side_desc = "LONG" if float(prev_pos.get("pos", 0.0) or 0.0) > 0 else "SHORT"
+        self._record_trade_outcome(inst_id, side_desc, is_loss)
         cooldown = POST_LOSS_COOLDOWN_SEC if is_loss else NORMAL_COOLDOWN_SEC
         self.trade_cooldowns[inst_id] = time.time() + cooldown
         self.peak_prices.pop(inst_id, None)
@@ -321,9 +394,9 @@ class OKXJevDemoTrader:
         logger.info(f"ℹ️ [Position Closed Externally] {inst_id} {tag} pnl={pnl:+.2f} USDT ({src}) -> cooldown {cooldown/60:.0f}m")
         send_telegram(f"[OKX Demo] {inst_id} 거래소 SL/TP 청산 ({tag} {pnl:+.2f} USDT)")
 
-    # ── MARKET DATA ──
-    def get_ticker_and_imbalance(self, inst_id: str) -> Tuple[float, float]:
-        """Fetches L1 BBO and top-5 orderbook imbalance"""
+    # ── MARKET DATA & WAVE INDICATORS ──
+    def get_bbo_and_imbalance(self, inst_id: str) -> Tuple[float, float, float, float]:
+        """Fetches L1 BBO (mid, imbalance, best_bid, best_ask) and top-5 orderbook imbalance"""
         try:
             url = f"{OKX_BASE_URL}/api/v5/market/books?instId={inst_id}&sz=5"
             resp = self.session.get(url, timeout=3)
@@ -340,10 +413,14 @@ class OKXJevDemoTrader:
                         ask_vol = sum(float(a[1]) for a in asks)
                         tot_vol = bid_vol + ask_vol
                         imbalance = (bid_vol - ask_vol) / tot_vol if tot_vol > 0 else 0.0
-                        return mid_price, imbalance
+                        return mid_price, imbalance, best_bid, best_ask
         except Exception as e:
             logger.debug(f"Ticker/Imb error for {inst_id}: {e}")
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
+
+    def get_ticker_and_imbalance(self, inst_id: str) -> Tuple[float, float]:
+        mid_price, imbalance, _, _ = self.get_bbo_and_imbalance(inst_id)
+        return mid_price, imbalance
 
     def get_funding_rate(self, inst_id: str) -> float:
         """Fetches real-time 8H funding rate for perpetual swap to guard against Long/Short Squeezes"""
@@ -358,8 +435,14 @@ class OKXJevDemoTrader:
             logger.debug(f"Funding rate error for {inst_id}: {e}")
         return 0.0
 
-    def fetch_bars(self, inst_id: str, bar: str = "5m", limit: int = 100) -> Optional[pd.DataFrame]:
+    def fetch_bars(self, inst_id: str, bar: str = "15m", limit: int = 100, use_cache: bool = True) -> Optional[pd.DataFrame]:
         """Fetches CONFIRMED candlestick bars only (the live, still-forming candle is dropped to avoid repaint)"""
+        cache_key = (inst_id, bar)
+        now = time.time()
+        if use_cache and cache_key in self.candle_cache:
+            ts_cached, df_cached = self.candle_cache[cache_key]
+            if now - ts_cached < CANDLE_CACHE_TTL_SEC and len(df_cached) >= min(25, limit - 5):
+                return df_cached
         try:
             url = f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
             resp = self.session.get(url, timeout=4)
@@ -372,53 +455,110 @@ class OKXJevDemoTrader:
                 df = df[df["confirm"] == "1"].reset_index(drop=True)
                 for col in ("open", "high", "low", "close", "vol"):
                     df[col] = df[col].astype(float)
+                self.candle_cache[cache_key] = (now, df)
                 return df
         except Exception as e:
-            logger.debug(f"Bars error for {inst_id}: {e}")
+            logger.debug(f"Bars error for {inst_id} ({bar}): {e}")
         return None
 
-    def calculate_technical_signals(self, df: Optional[pd.DataFrame]) -> Dict[str, Any]:
-        """Calculates EMA9, EMA20, EMA50, ATR Volatility, and Vol(3)/Vol(20) Participation Ratio"""
-        if df is None or len(df) < 20:
-            return {"signal": "NEUTRAL", "price": 0.0, "ema50": 0.0, "atr_ratio": 0.0, "vol_ratio": 0.0}
+    @staticmethod
+    def _calc_wilder_adx(highs: pd.Series, lows: pd.Series, closes: pd.Series) -> float:
+        tr = pd.concat([highs - lows, (highs - closes.shift()).abs(), (lows - closes.shift()).abs()], axis=1).max(axis=1)
+        up = highs.diff()
+        dn = -lows.diff()
+        plus_dm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=closes.index)
+        minus_dm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=closes.index)
+        atr14 = tr.ewm(alpha=1/14, adjust=False).mean().replace(0, 1e-9)
+        pdi = 100.0 * (plus_dm.ewm(alpha=1/14, adjust=False).mean() / atr14)
+        mdi = 100.0 * (minus_dm.ewm(alpha=1/14, adjust=False).mean() / atr14)
+        dx = 100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0, 1e-9)
+        adx_val = float(dx.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
+        return 0.0 if math.isnan(adx_val) else adx_val
 
-        closes = df["close"]
-        price = float(closes.iloc[-1])
-        ema9 = float(closes.ewm(span=9, adjust=False).mean().iloc[-1])
-        ema20 = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
-        ema50 = float(closes.ewm(span=min(50, len(closes)), adjust=False).mean().iloc[-1])
+    def analyze_1h_wave(self, df: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
+        """Computes 1H MA(5/10/20), slopes, spread, Wilder ADX(14), and restart-invariant wave_ts / wave_age."""
+        if df is None or len(df) < 25:
+            return None
+        c, h, l = df["close"], df["high"], df["low"]
+        ma5_s = c.rolling(5).mean()
+        ma10_s = c.rolling(10).mean()
+        ma20_s = c.rolling(20).mean()
 
-        # True Range and ATR
-        highs = df["high"]
-        lows = df["low"]
-        tr = np.maximum(highs - lows, np.maximum(abs(highs - closes.shift()), abs(lows - closes.shift())))
-        atr = float(tr.rolling(14).mean().iloc[-1])
-        atr_ratio = (atr / price) if price > 0 and not math.isnan(atr) else 0.0
-        lookback = min(12, len(closes) - 1)
-        recent_ret = (price / float(closes.iloc[-1 - lookback]) - 1.0) if lookback > 0 else 0.0
+        c_last = float(c.iloc[-1])
+        ma5 = float(ma5_s.iloc[-1])
+        ma10 = float(ma10_s.iloc[-1])
+        ma20 = float(ma20_s.iloc[-1])
+        if math.isnan(ma20) or ma20 <= 0:
+            return None
 
-        # Volume Participation Ratio: recent 3-bar average vs 20-bar average
-        vol_ratio = 1.0
-        if "vol" in df.columns and len(df) >= 20:
-            vol_ma20 = float(df["vol"].iloc[-20:].mean())
-            vol_ma3 = float(df["vol"].iloc[-3:].mean())
-            vol_ratio = (vol_ma3 / vol_ma20) if vol_ma20 > 0 else 1.0
+        ma20_prev3 = float(ma20_s.iloc[-4]) if not math.isnan(float(ma20_s.iloc[-4])) else ma20
+        ma5_prev1 = float(ma5_s.iloc[-2]) if not math.isnan(float(ma5_s.iloc[-2])) else ma5
+        c_prev3 = float(c.iloc[-4]) if len(c) >= 4 else c_last
 
-        is_bullish = (price > ema9) and (ema9 > ema20) and (price > ema50)
-        is_bearish = (price < ema9) and (ema9 < ema20) and (price < ema50)
+        dist_ma20 = (c_last / ma20 - 1.0) * 100.0
+        ma20_slope3 = (ma20 / ma20_prev3 - 1.0) * 100.0 if ma20_prev3 > 0 else 0.0
+        ma5_slope1 = (ma5 / ma5_prev1 - 1.0) * 100.0 if ma5_prev1 > 0 else 0.0
+        ma_spread_pct = abs(ma5 - ma20) / ma20 * 100.0
+        ret3 = (c_last / c_prev3 - 1.0) * 100.0 if c_prev3 > 0 else 0.0
+        adx = self._calc_wilder_adx(h, l, c)
 
-        sig = "BUY" if is_bullish else ("SELL" if is_bearish else "NEUTRAL")
+        # Invariant wave start timestamp & bars_in_wave since Close crossed MA20
+        above_cur = bool(c_last > ma20)
+        wave_age = 0
+        wave_ts = str(df["ts"].iloc[-1])
+        for idx in range(len(df) - 2, 18, -1):
+            m20_k = float(ma20_s.iloc[idx])
+            if math.isnan(m20_k):
+                break
+            if bool(float(c.iloc[idx]) > m20_k) == above_cur:
+                wave_age += 1
+                wave_ts = str(df["ts"].iloc[idx])
+            else:
+                break
+
         return {
-            "signal": sig,
-            "price": price,
+            "close": c_last,
+            "ma5": ma5,
+            "ma10": ma10,
+            "ma20": ma20,
+            "dist_ma20": dist_ma20,
+            "ma20_slope3": ma20_slope3,
+            "ma5_slope1": ma5_slope1,
+            "ma_spread_pct": ma_spread_pct,
+            "ret3": ret3,
+            "adx": adx,
+            "above_ma20": above_cur,
+            "wave_ts": wave_ts,
+            "wave_age": wave_age,
+        }
+
+    def analyze_15m_wave(self, df: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
+        """Computes 15m EMA9, EMA20, ATR(14)/Price ratio, Wilder ADX(14), and Vol(3)/Vol(20)."""
+        if df is None or len(df) < 22:
+            return None
+        c, h, l, v = df["close"], df["high"], df["low"], df["vol"]
+        c_last = float(c.iloc[-1])
+        ema9 = float(c.ewm(span=9, adjust=False).mean().iloc[-1])
+        ema20 = float(c.ewm(span=20, adjust=False).mean().iloc[-1])
+        tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+        atr = float(tr.rolling(14).mean().iloc[-1])
+        atr_ratio = (atr / c_last) if c_last > 0 and not math.isnan(atr) else 0.005
+        vol_ma20 = float(v.iloc[-20:].mean())
+        vol_ma3 = float(v.iloc[-3:].mean())
+        vol_ratio = (vol_ma3 / vol_ma20) if vol_ma20 > 0 else 1.0
+        adx = self._calc_wilder_adx(h, l, c)
+        lookback = min(12, len(c) - 1)
+        recent_ret_pct = ((c_last / float(c.iloc[-1 - lookback])) - 1.0) * 100.0 if lookback > 0 else 0.0
+
+        return {
+            "close": c_last,
             "ema9": ema9,
             "ema20": ema20,
-            "ema50": ema50,
+            "dist_ema20_pct": (c_last / ema20 - 1.0) * 100.0 if ema20 > 0 else 0.0,
             "atr_ratio": atr_ratio,
             "vol_ratio": vol_ratio,
-            "dist_ema20_pct": (price / ema20 - 1.0) * 100.0 if ema20 > 0 else 0.0,
-            "dist_ema50_pct": (price / ema50 - 1.0) * 100.0 if ema50 > 0 else 0.0,
-            "recent_return_pct": recent_ret * 100.0,
+            "adx": adx,
+            "recent_return_pct": recent_ret_pct,
             "lookback_bars": lookback,
         }
 
@@ -437,13 +577,16 @@ class OKXJevDemoTrader:
         return None
 
     def set_leverage(self, inst_id: str):
-        """Ensures isolated leverage is set"""
+        """Ensures isolated leverage is set cleanly (cancels any stale algo orders first)"""
+        self._cancel_algo_orders(inst_id)
         data = {
             "instId": inst_id,
             "lever": str(LEVERAGE),
             "mgnMode": "isolated"
         }
-        self._request("POST", "/api/v5/account/set-leverage", data=data)
+        res = self._request("POST", "/api/v5/account/set-leverage", data=data)
+        if res:
+            logger.info(f"⚡ [Leverage Configured] {inst_id} set to {LEVERAGE}x Isolated Margin")
 
     def _cancel_algo_orders(self, inst_id: str):
         """Cancels leftover attached SL/TP algo orders for the instrument."""
@@ -453,10 +596,16 @@ class OKXJevDemoTrader:
             self._request("POST", "/api/v5/trade/cancel-algos", data=algos)
             logger.info(f"🧹 [Algo Cleanup] {inst_id} cancelled {len(algos)} leftover SL/TP algo order(s)")
 
-    def open_position(self, inst_id: str, side: str = "buy",
-                      sl_pct: float = SL_PCT, tp_pct: float = TP_PCT,
-                      trail_arm: float = TRAIL_ARM_PCT, trail_drop: float = TRAIL_DROP_PCT) -> bool:
-        """Submits market order with exchange-attached dynamic SL/TP (Buy for Long, Sell for Short)"""
+    def open_position(
+        self,
+        inst_id: str,
+        side: str = "buy",
+        sl_pct: float = BASE_SL_ALT,
+        tp_pct: float = WAVE_TP_PCT,
+        btc_wave_ts: str = "",
+        sym_wave_ts: str = "",
+    ) -> bool:
+        """Submits Passive 1-Tick Post-Only Maker order (w/ Market fallback) + exchange-attached SL/TP"""
         info = self.get_instrument(inst_id)
         mid_pr, imb = self.get_ticker_and_imbalance(inst_id)
         if not info or mid_pr <= 0:
@@ -466,7 +615,7 @@ class OKXJevDemoTrader:
 
         ct_val = float(info["ctVal"])
         base_usdt = self.usdt_equity if self.usdt_equity > 0 else self.available_usdt
-        margin_to_use = min(base_usdt * POSITION_MARGIN_PCT, self.available_usdt * 0.95, MAX_MARGIN_PER_TRADE)
+        margin_to_use = min(base_usdt * POSITION_MARGIN_PCT, self.available_usdt * 0.90, MAX_MARGIN_PER_TRADE)
         notional_val = margin_to_use * LEVERAGE
         contracts = _round_step(notional_val / (mid_pr * ct_val), info["lotSz"], ROUND_DOWN)
         if contracts < Decimal(info["minSz"]):
@@ -475,54 +624,152 @@ class OKXJevDemoTrader:
             return False
 
         is_long = side == "buy"
-        sl_px = mid_pr * (1 - sl_pct) if is_long else mid_pr * (1 + sl_pct)
-        tp_px = mid_pr * (1 + tp_pct) if is_long else mid_pr * (1 - tp_pct)
+        _, _, best_bid, best_ask = self.get_bbo_and_imbalance(inst_id)
         tick = info["tickSz"]
-        order_data = {
+        tick_d = Decimal(tick)
+
+        # Passive 1-Tick Offset: prevents 0ms Post-Only auto-cancel on micro BBO drift while capturing 0.02% Maker fee
+        if is_long and best_bid > 0:
+            passive_px_d = _round_step(best_bid, tick, ROUND_DOWN) - tick_d
+            if best_ask > 0:
+                ask_minus_tick = _round_step(best_ask, tick, ROUND_DOWN) - tick_d
+                if passive_px_d > ask_minus_tick:
+                    passive_px_d = ask_minus_tick
+        elif (not is_long) and best_ask > 0:
+            passive_px_d = _round_step(best_ask, tick, ROUND_UP) + tick_d
+            if best_bid > 0:
+                bid_plus_tick = _round_step(best_bid, tick, ROUND_UP) + tick_d
+                if passive_px_d < bid_plus_tick:
+                    passive_px_d = bid_plus_tick
+        else:
+            passive_px_d = _round_step(mid_pr, tick, ROUND_DOWN if is_long else ROUND_UP)
+
+        maker_px = float(passive_px_d)
+        sl_px = maker_px * (1 - sl_pct) if is_long else maker_px * (1 + sl_pct)
+        tp_px = maker_px * (1 + tp_pct) if is_long else maker_px * (1 - tp_pct)
+        attach_algo = [{
+            "tpTriggerPx": _fmt(_round_step(tp_px, tick, ROUND_HALF_UP), tick),
+            "tpOrdPx": "-1",
+            "tpTriggerPxType": "last",
+            "slTriggerPx": _fmt(_round_step(sl_px, tick, ROUND_HALF_UP), tick),
+            "slOrdPx": "-1",
+            "slTriggerPxType": "last",
+        }]
+
+        pos_type_desc = "LONG" if is_long else "SHORT"
+        sz_str = _fmt(contracts, info["lotSz"])
+        approx_usd = float(contracts) * ct_val * maker_px
+
+        maker_order = {
             "instId": inst_id,
             "tdMode": "isolated",
             "side": side,
             "posSide": "net",
-            "ordType": "market",
-            "sz": _fmt(contracts, info["lotSz"]),
-            "clOrdId": f"jevdemo{int(time.time() * 1000)}",
-            "attachAlgoOrds": [{
-                "tpTriggerPx": _fmt(_round_step(tp_px, tick, ROUND_HALF_UP), tick),
+            "ordType": "post_only",
+            "px": _fmt(passive_px_d, tick),
+            "sz": sz_str,
+            "clOrdId": f"jevv4m{int(time.time() * 1000)}",
+            "attachAlgoOrds": attach_algo,
+        }
+        logger.info(
+            f"📤 [Argon V4-Pro Maker] {pos_type_desc} {sz_str} ct {inst_id} "
+            f"(Margin ~${margin_to_use:,.0f} x {LEVERAGE}x = ~${approx_usd:,.0f}) Post-Only @ ${maker_order['px']} "
+            f"| SL {attach_algo[0]['slTriggerPx']} (-{sl_pct*100:.2f}%) / Wave TP {attach_algo[0]['tpTriggerPx']} (+{tp_pct*100:.1f}%)"
+        )
+        res = self._request("POST", "/api/v5/trade/order", data=maker_order)
+        maker_filled = False
+        order_already_closed = False
+        rem_contracts = contracts
+
+        if res and res.get("data"):
+            m_oid = res["data"][0].get("ordId")
+            for _ in range(3):
+                time.sleep(1.1)
+                chk = self._request("GET", f"/api/v5/trade/order?instId={inst_id}&ordId={m_oid}")
+                if chk and chk.get("data"):
+                    st_info = chk["data"][0]
+                    st_state = st_info.get("state", "")
+                    acc_fill = Decimal(str(st_info.get("accFillSz") or "0"))
+                    if st_state == "filled":
+                        maker_filled = True
+                        order_already_closed = True
+                        logger.info(f"✅ [Maker Order Filled] {inst_id} {pos_type_desc} filled as Maker (0.02% fee)! ID: {m_oid}")
+                        break
+                    elif st_state == "canceled":
+                        order_already_closed = True
+                        rem_contracts = contracts - acc_fill
+                        break
+            if not maker_filled and not order_already_closed:
+                self._request("POST", "/api/v5/trade/cancel-order", data={"instId": inst_id, "ordId": m_oid})
+                chk = self._request("GET", f"/api/v5/trade/order?instId={inst_id}&ordId={m_oid}")
+                if chk and chk.get("data"):
+                    st_info = chk["data"][0]
+                    if st_info.get("state") == "filled":
+                        maker_filled = True
+                    else:
+                        acc_fill = Decimal(str(st_info.get("accFillSz") or "0"))
+                        rem_contracts = contracts - acc_fill
+
+        if not maker_filled and rem_contracts >= Decimal(info["minSz"]):
+            # Recompute SL/TP off latest mid price for market fallback accuracy
+            curr_mid, _ = self.get_ticker_and_imbalance(inst_id)
+            ref_px = curr_mid if curr_mid > 0 else maker_px
+            m_sl_px = ref_px * (1 - sl_pct) if is_long else ref_px * (1 + sl_pct)
+            m_tp_px = ref_px * (1 + tp_pct) if is_long else ref_px * (1 - tp_pct)
+            m_attach = [{
+                "tpTriggerPx": _fmt(_round_step(m_tp_px, tick, ROUND_HALF_UP), tick),
                 "tpOrdPx": "-1",
                 "tpTriggerPxType": "last",
-                "slTriggerPx": _fmt(_round_step(sl_px, tick, ROUND_HALF_UP), tick),
+                "slTriggerPx": _fmt(_round_step(m_sl_px, tick, ROUND_HALF_UP), tick),
                 "slOrdPx": "-1",
                 "slTriggerPxType": "last",
-            }],
-        }
+            }]
+            order_data = {
+                "instId": inst_id,
+                "tdMode": "isolated",
+                "side": side,
+                "posSide": "net",
+                "ordType": "market",
+                "sz": _fmt(rem_contracts, info["lotSz"]),
+                "clOrdId": f"jevv4t{int(time.time() * 1000)}",
+                "attachAlgoOrds": m_attach,
+            }
+            logger.info(f"⚡ [Maker Unfilled -> Market Fallback] Submitting Market {pos_type_desc} {order_data['sz']} ct {inst_id}")
+            res = self._request("POST", "/api/v5/trade/order", data=order_data)
+        else:
+            order_data = maker_order
 
-        pos_type_desc = "LONG" if is_long else "SHORT"
-        approx_usd = float(contracts) * ct_val * mid_pr
-        logger.info(f"📤 [Demo Order Submit] {pos_type_desc} {order_data['sz']} contracts {inst_id} (~${approx_usd:,.1f}) @ ${mid_pr:,.4f} "
-                    f"| Dyn SL {order_data['attachAlgoOrds'][0]['slTriggerPx']} (-{sl_pct*100:.2f}%) / TP {order_data['attachAlgoOrds'][0]['tpTriggerPx']} (+{tp_pct*100:.2f}%)")
-        res = self._request("POST", "/api/v5/trade/order", data=order_data)
         if res and res.get("data"):
             oid = res["data"][0].get("ordId")
-            logger.info(f"✅ [Demo Order Accepted] Order ID: {oid} | {inst_id} {pos_type_desc}")
+            logger.info(f"✅ [V4-Pro Wave Entry Accepted] Order ID: {oid} | {inst_id} {pos_type_desc} ({LEVERAGE}x Isolated)")
+            self.order_fail_counts.pop(inst_id, None)
             self.trade_cooldowns[inst_id] = time.time() + ENTRY_COOLDOWN_SEC
             self.position_entry_times[inst_id] = time.time()
             self.peak_prices[inst_id] = mid_pr
             self.position_params[inst_id] = {
                 "sl_pct": sl_pct,
                 "tp_pct": tp_pct,
-                "trail_arm": trail_arm,
-                "trail_drop": trail_drop
+                "trail_arm": STAGE3_TRAIL_ARM_PCT,
+                "trail_drop": STAGE3_TRAIL_DROP_PCT,
             }
+            if btc_wave_ts and sym_wave_ts:
+                self._mark_wave_traded(inst_id, btc_wave_ts, sym_wave_ts)
             self._save_state()
-            send_telegram(f"[OKX Demo] {pos_type_desc} {inst_id} {order_data['sz']}ct ~${approx_usd:,.0f} @ {mid_pr:,.4f} | SL -{sl_pct*100:.1f}%, TP +{tp_pct*100:.1f}%")
+            send_telegram(
+                f"[OKX V4-Pro {LEVERAGE}x] 🚀 {pos_type_desc} {inst_id} {order_data['sz']}ct "
+                f"(증거금 ~${margin_to_use:,.0f} / 노출 ~${approx_usd:,.0f}) @ {mid_pr:,.4f} | SL -{sl_pct*100:.2f}%"
+            )
             return True
 
-        self.trade_cooldowns[inst_id] = time.time() + ORDER_FAIL_COOLDOWN_SEC
-        logger.error(f"❌ [Order Failed] {inst_id} {pos_type_desc}: {self.last_error} -> cooldown {ORDER_FAIL_COOLDOWN_SEC/60:.0f}m")
+        fail_n = self.order_fail_counts.get(inst_id, 0) + 1
+        self.order_fail_counts[inst_id] = fail_n
+        fail_cd = min(ORDER_FAIL_COOLDOWN_SEC * (2 ** (fail_n - 1)), 3600.0)
+        self.trade_cooldowns[inst_id] = time.time() + fail_cd
+        logger.error(f"❌ [Order Failed] {inst_id} {pos_type_desc}: {self.last_error} -> cooldown {fail_cd/60:.0f}m (연속 실패 {fail_n}회)")
         send_telegram(f"[OKX Demo] ❌ {inst_id} 주문 실패: {self.last_error}",
                       dedupe_key=f"okx_order_fail_{inst_id}", min_interval_sec=1800)
         if "51010" in self.last_error or "account mode" in self.last_error.lower():
-            self.trading_enabled = False  # re-check account mode
+            self.trading_enabled = False
         return False
 
     def close_position(self, inst_id: str, reason: str = "MANUAL", pnl_pct: float = 0.0) -> bool:
@@ -540,244 +787,278 @@ class OKXJevDemoTrader:
                           dedupe_key=f"okx_close_fail_{inst_id}", min_interval_sec=600)
             return False
 
-        logger.info(f"✅ [Demo Position Closed] {inst_id} successfully closed.")
+        logger.info(f"✅ [Demo Position Closed] {inst_id} successfully closed ({reason}).")
         self._cancel_algo_orders(inst_id)
-        self.positions.pop(inst_id, None)
+        prev_pos = self.positions.pop(inst_id, {})
+        side_desc = "LONG" if float(prev_pos.get("pos", 0.0) or 0.0) > 0 else "SHORT"
+        is_loss = ("STOP_LOSS" in reason) or (pnl_pct < 0)
+        self._record_trade_outcome(inst_id, side_desc, is_loss)
+        cooldown = POST_LOSS_COOLDOWN_SEC if is_loss else NORMAL_COOLDOWN_SEC
+        self.trade_cooldowns[inst_id] = time.time() + cooldown
         self.peak_prices.pop(inst_id, None)
         self.position_entry_times.pop(inst_id, None)
         self.position_params.pop(inst_id, None)
         self._save_state()
-
-        if "STOP_LOSS" in reason or pnl_pct < 0:
-            logger.info(f"⏳ [Post-Loss Lockout] {inst_id} enforcing {POST_LOSS_COOLDOWN_SEC/60:.0f}m cooling period.")
-            self.trade_cooldowns[inst_id] = time.time() + POST_LOSS_COOLDOWN_SEC
-        else:
-            self.trade_cooldowns[inst_id] = time.time() + NORMAL_COOLDOWN_SEC
-        send_telegram(f"[OKX Demo] {inst_id} 청산 ({reason}) spot {pnl_pct*100:+.2f}%")
+        roe_est = pnl_pct * LEVERAGE * 100.0
+        send_telegram(f"[OKX V4-Pro] {inst_id} 청산 ({reason}) | 현물 {pnl_pct*100:+.2f}% (추정 ROE {roe_est:+.1f}%)")
         return True
 
+    # ── 4-STAGE WAVE POSITION MANAGEMENT ──
     def manage_open_positions(self):
-        """Monitors open positions for SL, TP, and Trailing Stops (Long & Short). Exchange SL/TP is primary."""
+        """Monitors open positions with Argon V4-Pro 4-Stage Wave Harvest & 1H MA20 Structure Guard."""
         if not self.positions:
             return
+
+        btc_1h = self.analyze_1h_wave(self.fetch_bars("BTC-USDT-SWAP", bar="1H", limit=60))
 
         for inst_id, pos in list(self.positions.items()):
             try:
                 avg_px = float(pos.get("avgPx", 0.0) or 0.0)
                 pos_amt = float(pos.get("pos", 0.0) or 0.0)
-                curr_px, imb = self.get_ticker_and_imbalance(inst_id)
+                curr_px, _ = self.get_ticker_and_imbalance(inst_id)
 
                 if avg_px <= 0 or curr_px <= 0:
                     continue
 
+                # Ensure any inherited / active position marks its wave so it won't re-enter the same wave after closing
+                sym_1h = self.analyze_1h_wave(self.fetch_bars(inst_id, bar="1H", limit=60))
+                if btc_1h and sym_1h:
+                    self._mark_wave_traded(inst_id, btc_1h["wave_ts"], sym_1h["wave_ts"])
+
                 is_long = pos_amt > 0
                 spot_pl_pct = (curr_px - avg_px) / avg_px if is_long else (avg_px - curr_px) / avg_px
 
-                # Retrieve dynamic risk parameters for this position (fallback to defaults)
-                params = self.position_params.get(inst_id, {
-                    "sl_pct": SL_PCT,
-                    "tp_pct": TP_PCT,
-                    "trail_arm": TRAIL_ARM_PCT,
-                    "trail_drop": TRAIL_DROP_PCT
-                })
-                pos_sl_pct = params.get("sl_pct", SL_PCT)
-                pos_tp_pct = params.get("tp_pct", TP_PCT)
-                pos_trail_arm = params.get("trail_arm", TRAIL_ARM_PCT)
-                pos_trail_drop = params.get("trail_drop", TRAIL_DROP_PCT)
+                default_sl = BASE_SL_CORE if inst_id in ("BTC-USDT-SWAP", "ETH-USDT-SWAP") else BASE_SL_ALT
+                params = self.position_params.get(inst_id, {})
+                pos_sl_pct = float(params.get("sl_pct", default_sl))
+                pos_tp_pct = float(params.get("tp_pct", WAVE_TP_PCT))
 
                 # Peak price tracking
                 peak = self.peak_prices.get(inst_id, avg_px)
                 if is_long and curr_px > peak:
                     self.peak_prices[inst_id] = curr_px
                     peak = curr_px
-                elif not is_long and curr_px < peak:
+                elif (not is_long) and curr_px < peak:
                     self.peak_prices[inst_id] = curr_px
                     peak = curr_px
 
-                # 1. Hard Stop-Loss backup
-                if spot_pl_pct <= -pos_sl_pct:
-                    logger.warning(f"🛑 [Stop Loss Trigger] {inst_id} {'LONG' if is_long else 'SHORT'} Spot PnL: {spot_pl_pct*100:.2f}% (Limit: -{pos_sl_pct*100:.2f}%)")
-                    self.close_position(inst_id, f"STOP_LOSS_{spot_pl_pct*100:.1f}PCT", spot_pl_pct)
-                    continue
-
-                # 2. Take-Profit backup
-                if spot_pl_pct >= pos_tp_pct:
-                    logger.info(f"🎯 [Take Profit Trigger] {inst_id} {'LONG' if is_long else 'SHORT'} Spot PnL: +{spot_pl_pct*100:.2f}% (Target: +{pos_tp_pct*100:.2f}%)")
-                    self.close_position(inst_id, f"TAKE_PROFIT_{spot_pl_pct*100:.1f}PCT", spot_pl_pct)
-                    continue
-
-                # 3. Peak-Latched Dynamic Trailing Stop (v3.3 Bug Fix: checks peak_pl_pct so trailing never disarms on pullback)
                 peak_pl_pct = (peak - avg_px) / avg_px if is_long else (avg_px - peak) / avg_px
-                if peak_pl_pct >= pos_trail_arm:
+
+                # 1. Hard Stop-Loss backup (Exchange SL is primary)
+                if spot_pl_pct <= -pos_sl_pct:
+                    logger.warning(f"🛑 [Stop Loss Trigger] {inst_id} {'LONG' if is_long else 'SHORT'} Spot PnL: {spot_pl_pct*100:+.2f}% <= -{pos_sl_pct*100:.2f}%")
+                    self.close_position(inst_id, f"STOP_LOSS_{spot_pl_pct*100:.2f}PCT", spot_pl_pct)
+                    continue
+
+                # 2. Hard Wave Take-Profit backup (+5.0% spot = +50% ROE @ 10x)
+                if spot_pl_pct >= pos_tp_pct:
+                    logger.info(f"🎯 [Wave Take Profit] {inst_id} {'LONG' if is_long else 'SHORT'} Spot PnL: +{spot_pl_pct*100:.2f}% >= +{pos_tp_pct*100:.1f}%")
+                    self.close_position(inst_id, f"WAVE_TP_{spot_pl_pct*100:+.2f}PCT", spot_pl_pct)
+                    continue
+
+                # 3. Stage 2 Mid-Wave Profit Floor (Peak >= +2.20% spot -> Lock +1.10% spot = +22% ROE)
+                if peak_pl_pct >= STAGE2_MID_ARM_PCT and spot_pl_pct <= STAGE2_MID_FLOOR_PCT:
+                    logger.info(
+                        f"🛡️ [Wave Stage-2 Profit Lock] {inst_id} {'LONG' if is_long else 'SHORT'} Peak +{peak_pl_pct*100:.2f}% "
+                        f"pulled back to +{spot_pl_pct*100:.2f}% (Floor +{STAGE2_MID_FLOOR_PCT*100:.2f}%)."
+                    )
+                    self.close_position(inst_id, f"WAVE_STAGE2_LOCK_{spot_pl_pct*100:+.2f}PCT", spot_pl_pct)
+                    continue
+
+                # 4. Stage 1 Early Breakeven Floor (Peak >= +1.50% spot -> Lock +0.25% spot = +5% ROE)
+                if peak_pl_pct >= STAGE1_BE_ARM_PCT and spot_pl_pct <= STAGE1_BE_FLOOR_PCT:
+                    logger.info(
+                        f"🛡️ [Wave Stage-1 BE Lock] {inst_id} {'LONG' if is_long else 'SHORT'} Peak +{peak_pl_pct*100:.2f}% "
+                        f"pulled back to +{spot_pl_pct*100:.2f}% (Floor +{STAGE1_BE_FLOOR_PCT*100:.2f}%)."
+                    )
+                    self.close_position(inst_id, f"WAVE_STAGE1_BE_{spot_pl_pct*100:+.2f}PCT", spot_pl_pct)
+                    continue
+
+                # 5. Stage 3 Big-Wave Trailing Stop (Peak >= +3.20% spot -> 1.00% pullback harvest)
+                if peak_pl_pct >= STAGE3_TRAIL_ARM_PCT:
                     pullback = (peak - curr_px) / peak if is_long else (curr_px - peak) / peak
-                    if pullback >= pos_trail_drop:
-                        if spot_pl_pct >= TRAIL_MIN_PROFIT_PCT:
-                            logger.info(
-                                f"🔒 [Trailing Stop Exit] {inst_id} {'LONG' if is_long else 'SHORT'} profit locked: "
-                                f"Entry ${avg_px:,.4f} -> Peak ${peak:,.4f} (+{peak_pl_pct*100:.2f}%) -> "
-                                f"Curr ${curr_px:,.4f} (Gain: +{spot_pl_pct*100:.2f}%)"
-                            )
-                            self.close_position(inst_id, f"TRAILING_EXIT_{spot_pl_pct*100:.2f}PCT", spot_pl_pct)
-                            continue
-                        elif spot_pl_pct <= 0.0:
-                            # Reset stale pre-gap/legacy peak if price already crossed back below entry before hard SL
-                            self.peak_prices[inst_id] = curr_px
+                    if pullback >= STAGE3_TRAIL_DROP_PCT and spot_pl_pct >= STAGE3_MIN_PROFIT_PCT:
+                        logger.info(
+                            f"🔒 [Wave Stage-3 Trail Harvest] {inst_id} {'LONG' if is_long else 'SHORT'}: "
+                            f"Entry ${avg_px:,.4f} -> Peak ${peak:,.4f} (+{peak_pl_pct*100:.2f}%) -> Curr ${curr_px:,.4f} (+{spot_pl_pct*100:.2f}%)"
+                        )
+                        self.close_position(inst_id, f"WAVE_TRAIL_{spot_pl_pct*100:+.2f}PCT", spot_pl_pct)
+                        continue
+
+                # 6. Stage 4 Confirmed 1H MA20 Structure Reversal Early Exit (cuts fake waves early around -0.8%)
+                if sym_1h is not None:
+                    c1h, ma5_1h, ma20_1h = sym_1h["close"], sym_1h["ma5"], sym_1h["ma20"]
+                    if is_long and (c1h < ma20_1h * (1.0 - MA20_REV_BUFFER_PCT)) and (ma5_1h < ma20_1h):
+                        logger.info(
+                            f"✂️ [1H MA20 Structure Exit] {inst_id} LONG invalidated: 1H Close ${c1h:,.4f} < MA20 ${ma20_1h:,.4f} & MA5 < MA20 "
+                            f"(Spot PnL {spot_pl_pct*100:+.2f}%)"
+                        )
+                        self.close_position(inst_id, f"1H_MA20_EXIT_{spot_pl_pct*100:+.2f}PCT", spot_pl_pct)
+                        continue
+                    elif (not is_long) and (c1h > ma20_1h * (1.0 + MA20_REV_BUFFER_PCT)) and (ma5_1h > ma20_1h):
+                        logger.info(
+                            f"✂️ [1H MA20 Structure Exit] {inst_id} SHORT invalidated: 1H Close ${c1h:,.4f} > MA20 ${ma20_1h:,.4f} & MA5 > MA20 "
+                            f"(Spot PnL {spot_pl_pct*100:+.2f}%)"
+                        )
+                        self.close_position(inst_id, f"1H_MA20_EXIT_{spot_pl_pct*100:+.2f}PCT", spot_pl_pct)
+                        continue
 
             except Exception as e:
                 logger.error(f"Position manage error for {inst_id}: {e}")
 
-    # ── ENTRY LOGIC ──
+    # ── 4-MAJOR DOMINANCE WAVE ENTRY ENGINE ──
     def evaluate_trading_opportunities(self):
-        """Scans BTC Macro, applies Chop Filter, and enters Long or Short"""
+        """Evaluates 4-Major Synchronization (BTC, ETH, SOL, XRP) on 1H MA(5/10/20) + 15m EMA(9/20)."""
         if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
             return
 
-        # 1. Macro Trend Gate (BTC-USDT-SWAP 5Min, confirmed candles)
-        btc_bars = self.fetch_bars("BTC-USDT-SWAP", bar="5m", limit=100)
-        btc_tech = self.calculate_technical_signals(btc_bars)
-        btc_px = btc_tech.get("price", 0.0)
-        btc_e50 = btc_tech.get("ema50", 0.0)
+        # 1. Fetch & Analyze 1H Wave Structure across all 4 Majors
+        w1h_map: Dict[str, Dict[str, Any]] = {}
+        for sym in TARGET_SYMBOLS:
+            info_1h = self.analyze_1h_wave(self.fetch_bars(sym, bar="1H", limit=80))
+            if info_1h is None:
+                return
+            w1h_map[sym] = info_1h
 
-        if btc_px <= 0 or btc_e50 <= 0:
+        btc_1h = w1h_map["BTC-USDT-SWAP"]
+        btc_15m = self.analyze_15m_wave(self.fetch_bars("BTC-USDT-SWAP", bar="15m", limit=60))
+        if btc_15m is None:
             return
 
-        macro_bullish = btc_px > (btc_e50 * 1.001)
-        macro_bearish = btc_px < (btc_e50 * 0.999)
+        bull_cnt, bear_cnt = 0, 0
+        for sym in TARGET_SYMBOLS:
+            m = w1h_map[sym]
+            if m["close"] > m["ma20"] and m["ma5"] > m["ma10"]:
+                bull_cnt += 1
+            elif m["close"] < m["ma20"] and m["ma5"] < m["ma10"]:
+                bear_cnt += 1
 
-        # 1.1 Higher Timeframe (15m) BTC Confirmation (MTF Filter)
-        btc_15m_bars = self.fetch_bars("BTC-USDT-SWAP", bar="15m", limit=50)
-        if btc_15m_bars is not None and len(btc_15m_bars) >= 20:
-            btc_15m_tech = self.calculate_technical_signals(btc_15m_bars)
-            btc_15m_px = btc_15m_tech.get("price", 0.0)
-            btc_15m_e50 = btc_15m_tech.get("ema50", 0.0)
-            if btc_15m_px > 0 and btc_15m_e50 > 0:
-                if macro_bullish and not (btc_15m_px > btc_15m_e50):
-                    logger.debug("⏳ [MTF BTC Filter] 5m is Bullish but 15m is below EMA50. Skipping chop.")
-                    macro_bullish = False
-                elif macro_bearish and not (btc_15m_px < btc_15m_e50):
-                    logger.debug("⏳ [MTF BTC Filter] 5m is Bearish but 15m is above EMA50. Skipping chop.")
-                    macro_bearish = False
+        bc1h, bm5, bm10, bm20 = btc_1h["close"], btc_1h["ma5"], btc_1h["ma10"], btc_1h["ma20"]
+        bslope = btc_1h["ma20_slope3"]
+        bm5_slope = btc_1h["ma5_slope1"]
+        bret3 = btc_1h["ret3"]
+        btc_wave_ts = btc_1h["wave_ts"]
+        btc_wave_age = btc_1h["wave_age"]
+        bc15, be20_15 = btc_15m["close"], btc_15m["ema20"]
 
-        if not (macro_bullish or macro_bearish):
+        bull_vel_ok = (bslope >= MIN_BTC_MA20_SLOPE3_PCT) or (
+            bslope >= MIN_BTC_IMPULSE_SLOPE3_PCT
+            and bm5_slope >= MIN_BTC_IMPULSE_MA5_SLOPE1_PCT
+            and bret3 >= MIN_BTC_IMPULSE_RET3_PCT
+        )
+        bear_vel_ok = (bslope <= -MIN_BTC_MA20_SLOPE3_PCT) or (
+            bslope <= -MIN_BTC_IMPULSE_SLOPE3_PCT
+            and bm5_slope <= -MIN_BTC_IMPULSE_MA5_SLOPE1_PCT
+            and bret3 <= -MIN_BTC_IMPULSE_RET3_PCT
+        )
+
+        sync_bull = (
+            (bc1h > bm20) and (bm5 > bm10) and (bc15 > be20_15)
+            and (bull_cnt >= MIN_SYNC_BREADTH) and bull_vel_ok
+        )
+        sync_bear = (
+            (bc1h < bm20) and (bm5 < bm10) and (bc15 < be20_15)
+            and (bear_cnt >= MIN_SYNC_BREADTH) and bear_vel_ok
+        )
+        is_impulse_brk = (sync_bull and bslope < MIN_BTC_MA20_SLOPE3_PCT) or (sync_bear and bslope > -MIN_BTC_MA20_SLOPE3_PCT)
+        max_dist_cap = MAX_IMPULSE_DIST_1H_MA20_PCT if is_impulse_brk else MAX_DIST_1H_MA20_PCT
+
+        now = time.time()
+        if now - self.last_radar_log >= RADAR_LOG_INTERVAL_SEC:
+            self.last_radar_log = now
+            regime_str = f"SYNC_BULL ({MIN_SYNC_BREADTH}/4)" if sync_bull else (f"SYNC_BEAR ({MIN_SYNC_BREADTH}/4)" if sync_bear else f"STANDBY ({bull_cnt}L/{bear_cnt}S, need {MIN_SYNC_BREADTH}/4)")
+            logger.info(
+                f"📡 [V4.1-Pro 4-Major Radar] {regime_str} | BTC 1H=${bc1h:,.1f} vs MA20=${bm20:,.1f} "
+                f"(Slope3H {bslope:+.2f}%, MA5Slp {bm5_slope:+.2f}%, Age {btc_wave_age}h) | Open Slots: {len(self.positions)}/{MAX_CONCURRENT_POSITIONS}"
+            )
+
+        if not (sync_bull or sync_bear):
             return
 
-        btc_ret_1h = btc_tech.get("recent_return_pct", 0.0) / 100.0
-        candidates = []
+        target_side = "buy" if sync_bull else "sell"
+        pos_desc = "LONG" if sync_bull else "SHORT"
+        candidates: List[Tuple[str, float, float, Dict[str, Any], Dict[str, Any]]] = []
 
+        # 2. Filter & Score Individual Coins in TARGET_SYMBOLS
         for sym in TARGET_SYMBOLS:
             if sym in self.positions:
                 continue
-            if time.time() < self.trade_cooldowns.get(sym, 0.0):
+            if now < self.trade_cooldowns.get(sym, 0.0):
+                continue
+            lock_key = f"{sym}:{pos_desc}"
+            if now < self.side_lockout_until.get(lock_key, 0.0):
                 continue
 
-            df = self.fetch_bars(sym, bar="5m", limit=100)
-            tech = self.calculate_technical_signals(df)
+            s1h = w1h_map[sym]
+            sym_wave_ts = s1h["wave_ts"]
+            sym_wave_age = s1h["wave_age"]
 
-            # 2. Chop Filter: Reject low volatility / sideways noise
-            atr_ratio = tech.get("atr_ratio", 0.0)
-            if atr_ratio < MIN_ATR_RATIO:
-                logger.debug(f"⏳ [Chop Filter Active] {sym} ATR ratio {atr_ratio*100:.3f}% < {MIN_ATR_RATIO*100:.2f}%. Skipping chop.")
+            # One-Wave-One-Shot Lock: never re-enter an already-traded wave
+            if f"{sym}:BTC:{btc_wave_ts}" in self.traded_waves or f"{sym}:SYM:{sym_wave_ts}" in self.traded_waves:
+                continue
+            if btc_wave_age > MAX_BTC_WAVE_AGE_HRS and sym_wave_age > MAX_SYM_LATE_WAVE_HRS:
                 continue
 
-            # 2.05 Dead-Volume Fakeout Filter (v3.3): Require 5m Vol(3)/Vol(20) >= 0.80x participation
-            vol_ratio = tech.get("vol_ratio", 1.0)
-            if vol_ratio < MIN_VOL_RATIO:
-                logger.debug(f"⏳ [Dead-Volume Filter] {sym} 5m Vol(3/20) {vol_ratio:.2f}x < {MIN_VOL_RATIO:.2f}x. Skipping illiquid drift.")
+            if s1h["ma_spread_pct"] < MIN_1H_MA_SPREAD_PCT or s1h["adx"] < MIN_1H_ADX:
                 continue
 
-            # 2.1 Overextension Guard: Reject chasing when price is already detached from 5m EMA20
-            dist_ema20 = tech.get("dist_ema20_pct", 0.0)
-            if tech["signal"] == "SELL" and dist_ema20 < -MAX_EMA20_DIST_PCT:
-                logger.info(f"⏳ [Overextension Guard] {sym} SHORT skipped: Price is {dist_ema20:.2f}% below EMA20 (overextended sell/bounce trap).")
-                continue
-            if tech["signal"] == "BUY" and dist_ema20 > MAX_EMA20_DIST_PCT:
-                logger.info(f"⏳ [Overextension Guard] {sym} LONG skipped: Price is +{dist_ema20:.2f}% above EMA20 (overextended buy/pullback trap).")
+            s15 = btc_15m if sym == "BTC-USDT-SWAP" else self.analyze_15m_wave(self.fetch_bars(sym, bar="15m", limit=60))
+            if s15 is None:
                 continue
 
-            # 2.2 Higher Timeframe (15m) Trend & Support/Resistance Confirmation
-            bars_15m = self.fetch_bars(sym, bar="15m", limit=30)
-            if bars_15m is not None and len(bars_15m) >= 20:
-                tech_15m = self.calculate_technical_signals(bars_15m)
-                dist_15m = tech_15m.get("dist_ema20_pct", 0.0)
-                px_15m = tech_15m.get("price", 0.0)
-                ema20_15m = tech_15m.get("ema20", 0.0)
-                if macro_bearish and tech["signal"] == "SELL":
-                    if tech_15m.get("signal") == "BUY" or dist_15m < -2.2 or (ema20_15m > 0 and px_15m > ema20_15m):
-                        logger.info(f"⏳ [15M Trend Guard] {sym} SHORT skipped: 15m signal is {tech_15m.get('signal')} or 15m above EMA20 / oversold ({dist_15m:.2f}%).")
-                        continue
-                elif macro_bullish and tech["signal"] == "BUY":
-                    if tech_15m.get("signal") == "SELL" or dist_15m > 2.2 or (ema20_15m > 0 and px_15m < ema20_15m):
-                        logger.info(f"⏳ [15M Trend Guard] {sym} LONG skipped: 15m signal is {tech_15m.get('signal')} or 15m below EMA20 / overbought ({dist_15m:.2f}%).")
-                        continue
+            c1h, ma5, ma10, ma20 = s1h["close"], s1h["ma5"], s1h["ma10"], s1h["ma20"]
+            dma20, m5_slp = s1h["dist_ma20"], s1h["ma5_slope1"]
+            c15, e9_15, e20_15 = s15["close"], s15["ema9"], s15["ema20"]
 
-            # 3. Signal Direction & Relative Strength (RS) Ranking vs BTC
-            if not ((macro_bullish and tech["signal"] == "BUY") or (macro_bearish and tech["signal"] == "SELL")):
+            if sync_bull:
+                ok_1h = (
+                    (c1h > ma20) and (c1h > ma5) and (ma5 > ma10 >= ma20 * 0.999)
+                    and (m5_slp > 0.05) and (MIN_DIST_1H_MA20_PCT <= dma20 <= max_dist_cap)
+                )
+                ok_15 = (c15 > e9_15 > e20_15) and (s15["adx"] >= MIN_15M_ADX)
+            else:
+                ok_1h = (
+                    (c1h < ma20) and (c1h < ma5) and (ma5 < ma10 <= ma20 * 1.001)
+                    and (m5_slp < -0.05) and (-max_dist_cap <= dma20 <= -MIN_DIST_1H_MA20_PCT)
+                )
+                ok_15 = (c15 < e9_15 < e20_15) and (s15["adx"] >= MIN_15M_ADX)
+
+            if not (ok_1h and ok_15) or s15["vol_ratio"] < MIN_15M_VOL_RATIO:
                 continue
 
-            # 3.05 1H Climax Exhaustion Guard (v3.3): Block chasing >4.5% directional extension from 1H EMA50
-            dist_1h_ema50 = 0.0
-            bars_1h = self.fetch_bars(sym, bar="1H", limit=100)
-            if bars_1h is not None and len(bars_1h) >= 25:
-                tech_1h = self.calculate_technical_signals(bars_1h)
-                dist_1h_ema50 = tech_1h.get("dist_ema50_pct", 0.0)
-                if macro_bullish and dist_1h_ema50 > MAX_1H_EMA50_DIST_PCT:
-                    logger.info(f"⏳ [1H Climax Guard] {sym} LONG skipped: 1H price is +{dist_1h_ema50:.2f}% above 1H EMA50 (> +{MAX_1H_EMA50_DIST_PCT:.1f}% climax top).")
-                    continue
-                if macro_bearish and dist_1h_ema50 < -MAX_1H_EMA50_DIST_PCT:
-                    logger.info(f"⏳ [1H Climax Guard] {sym} SHORT skipped: 1H price is {dist_1h_ema50:.2f}% below 1H EMA50 (< -{MAX_1H_EMA50_DIST_PCT:.1f}% climax bottom).")
-                    continue
+            score = s1h["ret3"] if sync_bull else -s1h["ret3"]
+            candidates.append((sym, score, s15["atr_ratio"], s1h, s15))
 
-            sym_ret_1h = tech.get("recent_return_pct", 0.0) / 100.0
-            rs_vs_btc = (sym_ret_1h - btc_ret_1h) if macro_bullish else (btc_ret_1h - sym_ret_1h)
+        if not candidates:
+            return
 
-            # High-Beta SUI Gate: Only allow SUI when it exhibits strong >= +1.5% 1H RS outperformance vs BTC
-            if sym == "SUI-USDT-SWAP" and rs_vs_btc < SUI_MIN_RS_OUTPERFORM:
-                logger.debug(f"⏳ [SUI RS Filter] SUI 1H RS vs BTC ({rs_vs_btc*100:+.2f}%) < +{SUI_MIN_RS_OUTPERFORM*100:.1f}% threshold. Prioritizing SOL/DOGE.")
-                continue
-
-            candidates.append((sym, tech, atr_ratio, rs_vs_btc, vol_ratio, dist_1h_ema50))
-
-        # Sort candidates by Relative Strength (strongest momentum leader first)
-        candidates.sort(key=lambda x: x[3], reverse=True)
-
-        for sym, tech, atr_ratio, rs_vs_btc, vol_ratio, dist_1h_ema50 in candidates:
+        # 3. Rank by 3H Wave Momentum Leadership & Execute Top Slots
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        for sym, score, atr15, s1h, s15 in candidates:
             if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
                 break
 
-            px, imb = self.get_ticker_and_imbalance(sym)
-            target_side = None
-            if macro_bullish and tech["signal"] == "BUY" and imb >= MIN_LOB_IMBALANCE:
-                target_side = "buy"  # LONG
-            elif macro_bearish and tech["signal"] == "SELL" and imb <= -MIN_LOB_IMBALANCE:
-                target_side = "sell"  # SHORT
-
-            if target_side is None:
-                continue
-
-            # 3.1 Perpetual Swap Funding Rate Contrarian Squeeze Filter
             funding_rate = self.get_funding_rate(sym)
-            if target_side == "buy" and funding_rate >= MAX_LONG_FUNDING_RATE:
-                logger.info(f"⏳ [Funding Squeeze Filter] {sym} LONG skipped: Funding rate {funding_rate*100:+.4f}% >= +{MAX_LONG_FUNDING_RATE*100:.2f}% (Long Squeeze risk).")
+            if sync_bull and funding_rate >= MAX_LONG_FUNDING_RATE:
+                logger.info(f"⏳ [Funding Squeeze Guard] {sym} LONG skipped: Funding {funding_rate*100:+.4f}% >= +{MAX_LONG_FUNDING_RATE*100:.2f}%")
                 continue
-            if target_side == "sell" and funding_rate <= MIN_SHORT_FUNDING_RATE:
-                logger.info(f"⏳ [Funding Squeeze Filter] {sym} SHORT skipped: Funding rate {funding_rate*100:+.4f}% <= {MIN_SHORT_FUNDING_RATE*100:.2f}% (Short Squeeze risk).")
+            if sync_bear and funding_rate <= MIN_SHORT_FUNDING_RATE:
+                logger.info(f"⏳ [Funding Squeeze Guard] {sym} SHORT skipped: Funding {funding_rate*100:+.4f}% <= {MIN_SHORT_FUNDING_RATE*100:.2f}%")
                 continue
 
-            # Dynamic ATR parameters (v3.3 validated: SL 1.6%~3.5%, TP 2.5*SL: 4.0%~8.5%, Peak-Latched Trail Arm 1.2*SL, Drop 0.40*SL)
-            dyn_sl_pct = max(0.016, min(0.035, 2.2 * atr_ratio))
-            dyn_tp_pct = max(0.040, min(0.085, 2.5 * dyn_sl_pct))
-            dyn_trail_arm = max(0.018, dyn_sl_pct * 1.2)
-            dyn_trail_drop = max(0.006, dyn_sl_pct * 0.40)
+            base_sl = BASE_SL_CORE if sym in ("BTC-USDT-SWAP", "ETH-USDT-SWAP") else BASE_SL_ALT
+            dyn_sl_pct = max(base_sl, min(MAX_DYN_SL_PCT, DYN_SL_ATR_MULT * atr15))
+            px, imb = self.get_ticker_and_imbalance(sym)
+            ref_px = px if px > 0 else s15["close"]
 
-            pos_desc = "LONG" if target_side == "buy" else "SHORT"
             logger.info(
-                f"🔎 [Signal Detected] {sym} {pos_desc} | Price: ${px:,.4f} | Vol(3/20): {vol_ratio:.2f}x | "
-                f"1H DistE50: {dist_1h_ema50:+.2f}% | RS vs BTC: {rs_vs_btc*100:+.2f}% | "
-                f"Funding: {funding_rate*100:+.4f}% | Imb: {imb:+.2f} | ATR: {atr_ratio*100:.2f}% | "
-                f"Dyn SL: -{dyn_sl_pct*100:.2f}%, TP: +{dyn_tp_pct*100:.2f}%"
+                f"🌊 [{MIN_SYNC_BREADTH}/4 Wave Signal] {sym} {pos_desc} ({LEVERAGE}x) | Px: ${ref_px:,.4f} | "
+                f"1H DistMA20: {s1h['dist_ma20']:+.2f}% | Spread: {s1h['ma_spread_pct']:.2f}% | "
+                f"ADX(1H/15m): {s1h['adx']:.1f}/{s15['adx']:.1f} | 3H Ret: {s1h['ret3']:+.2f}% | "
+                f"WaveAge(BTC/{sym[:3]}): {btc_wave_age}h/{s1h['wave_age']}h | DynSL: -{dyn_sl_pct*100:.2f}%"
             )
 
-            # 4. Universal Jev AI Gate (trend prompt, strict fail-closed)
+            # 4. Universal Jev AI Gate (4-Major Wave Context)
             if self.jev_gate:
                 try:
                     decision = self.jev_gate.evaluate_sync(
@@ -785,16 +1066,26 @@ class OKXJevDemoTrader:
                         symbol=sym,
                         side=pos_desc,
                         context_metrics={
-                            **{k: tech[k] for k in ("price", "ema9", "ema20", "ema50",
-                                                     "dist_ema20_pct", "recent_return_pct", "lookback_bars")},
-                            "atr_pct": atr_ratio * 100,
-                            "vol_ratio": vol_ratio,
-                            "dist_1h_ema50_pct": dist_1h_ema50,
+                            "wave_sync_breadth": f"{bull_cnt if sync_bull else bear_cnt}/4",
+                            "btc_ma20_slope3_pct": bslope,
+                            "price": ref_px,
+                            "dist_1h_ma20_pct": s1h["dist_ma20"],
+                            "ma_spread_pct": s1h["ma_spread_pct"],
+                            "adx_1h": s1h["adx"],
+                            "adx_15m": s15["adx"],
+                            "vol_ratio": s15["vol_ratio"],
+                            "ret3_1h_pct": s1h["ret3"],
+                            "btc_wave_age_h": btc_wave_age,
+                            "sym_wave_age_h": s1h["wave_age"],
+                            "funding_rate_pct": funding_rate * 100.0,
                             "imbalance": imb,
-                            "rs_vs_btc_1h_pct": rs_vs_btc * 100,
-                            "funding_rate_pct": funding_rate * 100,
-                            "macro": f"BTC 5m {'BULLISH' if macro_bullish else 'BEARISH'} (P {btc_px:.1f} vs EMA50 {btc_e50:.1f}) | 15m MTF Confirmed",
-                            "sl_pct": dyn_sl_pct * 100, "tp_pct": dyn_tp_pct * 100,
+                            "atr_pct": atr15 * 100.0,
+                            "dist_ema20_pct": s15["dist_ema20_pct"],
+                            "recent_return_pct": s15["recent_return_pct"],
+                            "lookback_bars": s15["lookback_bars"],
+                            "macro": f"{MIN_SYNC_BREADTH}/4 Majors Synchronized {'BULL' if sync_bull else 'BEAR'} Wave (BTC 1H Slope {bslope:+.2f}%)",
+                            "sl_pct": dyn_sl_pct * 100.0,
+                            "tp_pct": WAVE_TP_PCT * 100.0,
                         },
                     )
                 except Exception as e:
@@ -807,10 +1098,16 @@ class OKXJevDemoTrader:
                     self.trade_cooldowns[sym] = time.time() + cd
                     logger.info(f"🚫 [Jev Veto] {sym} {pos_desc} (conf {decision.confidence:.2f}, {decision.latency_ms:.0f}ms): {decision.reason} -> cooldown {cd/60:.0f}m")
                     continue
-                logger.info(f"🧠 [Jev Approved] {sym} {pos_desc} (conf {decision.confidence:.2f}, {decision.latency_ms:.0f}ms{', fallback' if decision.is_fallback else ''}): {decision.reason}")
+                logger.info(f"🧠 [Jev Approved] {sym} {pos_desc} (conf {decision.confidence:.2f}, {decision.latency_ms:.0f}ms): {decision.reason}")
 
-            logger.info(f"🚀 Entering {sym} {pos_desc} on OKX Demo (Dyn SL -{dyn_sl_pct*100:.2f}%, TP +{dyn_tp_pct*100:.2f}%, TrailDrop -{dyn_trail_drop*100:.2f}%)")
-            self.open_position(sym, target_side, sl_pct=dyn_sl_pct, tp_pct=dyn_tp_pct, trail_arm=dyn_trail_arm, trail_drop=dyn_trail_drop)
+            self.open_position(
+                sym,
+                side=target_side,
+                sl_pct=dyn_sl_pct,
+                tp_pct=WAVE_TP_PCT,
+                btc_wave_ts=btc_wave_ts,
+                sym_wave_ts=s1h["wave_ts"],
+            )
 
     # ── MAIN LOOP ──
     def run(self):
@@ -819,8 +1116,8 @@ class OKXJevDemoTrader:
             logger.critical("⛔ OKX_DEMO_API_KEY / OKX_DEMO_SECRET / OKX_DEMO_PASSPHRASE missing in .env -> exiting")
             sys.exit(1)
 
-        logger.info("🟢 [OKX Jev Demo Trader] Optimal Bidirectional Engine running 24/7...")
-        send_telegram("[OKX Demo] 엔진 시작")
+        logger.info(f"🟢 [OKX Jev Demo Trader] Argon V4-Pro ({LEVERAGE}x Isolated, 4-Major Wave Rider) running 24/7...")
+        send_telegram(f"[OKX Demo] Argon V4-Pro S8 가동 ({LEVERAGE}x 격리, 증거금 {POSITION_MARGIN_PCT*100:.0f}%/슬롯, 4대 메이저 {MIN_SYNC_BREADTH}/4 파동 동조화)")
         self.sync_account()
         self.check_account_mode()
 
@@ -841,6 +1138,7 @@ class OKXJevDemoTrader:
                 logger.error(f"Loop exception: {e}", exc_info=True)
                 send_telegram(f"[OKX Demo] ❌ 루프 예외: {e}", dedupe_key="okx_loop_exc", min_interval_sec=1800)
                 time.sleep(10.0)
+
 
 if __name__ == "__main__":
     trader = OKXJevDemoTrader()

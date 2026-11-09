@@ -125,11 +125,11 @@ class UniversalJevGate:
             payload = {
                 "model": model_target,
                 "messages": [
-                    {"role": "system", "content": "You are a quantitative sub-second trading risk validator. Respond strictly in valid JSON format: {\"approved\": bool, \"confidence\": float (0.0~1.0), \"risk_level\": \"LOW\"|\"MEDIUM\"|\"HIGH\", \"reason\": string}"},
+                    {"role": "system", "content": "You are a quantitative sub-second trading risk validator. Keep reason concise (under 20 words). Respond strictly in valid JSON format: {\"approved\": bool, \"confidence\": float (0.0~1.0), \"risk_level\": \"LOW\"|\"MEDIUM\"|\"HIGH\", \"reason\": string}"},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.0,
-                "max_tokens": 120
+                "max_tokens": 350
             }
 
             timeout_sec = (self.timeout_ms or int(os.getenv("JEV_TIMEOUT_MS", "2500"))) / 1000.0
@@ -139,9 +139,19 @@ class UniversalJevGate:
                     data = await resp.json()
                     content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
                     
-                    # Clean and parse JSON
+                    # Clean and resiliently parse JSON (repairs truncated strings if needed)
                     clean_content = content.replace("```json", "").replace("```", "").strip()
-                    parsed = json.loads(clean_content)
+                    if "{" in clean_content:
+                        clean_content = clean_content[clean_content.find("{"):]
+                    try:
+                        parsed = json.loads(clean_content)
+                    except json.JSONDecodeError:
+                        repaired = clean_content.rstrip()
+                        if not repaired.endswith("}"):
+                            if repaired.count('"') % 2 == 1:
+                                repaired += '"'
+                            repaired += "}"
+                        parsed = json.loads(repaired)
 
                     confidence = float(parsed.get("confidence", 0.5))
                     approved = bool(parsed.get("approved", False)) and (confidence >= self.confidence_threshold)
@@ -274,10 +284,27 @@ class UniversalJevGate:
 
     def _build_prompt(self, asset_class: str, symbol: str, setup_name: str, context: Dict[str, Any]) -> str:
         if asset_class == "CRYPTO":
+            if "wave_sync_breadth" in context:
+                return (
+                    f"Asset: Crypto Perpetual Swap ({symbol}) | Setup: 4-Major Dominance Synchronized 1H Wave ({setup_name})\n"
+                    f"4-Major Synchronization (BTC/ETH/SOL/XRP): {context.get('wave_sync_breadth', '4/4')} aligned | "
+                    f"BTC 1H MA20 3H-Slope: {context.get('btc_ma20_slope3_pct', 0.0):+.2f}%\n"
+                    f"Price: ${context.get('price', 0):,.4f} | 1H Dist MA20: {context.get('dist_1h_ma20_pct', 0.0):+.2f}% | "
+                    f"1H MA(5-20) Spread: {context.get('ma_spread_pct', 0.0):.2f}%\n"
+                    f"1H ADX(14): {context.get('adx_1h', 0.0):.1f} | 15m ADX(14): {context.get('adx_15m', 0.0):.1f} | "
+                    f"15m Vol(3/20): {context.get('vol_ratio', 1.0):.2f}x | 3H Return: {context.get('ret3_1h_pct', 0.0):+.2f}%\n"
+                    f"Wave Age: BTC {context.get('btc_wave_age_h', 0)}h / {symbol} {context.get('sym_wave_age_h', 0)}h | "
+                    f"Funding: {context.get('funding_rate_pct', 0.0):+.4f}% | SL: -{context.get('sl_pct', 2.0):.2f}% / Wave TP: +{context.get('tp_pct', 10.0):.1f}%\n"
+                    f"Note: All 4 major crypto assets (BTC, ETH, SOL, XRP) have simultaneously aligned on confirmed 1H MA(5/10/20) and 15m EMA(9/20) early in the wave. "
+                    f"Short-term L1 orderbook noise is secondary on 1H wave breakouts.\n"
+                    f"Question: Is this synchronized 1H market-wide wave structurally sound for trend continuation (not an extreme funding squeeze or blow-off climax)?\n"
+                    f"Approve if structural wave continuation probability >= 60%."
+                )
             if "macro" in context or "dist_ema20_pct" in context:
                 extra_lines = ""
                 if "vol_ratio" in context or "dist_1h_ema50_pct" in context:
                     extra_lines = (
+                        f"ADX(14): {context.get('adx', 0.0):.1f} | "
                         f"Volume Ratio (3/20): {context.get('vol_ratio', 1.0):.2f}x | "
                         f"1H Dist EMA50: {context.get('dist_1h_ema50_pct', 0.0):+.2f}% | "
                         f"1H RS vs BTC: {context.get('rs_vs_btc_1h_pct', 0.0):+.2f}% | "
@@ -301,14 +328,40 @@ class UniversalJevGate:
                 f"Approve only if continuation probability >= 65%."
             )
         elif asset_class == "US_STOCKS":
+            if "us_v4_pod" in context:
+                pod = context.get("us_v4_pod", "BULL_DIP")
+                bmk = context.get("benchmark", symbol)
+                return (
+                    f"Asset: US Equities/ETF ({symbol}) | Direction: {setup_name} | Strategy Pod: Argon US V4-Pro ({pod})\n"
+                    f"Sector Benchmark ({bmk}) Daily Regime: {context.get('daily_regime', 'N/A')}\n"
+                    f"Price: ${context.get('price', 0):,.2f} | Benchmark 1H RSI(2): {context.get('bmk_rsi2', 50.0):.1f} | "
+                    f"Benchmark 1H Z-Score(20): {context.get('bmk_z20', 0.0):+.2f} | 1H RSI(14): {context.get('rsi14', 50.0):.1f}\n"
+                    f"Cross-Sector Breadth: {context.get('sector_breadth', 'N/A')} | 7H Return: {context.get('ret7_pct', 0.0):+.2f}% | "
+                    f"SL: -{context.get('sl_pct', 5.5):.1f}% / TP: +{context.get('tp_pct', 14.0):.1f}%\n"
+                    f"Strategy Note: "
+                    f"{'Connors RSI(2) institutional mean-reversion dip-buy inside a confirmed Daily Uptrend (low RSI2 and negative Z-score are the intended buy-low trigger, NOT a reason to veto).' if pod == 'BULL_DIP' else ('Institutional Bear-Regime relief-rally fade using 3x Inverse ETF or Index Native Short when an oversold downtrend index bounces into extreme 1H RSI(2) >= 85 overbought territory.' if pod == 'BEAR_RIP' else 'Synchronized 3+/4 US cross-sector 1H EMA(9<21<50) waterfall breakdown momentum.')}\n"
+                    f"Question: Is this {pod} quantitative setup structurally valid to execute (no catastrophic data anomaly or extreme spread distortion)?\n"
+                    f"Approve if structural validity probability >= 60%."
+                )
             if "macro" in context or "dist_ema20_pct" in context:
+                inv_note = ""
+                if symbol in ("SQQQ", "SOXS", "SPXS", "PSQ"):
+                    inv_note = (
+                        f"Instrument Note: {symbol} is an INVERSE BEAR ETF that RISES when Nasdaq/Semiconductors fall. "
+                        f"Going LONG {symbol} during a QQQ BEARISH macro trend is a trend-following trade aligned with the market selloff.\n"
+                    )
+                extra_eq = ""
+                if "rsi" in context or "day_ret_pct" in context:
+                    extra_eq = f"RSI(14): {context.get('rsi', 55.0):.1f} | Intraday Return from Open: {context.get('day_ret_pct', 0.0):+.2f}%\n"
                 return (
                     f"Asset: US Equities ({symbol}) | Setup: Trend Continuation ({setup_name})\n"
+                    f"{inv_note}"
                     f"Price: ${context.get('price', 0):,.2f} | Dist from EMA20: {context.get('dist_ema20_pct', 0):+.2f}%\n"
                     f"Macro Trend: {context.get('macro', 'N/A')} | L1 Imbalance: {context.get('imbalance', 0):+.2f}\n"
                     f"ATR Volatility: {context.get('atr_pct', 0):.2f}% | SL: -{context.get('sl_pct', 1.2):.1f}% | TP: +{context.get('tp_pct', 2.8):.1f}%\n"
                     f"Recent Return ({context.get('lookback_bars', 15)} bars): {context.get('recent_return_pct', 0):+.2f}%\n"
-                    f"Question: Is this a high-probability momentum continuation, or an overextended buying trap near resistance?\n"
+                    f"{extra_eq}"
+                    f"Question: Is this a high-probability momentum continuation aligned with the macro regime, or an overextended climax trap?\n"
                     f"Approve only if continuation probability >= 65%."
                 )
             surge = context.get('surge_pct') or context.get('gap_pct', 0)
