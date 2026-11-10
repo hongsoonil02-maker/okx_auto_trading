@@ -20,7 +20,35 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SYMS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP"]
 CORE = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
 
-# ── 데이터 ──────────────────────────────────────────────
+# ── 데이터 / 체결 수익률 ─────────────────────────────────
+def linear_return(entry_px, exit_px, is_long):
+    """USDT-margined linear swap return; live trader와 동일한 가격 PnL식."""
+    if is_long:
+        return exit_px / entry_px - 1.0
+    return (entry_px - exit_px) / entry_px
+
+
+def align_15m_to_confirmed_1h(d15raw, ref_ts):
+    """1H 확정 시점에 실전에서 보는 마지막 15m 확정봉(t+45m)을 맞춘다."""
+    out = {}
+    target_ts = np.asarray(ref_ts) + 45 * 60 * 1000
+    for s, f in d15raw.items():
+        idx = np.searchsorted(f["ts"].values, target_ts, side="right") - 1
+        idx = np.clip(idx, 0, len(f) - 1)
+        out[s] = f.iloc[idx].reset_index(drop=True)
+    return out
+
+
+def trim_1h_to_15m_coverage(data_1h, data_15m_raw):
+    """1H 확정 시점에 실제 존재하는 15m 봉만 사용하도록 양끝을 자른다."""
+    start = max(f["ts"].iloc[0] for f in data_15m_raw.values()) - 45 * 60 * 1000
+    end = min(f["ts"].iloc[-1] for f in data_15m_raw.values()) - 45 * 60 * 1000
+    return {
+        s: f[(f["ts"] >= start) & (f["ts"] <= end)].reset_index(drop=True)
+        for s, f in data_1h.items()
+    }
+
+
 def fetch(inst, bar, target):
     f = os.path.join(DATA_DIR, f"{inst}_{bar}_v4.pkl")
     if os.path.exists(f):
@@ -74,6 +102,8 @@ def prep_1h(df):
     grp = (above != above.shift()).cumsum()
     df["wave_start"] = df.groupby(grp).cumcount().pipe(lambda x: df.index - x)
     df["wave_age"] = df.groupby(grp).cumcount()
+    df["ema20d"] = c.ewm(span=20 * 24, adjust=False).mean()
+    df["ema20d_slope3d"] = (df["ema20d"] / df["ema20d"].shift(3 * 24) - 1) * 100
     return df
 
 def prep_15m(df):
@@ -104,6 +134,10 @@ BASE = dict(
     streak_lock=2, lockout_bars=4,
     deleverage=False,              # S4: 연패 시 20→10→5
     fee=0.0005,
+    risk_sizing=False, risk_per_trade=0.005, max_total_risk=0.012,
+    risk_fee=0.001, risk_slip=0.001,
+    daily_stop=False, daily_stop_pct=0.02,
+    daily_filter=False, daily_slope_min=0.20,
 )
 SCEN = {
     "S0_현행_20x":        {},
@@ -112,6 +146,17 @@ SCEN = {
     "S3_게이트3/4":       {"breadth": 3},
     "S4_연패디레버리징":   {"deleverage": True},
     "S5_트레일수확":      {"tp": 9.99, "s2_floor":0.015, "s3_arm":0.025, "s3_drop":0.007},
+    "S8_현재_10x_3of4":  {"leverage":10.0, "breadth":3,
+                           "base_sl_core":0.025, "base_sl_alt":0.025,
+                           "max_dyn_sl":0.040, "dyn_mult":3.0, "tp":0.05},
+    "R1_S8_리스크0.5%":  {"leverage":10.0, "breadth":3,
+                           "base_sl_core":0.025, "base_sl_alt":0.025,
+                           "max_dyn_sl":0.040, "dyn_mult":3.0, "tp":0.05,
+                           "risk_sizing":True},
+    "R2_S8_리스크+일손실2%": {"leverage":10.0, "breadth":3,
+                           "base_sl_core":0.025, "base_sl_alt":0.025,
+                           "max_dyn_sl":0.040, "dyn_mult":3.0, "tp":0.05,
+                           "risk_sizing":True, "daily_stop":True},
 }
 LIQ_ADVERSE = {20.0: 0.040, 10.0: 0.090, 5.0: 0.190}   # 격리 청산까지 역행폭 근사
 
@@ -126,8 +171,20 @@ def run(data1h, data15, cfg0, start_eq=5000.0):
     streak = {}         # (sym,side) -> int
     traded_waves = set()
     trades = []
-    eq_curve = []
+    eq_curve = [start_eq]
     liq_count = 0
+    current_day = None
+    daily_start_eq = start_eq
+    daily_realized = 0.0
+
+    def equity_mtm(bar_idx):
+        """확정손익 + 보유 포지션의 종가 기준 미실현·예상 수수료."""
+        value = eq
+        for s, p in pos.items():
+            close_px = data1h[s]["close"].iloc[bar_idx]
+            unrealized = linear_return(p["entry"], close_px, p["side"] == "LONG")
+            value += p["margin"] * p["lev"] * (unrealized - 2 * cfg["fee"])
+        return value
 
     def lev_for(sym, side):
         if not cfg["deleverage"]: return cfg["leverage"]
@@ -136,6 +193,11 @@ def run(data1h, data15, cfg0, start_eq=5000.0):
 
     for t in range(60, n - 1):
         b_ts = data1h["BTC-USDT-SWAP"]["ts"].iloc[t]
+        bar_day = pd.to_datetime(b_ts, unit="ms").date()
+        if bar_day != current_day:
+            current_day = bar_day
+            daily_start_eq = eq
+            daily_realized = 0.0
         # ── 포지션 관리 (봉 t 인트라바: 시가→고저→종가) ──
         for sym in list(pos.keys()):
             p = pos[sym]; d = data1h[sym]
@@ -147,10 +209,11 @@ def run(data1h, data15, cfg0, start_eq=5000.0):
             # 피크 갱신
             if is_long: p["peak"] = max(p["peak"], fav)
             else:       p["peak"] = min(p["peak"], fav)
-            peak_pl = (p["peak"]/ent-1) if is_long else (ent/p["peak"]-1)
+            peak_pl = linear_return(ent, p["peak"], is_long)
             # 청산(갭): 불리 극값이 청산선 돌파
             liq_line = LIQ_ADVERSE.get(p["lev"], 0.040)
-            adverse = (ent/adv-1) if is_long else (adv/ent-1)
+            adverse = -linear_return(ent, adv, is_long)
+            p["mae_pct"] = max(p.get("mae_pct", 0.0), adverse * 100.0)
             exit_px, reason = None, None
             if adverse >= liq_line:
                 exit_px, reason = ent*(1-(liq_line if is_long else -liq_line)), "LIQUIDATED"
@@ -158,9 +221,9 @@ def run(data1h, data15, cfg0, start_eq=5000.0):
             elif adverse >= p["sl"]:
                 exit_px, reason = ent*(1-p["sl"] if is_long else 1+p["sl"]), "STOP_LOSS"
             else:
-                cur_pl_lo = (lo/ent-1) if is_long else (ent/hi-1)   # 봉 내 최악 수익률
+                cur_pl_lo = linear_return(ent, adv, is_long)   # 봉 내 최악 수익률
                 # TP
-                fav_pl = (fav/ent-1) if is_long else (ent/fav-1)
+                fav_pl = linear_return(ent, fav, is_long)
                 if fav_pl >= p["tp"]:
                     exit_px, reason = ent*(1+p["tp"] if is_long else 1-p["tp"]), "WAVE_TP"
                 # Stage2 플로어
@@ -172,7 +235,7 @@ def run(data1h, data15, cfg0, start_eq=5000.0):
                 # Stage3 트레일
                 elif peak_pl >= cfg["s3_arm"]:
                     trail_px = p["peak"]*(1-cfg["s3_drop"]) if is_long else p["peak"]*(1+cfg["s3_drop"])
-                    trail_pl = (trail_px/ent-1) if is_long else (ent/trail_px-1)
+                    trail_pl = linear_return(ent, trail_px, is_long)
                     hit = (lo <= trail_px) if is_long else (hi >= trail_px)
                     if hit and trail_pl >= cfg["s3_min"]:
                         exit_px, reason = trail_px, "STAGE3_TRAIL"
@@ -184,12 +247,13 @@ def run(data1h, data15, cfg0, start_eq=5000.0):
                     elif (not is_long) and cl > ma20*(1+cfg["ma20_buf"]) and ma5 > ma20:
                         exit_px, reason = cl, "MA20_EXIT"
             if exit_px is not None:
-                pl = (exit_px/ent-1) if is_long else (ent/exit_px-1)
+                pl = linear_return(ent, exit_px, is_long)
                 if reason == "LIQUIDATED":
                     pnl = -p["margin"]; liq_count += 1
                 else:
                     pnl = p["margin"]*p["lev"]*(pl - 2*cfg["fee"])
                 eq += pnl
+                daily_realized += pnl
                 is_loss = pnl < 0
                 k = (sym, p["side"])
                 streak[k] = streak.get(k, 0) + 1 if is_loss else 0
@@ -198,12 +262,17 @@ def run(data1h, data15, cfg0, start_eq=5000.0):
                 cooldown_until[sym] = t + (cfg["post_loss_cd"] if is_loss else cfg["normal_cd"])
                 trades.append(dict(sym=sym, side=p["side"], lev=p["lev"], pnl=pnl,
                                    ret=pl*100, reason=reason, bars=t-p["t0"],
-                                   etime=str(pd.to_datetime(p["entry_ts"],unit="ms"))[:16]))
+                                   mfe=linear_return(ent, p["peak"], is_long)*100,
+                                   mae=-p.get("mae_pct", 0.0),
+                                   etime=str(pd.to_datetime(p["entry_ts"],unit="ms"))[:16],
+                                   xtime=str(pd.to_datetime(d["ts"].iloc[t],unit="ms"))[:16]))
                 del pos[sym]
 
         # ── 진입 평가 (봉 t 확정 기준 → t+1 시가 진입) ──
+        if cfg["daily_stop"] and daily_start_eq > 0 and daily_realized <= -daily_start_eq * cfg["daily_stop_pct"]:
+            eq_curve.append(equity_mtm(t)); continue
         if len(pos) >= cfg["max_pos"]:
-            eq_curve.append(eq); continue
+            eq_curve.append(equity_mtm(t)); continue
         w = {s: data1h[s].iloc[t] for s in syms}
         bull = sum(1 for s in syms if w[s]["close"] > w[s]["ma20"] and w[s]["ma5"] > w[s]["ma10"])
         bear = sum(1 for s in syms if w[s]["close"] < w[s]["ma20"] and w[s]["ma5"] < w[s]["ma10"])
@@ -217,8 +286,20 @@ def run(data1h, data15, cfg0, start_eq=5000.0):
         sync_bear = (bt["close"] < bt["ma20"] and bt["ma5"] < bt["ma10"] and b15["close"] < b15["ema20"]
                      and bear >= cfg["breadth"] and bear_vel)
         if not (sync_bull or sync_bear):
-            eq_curve.append(eq); continue
+            eq_curve.append(equity_mtm(t)); continue
         side = "LONG" if sync_bull else "SHORT"
+        if (side == "LONG" and not cfg.get("allow_long", True)) or (side == "SHORT" and not cfg.get("allow_short", True)):
+            eq_curve.append(equity_mtm(t)); continue
+        if cfg.get("daily_filter", False):
+            btc_row = data1h["BTC-USDT-SWAP"].iloc[t]
+            d_ema = btc_row["ema20d"]
+            d_slope = btc_row["ema20d_slope3d"]
+            if pd.isna(d_ema) or pd.isna(d_slope):
+                eq_curve.append(equity_mtm(t)); continue
+            if side == "LONG" and not (btc_row["close"] > d_ema and d_slope >= cfg["daily_slope_min"]):
+                eq_curve.append(equity_mtm(t)); continue
+            if side == "SHORT" and not (btc_row["close"] < d_ema and d_slope <= -cfg["daily_slope_min"]):
+                eq_curve.append(equity_mtm(t)); continue
         impulse = (sync_bull and bslope < cfg["slope3"]) or (sync_bear and bslope > -cfg["slope3"])
         dist_cap = cfg["max_dist_imp"] if impulse else cfg["max_dist"]
         cands = []
@@ -253,23 +334,39 @@ def run(data1h, data15, cfg0, start_eq=5000.0):
             sl = max(base_sl, min(cfg["max_dyn_sl"], cfg["dyn_mult"]*atr15))
             entry_px = data1h[s]["open"].iloc[t+1]
             lev = lev_for(s, side)
-            margin = min(eq*cfg["margin_pct"], cfg["margin_cap"])
+            risk_buffer = sl + cfg["risk_fee"] + cfg["risk_slip"]
+            if cfg["risk_sizing"]:
+                open_risk = sum(p["risk"] for p in pos.values())
+                allowed_risk = min(
+                    eq * cfg["risk_per_trade"],
+                    max(0.0, eq * cfg["max_total_risk"] - open_risk),
+                )
+                notional = allowed_risk / risk_buffer
+                margin = notional / lev
+                trade_risk = notional * risk_buffer
+            else:
+                margin = min(eq*cfg["margin_pct"], cfg["margin_cap"])
+                trade_risk = margin * lev * risk_buffer
             if margin < 50: continue
             pos[s] = dict(side=side, entry=entry_px, peak=entry_px, sl=sl, tp=cfg["tp"],
-                          lev=lev, margin=margin, t0=t+1, entry_ts=data1h[s]["ts"].iloc[t+1])
+                          lev=lev, margin=margin, risk=trade_risk, t0=t+1,
+                          entry_ts=data1h[s]["ts"].iloc[t+1])
             traded_waves.add((s, int(bt["wave_start"])))
             traded_waves.add((s, int(w[s]["wave_start"])))
-        eq_curve.append(eq)
+        eq_curve.append(equity_mtm(t))
 
+    final_eq = equity_mtm(n - 1)
     tr = pd.DataFrame(trades)
     if len(tr) == 0:
-        return dict(cfg=cfg0, trades=0)
+        return dict(cfg=cfg0, trades=0, final_eq=final_eq, net=final_eq-start_eq,
+                    ret_pct=(final_eq/start_eq-1)*100)
     wins = tr[tr.pnl > 0]; losses = tr[tr.pnl <= 0]
     eqs = pd.Series(eq_curve)
     mdd = ((eqs - eqs.cummax())/eqs.cummax()).min()*100
     return dict(
         cfg=cfg0, trades=len(tr), winrate=len(wins)/len(tr)*100,
-        net=tr.pnl.sum(), final_eq=eq, ret_pct=(eq/start_eq-1)*100,
+        net=final_eq-start_eq, closed_net=tr.pnl.sum(), final_eq=final_eq,
+        ret_pct=(final_eq/start_eq-1)*100,
         pf=(wins.pnl.sum()/abs(losses.pnl.sum())) if len(losses) and losses.pnl.sum() != 0 else float("inf"),
         avg_w=wins.pnl.mean() if len(wins) else 0, avg_l=losses.pnl.mean() if len(losses) else 0,
         expect=tr.pnl.mean(), mdd=mdd, liq=liq_count,
@@ -284,16 +381,13 @@ def main():
     t1h, t15 = days*24+80, days*96+80
     d1 = {s: prep_1h(fetch(s, "1H", t1h)) for s in SYMS}
     d15raw = {s: prep_15m(fetch(s, "15m", t15)) for s in SYMS}
-    # 15m → 1H 정렬 (1H 확정 시점의 마지막 15m 확정봉)
+    d1 = trim_1h_to_15m_coverage(d1, d15raw)
+    # 15m → 1H 정렬 (실전과 동일하게 1H 확정 시점의 마지막 15m 확정봉)
     ref_ts = d1["BTC-USDT-SWAP"]["ts"].values
-    d15 = {}
-    for s in SYMS:
-        f = d15raw[s]
-        idx = np.searchsorted(f["ts"].values, ref_ts, side="right") - 1
-        idx = np.clip(idx, 0, len(f)-1)
-        d15[s] = f.iloc[idx].reset_index(drop=True)
+    d15 = align_15m_to_confirmed_1h(d15raw, ref_ts)
     span0 = pd.to_datetime(ref_ts[60], unit="ms"); span1 = pd.to_datetime(ref_ts[-1], unit="ms")
-    print(f"\n백테스트 구간: {span0} ~ {span1} ({(ref_ts[-1]-ref_ts[60])/3.6e9:.1f}일, 1H봉 {len(ref_ts)-61}개)\n")
+    span_days = (span1 - span0).total_seconds() / 86400.0
+    print(f"\n백테스트 구간: {span0} ~ {span1} ({span_days:.1f}일, 1H봉 {len(ref_ts)-61}개)\n")
     rows = []
     for name, ov in SCEN.items():
         r = run(d1, d15, ov)
@@ -304,6 +398,19 @@ def main():
               f"({r['ret_pct']:+.1f}%) MDD {r['mdd']:.1f}% 기대 {r['expect']:+.1f}U TP도달 {r['tp_hits']}건 청산 {r['liq']}건")
         print(f"   사유: {r['reasons']}")
         print(f"   심볼: {r['by_sym']}")
+        tr = r["tr"]
+        mid_ts = span0 + (span1 - span0) / 2
+        exit_ts = pd.to_datetime(tr["xtime"])
+        for label, subset in (
+            ("전반", tr[exit_ts <= mid_ts]),
+            ("후반", tr[exit_ts > mid_ts]),
+            ("XRP제외", tr[tr["sym"] != "XRP-USDT-SWAP"]),
+        ):
+            wins = subset[subset.pnl > 0]["pnl"].sum()
+            losses = abs(subset[subset.pnl <= 0]["pnl"].sum())
+            pf = wins / losses if losses > 0 else float("inf")
+            wr = (subset.pnl > 0).mean() * 100 if len(subset) else 0.0
+            print(f"   {label}: {len(subset)}건 승률 {wr:.1f}% PF {pf:.2f} net {subset.pnl.sum():+.0f}U")
     pd.to_pickle(rows, os.path.join(DATA_DIR, "v4pro_scenario_results.pkl"))
 
 if __name__ == "__main__":
