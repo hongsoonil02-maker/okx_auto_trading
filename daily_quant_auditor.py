@@ -199,7 +199,7 @@ def run_daily_audit():
         f"• 모드: 10x Isolated Net-Mode — Argon V4-Pro S8 (100% Simulated)\n"
         f"• 보유 포지션: {o_pos_desc}\n\n"
         f"🛡️ 봇 엔진 상태:\n"
-        f"• Alpaca: 1H/15m 추세추종 + 4섹터 레이더 + Jev 게이트 Active\n"
+        f"• Alpaca: ⛔ 중지됨 (2026-11-10 — 알파 부재 검증 확정, 계좌는 100% 현금 보존)\n"
         f"• OKX: 4대 메이저 3/4 동조 + 1H 확정봉 + 서버사이드 SL Active\n"
         f"• 실계좌 잔고: 전액 출금 안전 보존 상태 ✅"
     )
