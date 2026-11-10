@@ -65,7 +65,7 @@ def check_and_deploy():
         return
 
     # 4. Preflight Python compile
-    py_files = ["alpaca_golden_trader.py", "okx_jev_demo_trader.py", "daily_quant_auditor.py"]
+    py_files = ["okx_jev_demo_trader.py", "daily_quant_auditor.py"]
     for pf in py_files:
         full_p = os.path.join(CURRENT_DIR, pf)
         if os.path.exists(full_p):
@@ -77,14 +77,14 @@ def check_and_deploy():
                 send_telegram(f"🚨 [GitOps 배포 롤백] {pf} 문법 검증 실패! 이전 버전({local_rev[:7]})으로 자동 롤백되었습니다.")
                 return
 
-    # 5. Restart trading services gracefully
-    code, restart_out = run_cmd("systemctl --user restart alpaca_golden_trader okx_jev_demo_trader")
+    # 5. Restart trading services gracefully (alpaca_golden_trader는 2026-11-10 알파 부재 검증으로 폐기 — 재시작 금지)
+    code, restart_out = run_cmd("systemctl --user restart okx_jev_demo_trader")
     if code == 0:
         msg = (
             f"🚀 [100-Bagger GitOps 무인 배포 완료]\n"
             f"• 신규 커밋: {remote_rev[:7]}\n"
             f"• 배포 시각: {datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S')} KST\n"
-            f"• 대상 서비스: alpaca_golden_trader, okx_jev_demo_trader\n"
+            f"• 대상 서비스: okx_jev_demo_trader\n"
             f"• 문법 사전 검증: 100% PASS ✅"
         )
         logger.info(msg)
