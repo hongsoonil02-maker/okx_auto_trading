@@ -302,6 +302,9 @@ class AlpacaETFRotationBot:
                             series_map[s] = pd.Series(pts).sort_index()
                     df = pd.DataFrame(series_map).sort_index()
                     if len(df) >= 210 and not df.iloc[-1].isna().any():
+                        age_days = (cutoff_date - df.index[-1]).days
+                        if age_days > 4:
+                            logger.warning(f"⚠️ Latest confirmed bar ({df.index[-1]}) is {age_days}d behind cutoff {cutoff_date} (feed={feed})")
                         logger.info(f"📊 Loaded {len(df)} confirmed daily bars (feed={feed}, last={df.index[-1]})")
                         return df
             except Exception as e:
@@ -341,7 +344,7 @@ class AlpacaETFRotationBot:
         except Exception as e:
             logger.warning(f"Cancel open orders warn: {e}")
 
-    def _submit_market_notional(self, sym: str, side: str, notional: float, ym: str) -> bool:
+    def _submit_market_notional(self, sym: str, side: str, notional: float, ym: str) -> Optional[str]:
         payload = {
             "symbol": sym,
             "notional": f"{notional:.2f}",
@@ -353,24 +356,54 @@ class AlpacaETFRotationBot:
         try:
             r = self.session.post(f"{ALPACA_REST_URL}/orders", headers=HEADERS, json=payload, timeout=10)
             if r.status_code in (200, 201):
-                oid = r.json().get("id")
+                oid = r.json().get("id") or "SUBMITTED"
                 logger.info(f"📤 [{side.upper()}] {sym} ${notional:,.2f} (ord={oid})")
-                return True
+                return oid
             logger.error(f"❌ Order rejected [{side} {sym} ${notional:,.2f}]: HTTP {r.status_code} {r.text[:200]}")
         except Exception as e:
             logger.error(f"❌ Order exception [{side} {sym}]: {e}")
-        return False
+        return None
 
-    def _close_full_position(self, sym: str) -> bool:
+    def _close_full_position(self, sym: str) -> Optional[str]:
         try:
             r = self.session.delete(f"{ALPACA_REST_URL}/positions/{sym}", headers=HEADERS, timeout=10)
-            if r.status_code in (200, 201, 404):
-                logger.info(f"📤 [CLOSE_ALL] {sym} (HTTP {r.status_code})")
-                return True
+            if r.status_code in (200, 201):
+                oid = r.json().get("id") if r.text else None
+                logger.info(f"📤 [CLOSE_ALL] {sym} (HTTP {r.status_code}, ord={oid})")
+                return oid or "SUBMITTED"
+            if r.status_code == 404:
+                logger.info(f"📤 [CLOSE_ALL] {sym} already flat (HTTP 404)")
+                return "ALREADY_FLAT"
             logger.error(f"❌ Close position failed [{sym}]: HTTP {r.status_code} {r.text[:200]}")
         except Exception as e:
             logger.error(f"❌ Close position exception [{sym}]: {e}")
-        return False
+        return None
+
+    def _wait_for_orders_settlement(self, order_ids: List[str], timeout_sec: float = 30.0) -> bool:
+        """Polls submitted sell/close order IDs until terminal status or timeout."""
+        pending = {oid for oid in order_ids if oid and oid not in ("ALREADY_FLAT", "SUBMITTED")}
+        if not pending:
+            time.sleep(2.0)
+            return True
+
+        terminal = {"filled", "canceled", "expired", "rejected", "replaced", "done_for_day"}
+        deadline = time.time() + timeout_sec
+        while pending and time.time() < deadline:
+            time.sleep(1.5)
+            for oid in list(pending):
+                try:
+                    r = self.session.get(f"{ALPACA_REST_URL}/orders/{oid}", headers=HEADERS, timeout=8)
+                    if r.status_code == 200:
+                        st = str(r.json().get("status", "")).lower()
+                        if st in terminal:
+                            pending.discard(oid)
+                except Exception as e:
+                    logger.debug(f"Order status poll err ({oid}): {e}")
+        if pending:
+            logger.warning(f"⚠️ {len(pending)} sell order(s) still pending after {timeout_sec:.0f}s: {sorted(pending)}")
+            return False
+        logger.info("✅ All sell orders settled before buy leg.")
+        return True
 
     def execute_rebalance(self, et_now: datetime, reason: str):
         acc, curr_vals = self.fetch_account_and_positions()
@@ -396,14 +429,16 @@ class AlpacaETFRotationBot:
         self._cancel_all_open_orders()
 
         all_ok = True
+        sell_order_ids: List[str] = []
         if sells:
             for o in sells:
-                ok = self._close_full_position(o["symbol"]) if o["action"] == "CLOSE_ALL" \
+                oid = self._close_full_position(o["symbol"]) if o["action"] == "CLOSE_ALL" \
                     else self._submit_market_notional(o["symbol"], "sell", o["notional"], current_ym)
-                if not ok:
+                if oid:
+                    sell_order_ids.append(oid)
+                else:
                     all_ok = False
-            # Wait briefly for sells to settle buying power / cash
-            time.sleep(4.0)
+            self._wait_for_orders_settlement(sell_order_ids, timeout_sec=30.0)
             acc2, curr_vals2 = self.fetch_account_and_positions()
             if acc2:
                 equity = float(acc2.get("equity", equity) or equity)

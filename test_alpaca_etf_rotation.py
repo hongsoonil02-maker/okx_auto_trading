@@ -76,6 +76,22 @@ class TestAlpacaETFRotation(unittest.TestCase):
         self.assertTrue(due_next)
         self.assertIn("MONTHLY_REBALANCE", reason_next)
 
+    def test_wait_for_orders_settlement_polls_until_filled(self):
+        from unittest.mock import MagicMock, patch
+        bot = object.__new__(bot_mod.AlpacaETFRotationBot)
+        statuses = ["new", "partially_filled", "filled"]
+        def fake_get(url, headers=None, timeout=8):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"status": statuses.pop(0)}
+            return resp
+        bot.session = MagicMock()
+        bot.session.get.side_effect = fake_get
+        with patch("time.sleep", return_value=None):
+            ok = bot._wait_for_orders_settlement(["ord-123", "ALREADY_FLAT"], timeout_sec=10.0)
+        self.assertTrue(ok)
+        self.assertEqual(bot.session.get.call_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

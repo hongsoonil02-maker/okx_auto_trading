@@ -275,21 +275,82 @@ class OKXBlendDemoTrader:
             return None, None
 
     # ── EXECUTION ──
-    def _cancel_algo_orders(self, inst_id: str):
+    def _get_pending_algos(self, inst_id: str) -> List[Dict[str, Any]]:
         res = self._request("GET", f"/api/v5/trade/orders-algo-pending?ordType=conditional,oco&instId={inst_id}")
-        algos = [{"algoId": a["algoId"], "instId": inst_id} for a in (res or {}).get("data", []) if a.get("algoId")]
+        return [a for a in (res or {}).get("data", []) if a.get("algoId")]
+
+    def _cancel_algo_orders(self, inst_id: str):
+        algos = [{"algoId": a["algoId"], "instId": inst_id} for a in self._get_pending_algos(inst_id)]
         if algos:
             self._request("POST", "/api/v5/trade/cancel-algos", data=algos)
 
-    def _close_position(self, inst_id: str) -> bool:
+    def sync_emergency_sl_orders(self, prices: Dict[str, float]) -> bool:
+        """
+        Ensures every open long position has an exchange-side conditional -10% SL
+        matching 100% of current position contracts (fixes scale-in / reduce SL drift).
+        """
+        all_ok = True
+        for sym, p in list(self.positions.items()):
+            pos_amt = float(p.get("pos", 0.0) or 0.0)
+            if pos_amt <= 1e-9:
+                continue
+            info = self.get_instrument(sym)
+            if not info:
+                all_ok = False
+                continue
+            lot_sz = Decimal(info["lotSz"])
+            pos_sz = _round_step(pos_amt, info["lotSz"], ROUND_DOWN)
+            if pos_sz < Decimal(info["minSz"]):
+                continue
+            ref_px = float(p.get("avgPx") or prices.get(sym, 0.0) or 0.0)
+            if ref_px <= 0:
+                continue
+            target_sl = _round_step(ref_px * (1.0 - EMERGENCY_SL_PCT), info["tickSz"], ROUND_HALF_UP)
+
+            pending = self._get_pending_algos(sym)
+            if len(pending) == 1:
+                cur_sz = Decimal(str(pending[0].get("sz") or "0"))
+                cur_sl = float(pending[0].get("slTriggerPx") or 0.0)
+                sz_match = abs(cur_sz - pos_sz) <= (lot_sz * Decimal("0.5"))
+                sl_match = float(target_sl) > 0 and abs(cur_sl - float(target_sl)) / float(target_sl) <= 0.005
+                if sz_match and sl_match:
+                    continue
+
+            if pending:
+                self._cancel_algo_orders(sym)
+
+            mgn_mode = p.get("mgnMode") or "isolated"
+            sl_payload = {
+                "instId": sym,
+                "tdMode": mgn_mode,
+                "side": "sell",
+                "posSide": "net",
+                "ordType": "conditional",
+                "sz": _fmt(pos_sz, info["lotSz"]),
+                "reduceOnly": True,
+                "slTriggerPx": _fmt(target_sl, info["tickSz"]),
+                "slOrdPx": "-1",
+                "slTriggerPxType": "last",
+            }
+            res = self._request("POST", "/api/v5/trade/order-algo", data=sl_payload)
+            if res and res.get("data"):
+                algo_id = res["data"][0].get("algoId")
+                logger.info(f"🛡️ [SL Sync] {sym} sz={sl_payload['sz']} SL=${sl_payload['slTriggerPx']} algo={algo_id}")
+            else:
+                logger.warning(f"⚠️ [SL Sync Failed] {sym}: {self.last_error}")
+                all_ok = False
+        return all_ok
+
+    def _close_position(self, inst_id: str, mgn_mode: Optional[str] = None) -> bool:
+        mode = mgn_mode or self.positions.get(inst_id, {}).get("mgnMode") or "isolated"
         res = self._request("POST", "/api/v5/trade/close-position", data={
             "instId": inst_id,
-            "mgnMode": "isolated",
+            "mgnMode": mode,
             "autoCxl": True,
         })
         if res:
             self._cancel_algo_orders(inst_id)
-            logger.info(f"✅ [Close Position] {inst_id}")
+            logger.info(f"✅ [Close Position] {inst_id} ({mode})")
             return True
         logger.error(f"❌ [Close Failed] {inst_id}: {self.last_error}")
         return False
@@ -436,6 +497,15 @@ class OKXBlendDemoTrader:
                 else:
                     all_ok = False
 
+        if executed > 0 or self.positions:
+            if executed > 0:
+                time.sleep(1.5)
+                self.sync_account()
+                self.sync_positions()
+            if self.positions:
+                if not self.sync_emergency_sl_orders(prices):
+                    logger.warning("⚠️ Emergency SL sync incomplete (will retry next bar)")
+
         if all_ok:
             self.state["last_4h_ts"] = ts4
             self.state["last_1d_ts"] = ts1
@@ -503,3 +573,4 @@ class OKXBlendDemoTrader:
 if __name__ == "__main__":
     trader = OKXBlendDemoTrader()
     trader.run()
+

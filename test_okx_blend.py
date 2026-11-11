@@ -36,6 +36,45 @@ class TestOKXBlendStrategy(unittest.TestCase):
         self.assertNotIn("ETH-USDT-SWAP", buy_map)
         self.assertIn("BTC-USDT-SWAP", buy_map)
 
+    def test_sync_emergency_sl_orders_replaces_drifted_scale_in_size(self):
+        import okx_blend_demo_trader as obdt
+        trader = object.__new__(obdt.OKXBlendDemoTrader)
+        trader.last_error = ""
+        trader.inst_cache = {"BTC-USDT-SWAP": {"ctVal": "0.01", "lotSz": "0.01", "minSz": "0.01", "tickSz": "0.1"}}
+        trader.positions = {"BTC-USDT-SWAP": {"pos": "1.50", "avgPx": "74000.0", "mgnMode": "isolated"}}
+
+        calls = []
+        def fake_request(method, path, params=None, data=None):
+            calls.append((method, path, data))
+            if "orders-algo-pending" in path:
+                # Old SL only covers 0.50 ct instead of scaled-in 1.50 ct
+                return {"code": "0", "data": [{"algoId": "old1", "sz": "0.50", "slTriggerPx": "66600.0"}]}
+            if "cancel-algos" in path:
+                return {"code": "0", "data": [{"sCode": "0"}]}
+            if "order-algo" in path:
+                return {"code": "0", "data": [{"algoId": "new1"}]}
+            return {"code": "0", "data": []}
+
+        trader._request = fake_request
+        ok = trader.sync_emergency_sl_orders({"BTC-USDT-SWAP": 74500.0})
+        self.assertTrue(ok)
+        placed = [d for m, p, d in calls if m == "POST" and "order-algo" in p]
+        self.assertEqual(len(placed), 1)
+        self.assertEqual(placed[0]["sz"], "1.50")
+        self.assertEqual(placed[0]["slTriggerPx"], "66600.0")
+        self.assertTrue(placed[0]["reduceOnly"])
+
+        # Second pass with matching SL should not cancel or replace
+        calls.clear()
+        trader._request = lambda m, p, params=None, data=None: (
+            {"code": "0", "data": [{"algoId": "new1", "sz": "1.50", "slTriggerPx": "66600.0"}]}
+            if "orders-algo-pending" in p else calls.append((m, p, data)) or {"code": "0", "data": []}
+        )
+        ok2 = trader.sync_emergency_sl_orders({"BTC-USDT-SWAP": 74500.0})
+        self.assertTrue(ok2)
+        self.assertEqual(calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()
+
