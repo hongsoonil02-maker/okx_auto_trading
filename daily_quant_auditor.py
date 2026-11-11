@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 daily_quant_auditor.py — Autonomous Daily Quant Audit & Telegram Dispatch
 Runs daily at 06:30 KST (after US market close).
@@ -196,11 +196,11 @@ def run_daily_audit():
         f"🪙 OKX (Futures Demo):\n"
         f"• USDT 거래 자본: ${okx['equity']:,.2f} ({o_sign}${abs(okx['daily_pnl']):,.2f} / {o_sign}{abs(okx['daily_pnl_pct']):.2f}%)\n"
         f"• 참고) 총 데모 평가액: ${okx.get('total_eq', 0.0):,.2f} (유휴 코인 포함, 성과 지표 아님)\n"
-        f"• 모드: 10x Isolated Net-Mode — Argon V4-Pro S8 (100% Simulated)\n"
+        f"• 모드: 3x Isolated Net-Mode — BLEND 65/35 (100% Simulated)\n"
         f"• 보유 포지션: {o_pos_desc}\n\n"
         f"🛡️ 봇 엔진 상태:\n"
         f"• Alpaca: H3 다자산 ETF 로테이션 (lb126+ma150, 월간 리밸런싱) Active (Paper)\n"
-        f"• OKX: 4대 메이저 동조 + 1H 확정봉 + 서버사이드 SL Active\n"
+        f"• OKX: BLEND 65/35 (4H 다중속도 돈치안 + 1D RSI2 눌림목) Active (Demo)\n"
         f"• 실계좌 잔고: 전액 출금 안전 보존 상태 ✅"
     )
 

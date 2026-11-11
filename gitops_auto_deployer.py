@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 gitops_auto_deployer.py — Automated GitOps Push-to-Deploy Pipeline
 Checks origin/main on GitHub every 5 minutes.
@@ -65,7 +65,7 @@ def check_and_deploy():
         return
 
     # 4. Preflight Python compile
-    py_files = ["okx_jev_demo_trader.py", "alpaca_etf_rotation.py", "daily_quant_auditor.py"]
+    py_files = ["okx_blend_strategy.py", "okx_blend_demo_trader.py", "alpaca_etf_rotation.py", "daily_quant_auditor.py"]
     for pf in py_files:
         full_p = os.path.join(CURRENT_DIR, pf)
         if os.path.exists(full_p):
